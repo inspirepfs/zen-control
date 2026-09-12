@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a ZEN v0.54.5.2.1 final release-readiness JSON capture."""
+"""Evaluate a ZEN v0.54.5.3 final release-readiness JSON capture."""
 from __future__ import annotations
 
 import argparse

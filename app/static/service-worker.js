@@ -3,7 +3,7 @@
  * are cached. Authenticated HTML/API responses and all mutations remain
  * network-only and are never queued for replay.
  */
-const RELEASE = '0.54.5.2.1';
+const RELEASE = '0.54.5.3';
 const CACHE_NAME = `zen-control-shell-${RELEASE}`;
 const OFFLINE_URL = '/static/offline.html';
 const SHELL_ASSETS = [

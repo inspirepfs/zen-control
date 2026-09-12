@@ -330,7 +330,17 @@ class PerformanceCollector:
         router_requests: list[RequestSample] = []
         for sample in samples:
             component_names = tuple(sample.components)
-            uses_router = any(name.startswith("routeros.") for name in component_names)
+            # Local observability spans such as mutation_status do not open or
+            # require a RouterOS transport. Treating them as network reads caused
+            # ordinary fast navigation to report false missing-connection evidence.
+            non_transport_router_components = {
+                "routeros.mutation_status",
+                "routeros.coherent_session",
+            }
+            uses_router = any(
+                name.startswith("routeros.") and name not in non_transport_router_components
+                for name in component_names
+            )
             if uses_router:
                 router_requests.append(sample)
             if sample.method == "GET" and str(sample.route).startswith("/?view="):

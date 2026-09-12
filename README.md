@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.54.5.2.1** — prepared-view and read-path fan-out closure: ordinary Dashboard, Activity and Managed Devices navigation consumes revision-bound advisory read models, heavy telemetry preparation reuses one coherent PostgreSQL session, and cached evidence remains excluded from RouterOS mutation authority.
+> Current release: **v0.54.5.3** — navigation tail-latency closure: Dashboard favourites reuse revision-bound reconciler policy projections, Settings → Operations consumes background/startup advisory managed-state inventory, and the large shared navigation template is precompiled before first use. Explicit live RouterOS reads and all mutation authority remain fresh and unchanged.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 

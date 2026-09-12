@@ -320,7 +320,7 @@ class V0542SourceContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(f"@coherent_router_mutation\ndef {name}", self.main)
 
-        # v0.54.5.2.1.1 deliberately moves the declarative Apply buttons off the
+        # v0.54.5.3.1 deliberately moves the declarative Apply buttons off the
         # synchronous RouterOS request path. The reconciler, not the HTTP route,
         # owns the mutation lane for those queued requests.
         for name in ("apply_device_policy", "apply_all_device_policies"):
@@ -366,8 +366,8 @@ class V0542SourceContractTests(unittest.TestCase):
         self.assertIn("reconciler_status.router_mutation", template)
 
     def test_release_identity_is_v0542(self):
-        self.assertIn('version="0.54.5.2.1"', self.main)
-        self.assertIn("v0.54.5.2.1", (ROOT / "README.md").read_text())
+        self.assertIn('version="0.54.5.3"', self.main)
+        self.assertIn("v0.54.5.3", (ROOT / "README.md").read_text())
         self.assertIn("## v0.54.2 — Parallel observation / serialized enforcement", (ROOT / "CHANGELOG.md").read_text())
 
 

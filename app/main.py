@@ -63,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.5.2.1")
+app = FastAPI(title="ZEN Control", version="0.54.5.3")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -972,6 +972,49 @@ def _advisory_router_payload(view_key: str, *, max_age_seconds: int = 180):
     }
 
 
+def _build_advisory_policy_summary(
+    devices: list[dict],
+    device_policy: dict,
+    profiles: list[dict],
+    policy_plans: dict,
+) -> list[dict]:
+    """Build Dashboard favourites from already-published reconciler plans.
+
+    Normal Dashboard navigation must not recompute effective policy for every
+    managed device. The reconciler's managed-device observation is revision-bound
+    and already carries the desired-policy fields needed by the compact favourite
+    cards. Missing plan evidence is represented as UNKNOWN rather than triggering
+    synchronous policy resolution.
+    """
+    profile_names = {
+        str(item.get("id")): str(item.get("name") or "Unassigned")
+        for item in (profiles or [])
+        if item.get("id") is not None
+    }
+    rows = []
+    for device in devices or []:
+        ip = str(device.get("ip") or device.get("address") or "").strip()
+        if not ip:
+            continue
+        cfg = dict((device_policy or {}).get(ip) or {})
+        plan = dict((policy_plans or {}).get(ip) or {})
+        profile_id = cfg.get("profile_id")
+        rows.append({
+            "ip": ip,
+            "name": str(cfg.get("alias") or device.get("name") or device.get("host_name") or "Unknown"),
+            "profile": profile_names.get(str(profile_id), "Unassigned") if profile_id else "Unassigned",
+            "category": cfg.get("category", "other"),
+            "favourite": bool(cfg.get("favourite", 0)),
+            "desired_mode": str(plan.get("desired_mode") or "unknown"),
+            "mode_source": str(plan.get("mode_source") or "advisory evidence unavailable"),
+            "bandwidth": str(plan.get("bandwidth_preset") or "unknown"),
+            "blocked_services": list(plan.get("blocked_services") or []),
+            "conflicts": list(plan.get("conflicts") or []),
+            "evidence_state": "ready" if plan.get("desired_mode") else "missing",
+        })
+    return sorted(rows, key=lambda row: (not row["favourite"], row["name"].lower(), row["ip"]))
+
+
 def _prepare_dashboard_payload() -> dict:
     local = policy_store.list_device_policy()
     managed_ips = sorted(str(ip) for ip in local if str(ip))
@@ -1456,6 +1499,13 @@ def start_auto_reconciler():
     # Establish the durable configuration revision baseline before read-side
     # background processing starts. This never writes RouterOS.
     policy_store.ensure_config_revision_baseline(actor="system:startup")
+    # Compile the large shared navigation template before the first browser GET.
+    # This moves one-time Jinja parsing out of the formal navigation latency set.
+    try:
+        with perf_span("worker.template_warmup"):
+            templates.env.get_template("index.html")
+    except Exception as exc:
+        audit("TEMPLATE_WARMUP_FAILED", "system:startup", str(exc))
     background_worker.start()
 
     # Reconcile every reserved reward debit against fresh RouterOS evidence. A
@@ -2260,6 +2310,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         "queues": [], "schedulers": [], "scripts": [], "firewall": [],
     }
     managed_inventory_error = None
+    managed_inventory_notice = None
     service_enforcement_catalog = {}
     live_service_keys = frozenset()
     custom_service_defs = []
@@ -2471,11 +2522,42 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                 if ip:
                     discovered_devices.append({**item, "ip": ip, "managed": ip in restricted_ips})
 
+    if active_view == "settings" and active_section == "operations":
+        managed_inventory, managed_inventory_meta = _advisory_router_payload(
+            "router:managed-state-inventory", max_age_seconds=300
+        )
+        router_observation_evidence["managed_inventory"] = managed_inventory_meta
+        if managed_inventory:
+            if managed_inventory_meta.get("state") == "stale":
+                managed_inventory_notice = (
+                    "Managed RouterOS inventory is advisory and stale; background "
+                    "reconciliation or an explicit live inventory check will refresh it."
+                )
+        else:
+            startup_inventory = dict(
+                ((operations_startup.get("inventory") or {}).get("detail") or {})
+            )
+            if startup_inventory:
+                managed_inventory = startup_inventory
+                managed_inventory_notice = (
+                    "Live advisory inventory is not published yet; showing the startup "
+                    "inventory snapshot without blocking this navigation request."
+                )
+            else:
+                managed_inventory = {
+                    "counts": {}, "restricted_devices": [], "address_lists": [],
+                    "queues": [], "schedulers": [], "scripts": [], "firewall": [],
+                }
+                managed_inventory_error = (
+                    "Managed RouterOS inventory evidence is not ready. Use the explicit "
+                    "live inventory endpoint or wait for background reconciliation."
+                )
+
     needs_router = (
         needs_devices
         or active_view == "dashboard"  # cheap web-policy status only
         or (active_view == "policies" and active_section == "services")
-        or (active_view == "settings" and active_section in {"security", "operations"})
+        or (active_view == "settings" and active_section == "security")
     )
 
     # Reuse one RouterOS transport for the synchronous surfaces that explicitly
@@ -2536,18 +2618,19 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                             "stale": {"total": 0}, "authority": {"global_mode": "unknown"},
                             "doh": {"expected": len(DOH_ROUTER_RULES), "valid": 0, "errors": [str(exc)]},
                         }
-
-                if active_view == "settings" and active_section == "operations":
-                    try:
-                        managed_inventory = router.get_managed_state_inventory()
-                    except RouterError as exc:
-                        managed_inventory_error = str(exc)
         except RouterError as exc:
             router_read_error = str(exc)
             audit("ROUTER_READ_FAILED", user["username"], str(exc))
 
-    # Local policy summary needs only the managed-device list and SQLite state.
-    if active_view in {"dashboard", "policies"}:
+    # Dashboard favourites reuse the reconciler's revision-bound desired-policy
+    # projection. Recomputing effective policy for every device created more than
+    # one hundred SQLite transactions per click and dominated warm Dashboard latency.
+    # The full policy summary route keeps its canonical local resolver.
+    if active_view == "dashboard":
+        policy_summary = _build_advisory_policy_summary(
+            devices, local_device_policy, local_profiles, policy_plans
+        )
+    elif active_view == "policies":
         policy_summary = policy_store.build_policy_summary(devices)
 
     if active_view in {"activity", "dashboard"}:
@@ -2772,6 +2855,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "connected_overview": connected_overview,
             "managed_inventory": managed_inventory,
             "managed_inventory_error": managed_inventory_error,
+            "managed_inventory_notice": managed_inventory_notice,
             "service_contract_health": service_contract_health,
             "service_contract_health_map": service_contract_health_map,
             "service_contract_error": service_contract_error,
@@ -4886,7 +4970,12 @@ def api_operations_inventory(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     try:
-        return {"ok": True, "inventory": router.get_managed_state_inventory()}
+        inventory = router.get_managed_state_inventory()
+        _publish_router_observation(
+            "router:managed-state-inventory", inventory,
+            scope="router:managed-state", ttl_seconds=300,
+        )
+        return {"ok": True, "inventory": inventory}
     except RouterError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 

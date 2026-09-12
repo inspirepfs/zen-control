@@ -84,13 +84,31 @@ class OperationsMonitor:
             inventory = self.router.get_managed_state_inventory()
             inventory_state = {
                 "ok": True,
+                "captured_at": self._now_iso(),
                 "router": inventory.get("router"),
                 "restricted_devices": inventory.get("counts", {}).get("restricted_devices", 0),
                 "managed_address_entries": inventory.get("counts", {}).get("managed_address_entries", 0),
                 "managed_queues": inventory.get("counts", {}).get("managed_queues", 0),
                 "managed_schedulers": inventory.get("counts", {}).get("managed_schedulers", 0),
                 "managed_scripts": inventory.get("counts", {}).get("managed_scripts", 0),
+                "detail": inventory,
             }
+            # Seed the non-blocking Operations page with the same startup inventory.
+            # Publication is advisory only and must never make startup readiness fail.
+            try:
+                saver = getattr(self.policy_store, "save_prepared_view", None)
+                revision_getter = getattr(self.policy_store, "current_config_revision", None)
+                if saver and revision_getter:
+                    saver(
+                        view_key="router:managed-state-inventory",
+                        kind="router.observation",
+                        scope="router:managed-state",
+                        payload=inventory,
+                        source_revision=int(revision_getter().get("revision") or 0),
+                        ttl_seconds=300,
+                    )
+            except Exception:
+                pass
         except Exception as exc:
             inventory_state = {"ok": False, "error": str(exc)}
             issues.append(f"Managed-state inventory unavailable: {exc}")

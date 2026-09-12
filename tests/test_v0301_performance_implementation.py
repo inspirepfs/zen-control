@@ -96,7 +96,7 @@ class PerformanceImplementationContractTests(unittest.TestCase):
             offset = self.main.index(route)
             prefix = self.main[max(0, offset - 260):offset]
             self.assertIn("@coherent_router_mutation", prefix, route)
-        # v0.54.5.2.1 deliberately decouples declarative Apply from synchronous
+        # v0.54.5.3 deliberately decouples declarative Apply from synchronous
         # RouterOS mutation. The request durably queues desired-state intent;
         # AutoReconciler owns the later coherent mutation session.
         route = "def apply_device_policy("
@@ -126,7 +126,11 @@ class PerformanceImplementationContractTests(unittest.TestCase):
         self.assertIn("window.location.href = `/?view=${encodeURIComponent(view)}&section=${encodeURIComponent(group.key)}#${view}/${group.key}`", self.index)
 
     def test_local_settings_sections_do_not_force_router_connection(self):
-        self.assertIn('active_view == "settings" and active_section in {"security", "operations"}', self.main)
+        # Security remains an explicit fresh RouterOS read surface. Operations
+        # navigation was moved to revision-bound advisory inventory in v0.54.5.3;
+        # its explicit /api/operations/inventory endpoint remains the live read.
+        self.assertIn('active_view == "settings" and active_section == "security"', self.main)
+        self.assertIn('"router:managed-state-inventory"', self.main)
         self.assertNotIn('active_view in {"dashboard", "settings", "activity"}', self.main)
         self.assertIn('active_view == "policies" and active_section == "services"', self.main)
 

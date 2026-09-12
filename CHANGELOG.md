@@ -1,3 +1,14 @@
+## v0.54.5.3 — Navigation tail-latency closure
+
+- Removes Dashboard's per-device effective-policy recomputation from the normal navigation path. Favourite cards now reuse the revision-bound desired-policy projection already published by the reconciler; missing advisory plan evidence is shown as unknown rather than triggering synchronous policy resolution.
+- Precompiles the large shared `index.html` Jinja template during application startup so one-time template parsing cannot contaminate the first measured Dashboard navigation request.
+- Moves Settings → Operations managed-state inventory off the browser request path. Startup seeds a revision-bound advisory inventory and the reconciler refreshes it in the background with a bounded two-minute throttle; stale/missing evidence remains explicit.
+- Keeps `/api/operations/inventory` as an explicit fresh RouterOS read and republishes the result for subsequent fast Operations navigation. No cached inventory is used for mutation authority.
+- Corrects formal RouterOS connection evidence so local in-process observability spans (`routeros.mutation_status` / coherent-session bookkeeping) are not misclassified as network reads. Actual RouterOS operations still require exactly one measured transport connection per request.
+- Leaves the canonical navigation budget unchanged at p95 ≤ 1000 ms; the slice closes measured tail latency rather than relaxing or gaming the gate.
+
+Authority boundary: all new cached data is display-only. RouterOS-changing operations still acquire the serialized mutation lane, re-prove security posture, fresh-read relevant RouterOS state, calculate, write and verify.
+
 ## v0.54.5.2.1 — Prepared-view serialization recovery & telemetry-health closure
 
 - Fixes a deterministic prepared-view publication failure where PostgreSQL aggregate `Decimal` values in `activity:24h` and `services:24h` could not cross the SQLite JSON persistence boundary, causing repeated worker retries and permanently missing read models.

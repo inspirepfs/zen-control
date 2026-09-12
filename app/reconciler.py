@@ -173,6 +173,7 @@ class AutoReconciler:
 
         self._consecutive_failures = 0
         self._hold_until_epoch = 0.0
+        self._last_managed_inventory_observation_mono = 0.0
         self._last: dict = {
             "started_at": None,
             "finished_at": None,
@@ -502,6 +503,39 @@ class AutoReconciler:
             except Exception:
                 pass
 
+    def _publish_managed_inventory_observation(self, *, min_interval_seconds: int = 120) -> None:
+        """Refresh Operations inventory off the browser request path.
+
+        This is read-only advisory evidence. It is deliberately throttled because
+        the complete managed-state inventory is a relatively expensive RouterOS
+        scan. Mutation paths never consume this prepared view.
+        """
+        getter = getattr(self.router, "get_managed_state_inventory", None)
+        if getter is None:
+            return
+        now = time.monotonic()
+        if (
+            self._last_managed_inventory_observation_mono
+            and now - self._last_managed_inventory_observation_mono < max(30, int(min_interval_seconds))
+        ):
+            return
+        # Throttle failures too; a disconnected router must not be hammered every
+        # reconciliation interval merely to refresh an advisory Operations card.
+        self._last_managed_inventory_observation_mono = now
+        try:
+            inventory = getter()
+            revision = int(self.policy_store.current_config_revision().get("revision") or 0)
+            self.policy_store.save_prepared_view(
+                view_key="router:managed-state-inventory",
+                kind="router.observation",
+                scope="router:managed-state",
+                payload=inventory,
+                source_revision=revision,
+                ttl_seconds=300,
+            )
+        except Exception:
+            pass
+
     def _observe_plans(self, devices: list[dict]) -> dict:
         usable = [
             device for device in devices
@@ -745,6 +779,7 @@ class AutoReconciler:
             counts["observed"] = len(batch.get("results") or {})
             counts["plan_failed"] = len(batch.get("errors") or {})
             self._publish_managed_observation(devices, batch)
+            self._publish_managed_inventory_observation()
 
             for address, error in (batch.get("errors") or {}).items():
                 counts["failed"] += 1
