@@ -7,7 +7,9 @@ secret scanner and does not replace manual review or credential rotation.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -39,7 +41,52 @@ PLACEHOLDER_MARKERS = (
 )
 
 
+def _git_visible_files(root: Path) -> list[Path] | None:
+    """Return tracked plus non-ignored untracked files when Git metadata exists."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+
+    result: list[Path] = []
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = Path(os.fsdecode(raw))
+        path = root / rel
+        if path.is_file():
+            result.append(path)
+    return sorted(set(result))
+
+
 def iter_files() -> list[Path]:
+    # In a working tree audit exactly what Git could publish: tracked files plus
+    # non-ignored untracked files. Local runtime material such as .env is
+    # intentionally excluded by .gitignore, while an accidentally tracked .env
+    # remains visible here and will still fail the checks below.
+    git_files = _git_visible_files(ROOT)
+    if git_files is not None:
+        return git_files
+
+    # git archive/source-bundle fallback: there is no .git metadata, so inspect
+    # the supplied tree directly. Archives generated from Git should already
+    # contain source-visible files only.
     result: list[Path] = []
     for path in ROOT.rglob("*"):
         if not path.is_file():

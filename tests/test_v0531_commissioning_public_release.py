@@ -131,6 +131,22 @@ class PublicRepositoryContractTests(unittest.TestCase):
         self.assertIn("CADDY_CF_API_TOKEN=replace-with-cloudflare-dns-api-token", env)
         self.assertIn("ZEN_LAN_BIND_IP=192.168.1.10", env)
 
+    def test_test_suite_is_an_explicit_package_for_clean_ci(self):
+        init = ROOT / "tests/__init__.py"
+        self.assertTrue(init.is_file())
+        self.assertIn("test package", init.read_text().lower())
+
+    def test_github_actions_discovers_tests_from_repository_top_level(self):
+        workflow = (ROOT / ".github/workflows/quality.yml").read_text()
+        self.assertIn("python3 -m unittest discover -s tests -t . -v", workflow)
+
+    def test_public_release_audit_scans_git_visible_source_not_ignored_runtime_files(self):
+        audit = (ROOT / "scripts/public_release_audit.py").read_text()
+        self.assertIn('"ls-files"', audit)
+        self.assertIn('"--cached"', audit)
+        self.assertIn('"--others"', audit)
+        self.assertIn('"--exclude-standard"', audit)
+
     def test_public_release_audit_passes_with_license_as_manual_gate(self):
         proc = subprocess.run(
             [sys.executable, "scripts/public_release_audit.py"],

@@ -4,12 +4,19 @@ All notable ZEN Control release slices are recorded here. ZEN is developed as ev
 
 ## v0.53.1 — Commissioning and public-repository closure
 
+
+### CI/public-audit host compatibility hotfix
+
+- Public-source auditing now enumerates Git tracked files plus non-ignored untracked files when run inside a working tree. Local ignored runtime material such as `.env` therefore cannot create a false publication failure, while an accidentally tracked secret file remains auditable and blocking.
+- Source bundles without Git metadata retain the conservative filesystem scan fallback.
+
 - Formalises the live Kid Control migration workbench Stage-button visibility repair.
 - Separates legacy-profile disabled state from translation warnings, so an expected retained/disabled rollback profile does not produce a false REVIEW signal after successful authority transfer.
 - Makes the post-cutover authority state explicit: ZEN policy active, legacy Kid Control disabled and retained, verified migration devices counted, rollback available.
 - Keeps staging records as provenance after cutover and removes misleading language that could imply the materialised ZEN policy is still non-active.
 - Restructures the repository for public review with a product-first README, architecture/install/security/contribution documentation, read-only RouterOS inspection helpers, and an executable public-source audit.
 - Adds no RouterOS authority, Kid Control deletion, notification expansion, or performance-architecture changes.
+- CI qualification explicitly packages the test tree and discovers it from the repository top level, preventing third-party `tests` packages from shadowing ZEN test helpers on clean runners.
 
 ## v0.53.0 — Controlled MikroTik Kid Control authority transfer
 
