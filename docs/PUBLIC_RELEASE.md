@@ -17,6 +17,24 @@ This checklist is deliberately conservative because ZEN can control a real house
 - [ ] Confirm GitHub Actions passes from the committed tree.
 - [ ] Add a repository description/topics and verify `SECURITY.md` is visible.
 
+## Automated host release path
+
+The supported host-side orchestration helper is `scripts/release_patch.py`. It preserves the manual gates rather than hiding them: patch application rejects fuzz/offset/reversed evidence, source validation must pass, the selected containers must rebuild and become healthy, Git staging must be clean, the pushed commit must pass the selected GitHub Actions workflow, and only then may an annotated release tag be pushed.
+
+Important switches include:
+
+- `--patch NAME.patch` — apply a patch; a relative name also searches `../`.
+- `--resume` — skip patch application when the intended release changes are already present locally.
+- `--rebuild-service SERVICE` — repeat for additional services; default is `mikrotik-control`.
+- `--rebuild-all` — explicitly rebuild/start all Compose services.
+- `--expect-version VERSION` — require the live health JSON to expose the expected release.
+- `--stage PATH` — repeat to restrict staging; otherwise the intentionally changed tree is staged with `git add -A`.
+- `--workflow NAME` — GitHub Actions workflow to wait for; default is `Quality`.
+- `--tag TAG` — create and push an annotated tag only after watched CI succeeds.
+- `--dry-run` — print the plan and commands without changing state.
+
+The normal flow expects a clean tree before patch application. `--resume` is the explicit exception for an already-applied, reviewed release tree.
+
 ## License decision
 
 Two sensible options for ZEN are:

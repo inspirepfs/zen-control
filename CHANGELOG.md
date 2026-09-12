@@ -17,6 +17,7 @@ All notable ZEN Control release slices are recorded here. ZEN is developed as ev
 - Restructures the repository for public review with a product-first README, architecture/install/security/contribution documentation, read-only RouterOS inspection helpers, and an executable public-source audit.
 - Adds no RouterOS authority, Kid Control deletion, notification expansion, or performance-architecture changes.
 - CI qualification explicitly packages the test tree and discovers it from the repository top level, preventing third-party `tests` packages from shadowing ZEN test helpers on clean runners.
+- Adds `scripts/release_patch.py` as a fail-closed host release orchestrator for exact patch application, validation, bounded rebuild/health proof, Git publication, commit-scoped GitHub Actions watching and post-CI annotated tagging.
 
 ## v0.53.0 — Controlled MikroTik Kid Control authority transfer
 
