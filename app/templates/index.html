@@ -4,11 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.54.5">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.5">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.5">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.5">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.5">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.5.1">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -108,7 +108,10 @@
       <div>
         <h2>Connected system health</h2>
         <p class="muted">One view across policy, RouterOS authority, service intelligence, telemetry and operational evidence. Every row drills back into the feature that owns the state.</p>
-        {% if prepared_view_evidence.dashboard %}<p class="muted small">Telemetry summary prepared {{prepared_view_evidence.dashboard.age_seconds|round(1)}}s ago at config revision {{prepared_view_evidence.dashboard.source_revision}}; RouterOS state remains fresh.</p>{% endif %}
+        {% if prepared_view_evidence.dashboard %}<p class="muted small">Telemetry summary prepared {{prepared_view_evidence.dashboard.age_seconds|round(1)}}s ago at config revision {{prepared_view_evidence.dashboard.source_revision}}.</p>{% endif %}
+        {% set sec_obs = router_observation_evidence.get('security_posture', {}) %}
+        {% set svc_obs = router_observation_evidence.get('service_contract_health', {}) %}
+        <p class="muted small">RouterOS dashboard evidence is non-blocking: security {{ sec_obs.get('state', 'missing')|upper }}{% if sec_obs.get('age_seconds') is not none %} · {{sec_obs.get('age_seconds')|round(1)}}s old{% endif %}; service contracts {{ svc_obs.get('state', 'missing')|upper }}{% if svc_obs.get('age_seconds') is not none %} · {{svc_obs.get('age_seconds')|round(1)}}s old{% endif %}. Authority-changing operations always re-read RouterOS live.</p>
       </div>
       <div class="connected-overview-state">
         <span class="policy-badge integration-state-{{connected_overview.state}}">{{connected_overview.state|upper}}</span>
@@ -321,8 +324,8 @@
         <h2>Managed devices</h2>
         <p class="muted">
           RouterOS is the enforcement plane. Profiles, schedules and date exceptions
-          resolve into one effective desired policy. Automatic reconciliation is
-          {{ reconciler_status.mode|upper }}.
+          resolve into one effective desired policy. Manual Apply actions are durably queued and
+          reconciled in the background; automatic reconciliation is {{ reconciler_status.mode|upper }}.
         </p>
       </div>
       <div class="card-heading-actions">
@@ -338,10 +341,10 @@
           <form
             method="post"
             action="/devices/policy/apply-all"
-            onsubmit="return confirm('Reconcile live mode, bandwidth and RouterOS-backed service policy for every drifted device?');"
+            onsubmit="return confirm('Queue reconciliation for every managed device? ZEN will acknowledge immediately and apply through the serialized background mutation lane.');"
           >
             <input type="hidden" name="csrf" value="{{ csrf }}">
-            <button class="primary compact">Reconcile all</button>
+            <button class="primary compact">Queue reconcile all</button>
           </form>
         {% endif %}
       </div>
@@ -489,7 +492,7 @@
                 <form method="post" action="/devices/policy/apply">
                   <input type="hidden" name="csrf" value="{{ csrf }}">
                   <input type="hidden" name="ip" value="{{ d.ip }}">
-                  <button class="primary compact">Apply desired policy</button>
+                  <button class="primary compact">Queue desired policy</button>
                 </form>
               {% endif %}
             </div>
@@ -2813,16 +2816,23 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       <div class="conflict-warning"><strong>SECURITY HOLD:</strong> ENFORCE is configured but the RouterOS write gate is closed. Repair critical hardening checks first.</div>
     {% endif %}
 
+    {% set rq = reconciler_status.requested or {} %}
     <div class="auto-reconcile-status">
       <div><span class="muted small">Worker</span><strong>{{ 'RUNNING' if reconciler_status.worker_alive else 'STOPPED' }}</strong></div>
+      <div><span class="muted small">Queued applies</span><strong>{{ rq.pending or 0 }}</strong></div>
+      <div><span class="muted small">Applying now</span><strong>{{ rq.running or 0 }}</strong></div>
+      <div><span class="muted small">Queue failures</span><strong>{{ rq.failed or 0 }}</strong></div>
       <div><span class="muted small">Last result</span><strong>{{ reconciler_status.last.result|upper }}</strong></div>
       <div><span class="muted small">Last cycle</span><strong>{{ reconciler_status.last.finished_at or 'Not yet' }}</strong></div>
-      <div><span class="muted small">Failures</span><strong>{{ reconciler_status.consecutive_failures }} / {{ reconciler_status.failure_threshold }}</strong></div>
+      <div><span class="muted small">Automatic failures</span><strong>{{ reconciler_status.consecutive_failures }} / {{ reconciler_status.failure_threshold }}</strong></div>
     </div>
+    {% if rq.latest %}
+      <p class="muted small">Latest requested reconciliation #{{rq.latest.id}} · target {{rq.latest.target}} · desired revision {{rq.latest.requested_revision}} · {{rq.latest.status|upper}}{% if rq.latest.applied_revision %} · applied revision {{rq.latest.applied_revision}}{% endif %}.</p>
+    {% endif %}
 
     <p class="muted auto-reconcile-summary">{{ reconciler_status.last.summary }}</p>
     {% if reconciler_status.hold_active %}
-      <div class="conflict-warning">Automatic enforcement is paused until {{ reconciler_status.hold_until }} after repeated failed cycles. Manual device reconciliation remains available.</div>
+      <div class="conflict-warning">Automatic enforcement is paused until {{ reconciler_status.hold_until }} after repeated failed cycles. Queued manual reconciliation remains available.</div>
     {% endif %}
 
     {% if user.role == 'admin' %}

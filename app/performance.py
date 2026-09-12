@@ -644,9 +644,13 @@ def build_formal_acceptance(snapshot: dict, operational_evidence: dict) -> dict:
     background = dict(operational_evidence.get("background_worker") or {})
     background_alive = background.get("worker_alive")
     background_duration = background.get("last_duration_ms")
+    background_result = str(background.get("last_result") or "").lower()
+    background_failed = int(background.get("last_failed") or 0)
     if background_alive is False:
         background_state = "fail"
-    elif background_alive is True and background_duration is not None:
+    elif background_result in {"degraded", "error"} or background_failed > 0:
+        background_state = "fail"
+    elif background_alive is True and background_duration is not None and background_result in {"ok", "idle"}:
         background_state = "pass"
     else:
         background_state = "pending"
@@ -713,7 +717,9 @@ def build_formal_acceptance(snapshot: dict, operational_evidence: dict) -> dict:
             "state": background_state,
             "worker_alive": background_alive,
             "last_duration_ms": background_duration,
-            "description": "The non-authoritative durable read worker must be alive and expose a completed-cycle duration.",
+            "last_result": background_result or None,
+            "last_failed": background_failed,
+            "description": "The non-authoritative durable read worker must be alive, complete a healthy cycle and expose its timing; degraded/error cycles are FAIL rather than timing-only PASS.",
         },
         {
             "key": "parallel_observation",

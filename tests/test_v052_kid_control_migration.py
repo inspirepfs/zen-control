@@ -314,8 +314,8 @@ class KidControlMigrationSourceContractTests(unittest.TestCase):
         cls.env = (ROOT / ".env.example").read_text()
 
     def test_release_and_ui_contract_moves_forward_from_staging(self):
-        self.assertIn('version="0.54.5"', self.main)
-        self.assertIn("v0.54.5", self.readme)
+        self.assertIn('version="0.54.5.1"', self.main)
+        self.assertIn("v0.54.5.1", self.readme)
         self.assertIn('("kid_control_migration", "MikroTik Kid Control staged migration", "0.52.0")', self.release)
         self.assertIn('("kid_control_authority", "MikroTik Kid Control controlled authority transfer", "0.53.0")', self.release)
 

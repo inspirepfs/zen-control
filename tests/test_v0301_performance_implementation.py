@@ -88,7 +88,6 @@ class PerformanceImplementationContractTests(unittest.TestCase):
         self.assertIn("def coherent_router_request(func):", self.main)
         self.assertIn("def coherent_router_mutation(func):", self.main)
         mutation_routes = (
-            "def apply_device_policy(",
             "def set_device_enforcement(",
             "def start_device_temporary_access(",
             "def local_service_provision(",
@@ -97,6 +96,16 @@ class PerformanceImplementationContractTests(unittest.TestCase):
             offset = self.main.index(route)
             prefix = self.main[max(0, offset - 260):offset]
             self.assertIn("@coherent_router_mutation", prefix, route)
+        # v0.54.5.1 deliberately decouples declarative Apply from synchronous
+        # RouterOS mutation. The request durably queues desired-state intent;
+        # AutoReconciler owns the later coherent mutation session.
+        route = "def apply_device_policy("
+        offset = self.main.index(route)
+        block = self.main[offset:self.main.index("@app.", offset + len(route))]
+        prefix = self.main[max(0, offset - 260):offset]
+        self.assertNotIn("@coherent_router_mutation", prefix)
+        self.assertIn("request_reconciliation", block)
+        self.assertNotIn("router.", block)
         # The reconciler route may execute OBSERVE without mutation authority;
         # ENFORCE acquires the mutation lane inside AutoReconciler after planning.
         route = "def local_reconciler_run_now("

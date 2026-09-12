@@ -26,8 +26,8 @@ class MaintenanceCleanupTests(unittest.TestCase):
         index = (ROOT / "app/templates/index.html").read_text()
         activity = (ROOT / "app/templates/activity_device.html").read_text()
         for html in (index, activity):
-            self.assertIn('/static/layout.css?v=0.54.5', html)
-            self.assertIn('/static/activity.css?v=0.54.5', html)
+            self.assertIn('/static/layout.css?v=0.54.5.1', html)
+            self.assertIn('/static/activity.css?v=0.54.5.1', html)
             self.assertNotIn('/static/r15-1.css', html)
             self.assertNotIn('/static/r16.css', html)
         self.assertTrue((ROOT / "app/static/layout.css").exists())

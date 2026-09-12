@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.54.5** — final release-readiness closure with the canonical eight-check application gate wired to formal performance and embedded runtime health.
+> Current release: **v0.54.5.1** — RouterOS request-path decoupling and reconciliation closure: declarative Apply actions ACK from durable local intent, RouterOS convergence runs through the serialized reconciler, and Dashboard authority evidence is prepared/stale-aware rather than navigation-blocking.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 

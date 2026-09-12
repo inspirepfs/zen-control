@@ -116,6 +116,7 @@ class BackgroundWorker:
             "last_succeeded": int(last.get("succeeded") or 0),
             "last_failed": int(last.get("failed") or 0),
             "last_deferred": int(last.get("deferred") or 0),
+            "last_error": str(last.get("last_error") or ""),
         }
 
     @timed("worker.background.cycle")

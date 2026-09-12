@@ -63,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.5")
+app = FastAPI(title="ZEN Control", version="0.54.5.1")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -779,6 +779,54 @@ def _prepared_payload(view_key: str, *, max_age_seconds: int | None = None):
     return payload, meta
 
 
+def _publish_router_observation(view_key: str, payload: dict, *, scope: str, ttl_seconds: int = 180):
+    """Publish advisory RouterOS evidence for non-blocking read surfaces.
+
+    Mutation paths never consume these rows. They continue to fresh-read and
+    verify RouterOS inside the serialized mutation lane.
+    """
+    try:
+        return policy_store.save_prepared_view(
+            view_key=view_key,
+            kind="router.observation",
+            scope=scope,
+            payload=payload,
+            source_revision=int(policy_store.current_config_revision().get("revision") or 0),
+            ttl_seconds=ttl_seconds,
+        )
+    except Exception:
+        return None
+
+
+def _advisory_router_payload(view_key: str, *, max_age_seconds: int = 180):
+    """Read RouterOS observation evidence without forcing a live request.
+
+    Expired evidence may be shown as explicitly STALE, but evidence from a
+    different configuration revision is withheld to avoid presenting old service
+    semantics as current.
+    """
+    revision = int(policy_store.current_config_revision().get("revision") or 0)
+    row = policy_store.get_prepared_view(
+        view_key, required_revision=revision, max_age_seconds=max_age_seconds, include_stale=True
+    )
+    performance_collector.record_evidence("router_observation.lookup")
+    if not row or row.get("revision_stale"):
+        performance_collector.record_evidence("router_observation.miss")
+        return None, {"state": "missing", "view_key": view_key}
+    payload = dict(row.get("payload") or {})
+    state = "fresh" if row.get("eligible") else "stale"
+    performance_collector.record_evidence(f"router_observation.{state}")
+    return payload, {
+        "state": state,
+        "view_key": view_key,
+        "captured_at": row.get("captured_at"),
+        "age_seconds": row.get("age_seconds"),
+        "source_revision": row.get("source_revision"),
+        "expired": bool(row.get("expired")),
+        "too_old": bool(row.get("too_old")),
+    }
+
+
 def _prepare_dashboard_payload() -> dict:
     local = policy_store.list_device_policy()
     managed_ips = sorted(str(ip) for ip in local if str(ip))
@@ -1435,6 +1483,7 @@ def current_performance_snapshot() -> dict:
         "background_worker": background,
         "parallel_observation": observation,
         "mutation_lane": mutation,
+        "reconciliation_queue": policy_store.reconciliation_request_stats(),
     }
     snapshot["operational_evidence"] = operational
     snapshot["formal_acceptance"] = build_formal_acceptance(snapshot, operational)
@@ -2076,6 +2125,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     activity_coverage = {}
     activity_unknown_domains = []
     prepared_view_evidence = {}
+    router_observation_evidence = {}
     service_prefill_dns = (
         str(request.query_params.get("prefill_dns") or "").strip().lower().rstrip(".")[:253]
         if active_view == "policies" and active_section == "services" else ""
@@ -2150,6 +2200,29 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         or (active_view == "settings" and active_section in {"security", "operations"})
     )
 
+    if active_view == "dashboard":
+        cached_security, security_meta = _advisory_router_payload(
+            "router:security-posture", max_age_seconds=180
+        )
+        router_observation_evidence["security_posture"] = security_meta
+        if cached_security:
+            security_posture = cached_security
+            if security_meta.get("state") == "stale":
+                security_error = "Advisory RouterOS security evidence is stale; enforcement writes still re-prove live posture."
+
+        cached_services, service_meta = _advisory_router_payload(
+            "router:service-contract-health", max_age_seconds=180
+        )
+        router_observation_evidence["service_contract_health"] = service_meta
+        if cached_services:
+            service_contract_health = cached_services
+            service_contract_health_map = {
+                str(item.get("key") or ""): item
+                for item in service_contract_health.get("services", [])
+            }
+            if service_meta.get("state") == "stale":
+                service_contract_error = "Advisory service-contract evidence is stale; open Service Intelligence for a fresh read."
+
     # Reuse one RouterOS transport for the whole synchronous page composition.
     # Read-only Dashboard/Managed-device composition additionally uses one fresh
     # RouterOS observational snapshot so per-device mode/service/bandwidth state
@@ -2157,24 +2230,9 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     # not consume this snapshot and continue to fresh-read RouterOS directly.
     if needs_router:
         try:
-            with router.coherent_session():
-                # Dashboard needs service-contract health anyway. Load it first
-                # so the device snapshot can reuse the same per-service authority
-                # result instead of validating every contract a second time.
-                if active_view == "dashboard":
-                    try:
-                        service_contract_health = router.get_service_contract_health(custom_service_defs)
-                    except RouterError as exc:
-                        service_contract_error = str(exc)
-                        service_contract_health = {
-                            "available": False, "services": [], "healthy": 0,
-                            "total": len(service_enforcement_catalog), "detector_addresses": 0,
-                            "degraded": 0, "reporting_only": len(custom_service_defs),
-                        }
-                    service_contract_health_map = {
-                        str(item.get("key") or ""): item
-                        for item in service_contract_health.get("services", [])
-                    }
+            with router.coherent_session():                # Dashboard consumes advisory prepared RouterOS evidence above.
+                # Fresh service-contract probes stay on the explicit Activity /
+                # Service Intelligence paths instead of blocking navigation.
 
                 device_snapshot = None
                 if active_view in {"dashboard", "devices"}:
@@ -2281,6 +2339,10 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                 ):
                     try:
                         service_contract_health = router.get_service_contract_health(custom_service_defs)
+                        _publish_router_observation(
+                            "router:service-contract-health", service_contract_health,
+                            scope="router:service-contracts", ttl_seconds=180,
+                        )
                     except RouterError as exc:
                         service_contract_error = str(exc)
                         service_contract_health = {
@@ -2293,9 +2355,13 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                         for item in service_contract_health.get("services", [])
                     }
 
-                if active_view == "dashboard" or (active_view == "settings" and active_section == "security"):
+                if active_view == "settings" and active_section == "security":
                     try:
                         security_posture = router.get_security_posture()
+                        _publish_router_observation(
+                            "router:security-posture", security_posture,
+                            scope="router:security", ttl_seconds=180,
+                        )
                     except RouterError as exc:
                         security_error = str(exc)
                         security_posture = {
@@ -2556,6 +2622,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "activity_coverage": activity_coverage,
             "activity_unknown_domains": activity_unknown_domains,
             "prepared_view_evidence": prepared_view_evidence,
+            "router_observation_evidence": router_observation_evidence,
             "service_prefill_dns": service_prefill_dns,
             "activity_error": activity_error,
             "flash_error": request.query_params.get("error"),
@@ -2571,7 +2638,12 @@ def api_service_health(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     try:
-        return router.get_service_contract_health(custom_service_contract_definitions())
+        health = router.get_service_contract_health(custom_service_contract_definitions())
+        _publish_router_observation(
+            "router:service-contract-health", health,
+            scope="router:service-contracts", ttl_seconds=180,
+        )
+        return health
     except RouterError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -5117,6 +5189,17 @@ def api_background_prepared_views(
     }
 
 
+@app.get("/api/reconciler/requests")
+def api_reconciliation_requests(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return {
+        "schema": "zen_reconciliation_requests_v1",
+        "summary": policy_store.reconciliation_request_stats(),
+        "requests": policy_store.list_reconciliation_requests(50),
+    }
+
+
 @app.get("/api/reconciler/status")
 def api_reconciler_status(
     user=Depends(require_role("admin", "operator", "viewer")),
@@ -5799,287 +5882,60 @@ def local_policy_summary(
 
 
 @app.post("/devices/policy/apply")
-@coherent_router_mutation
 def apply_device_policy(
     request: Request,
     ip: str = Form(...),
     csrf: str = Form(...),
     user=Depends(require_role("admin", "operator")),
 ):
-    """Reconcile live mode, bandwidth and RouterOS-backed service policy."""
+    """Durably queue reconciliation and return without waiting on RouterOS."""
     if not csrf_ok(request, csrf):
-        raise HTTPException(
-            status_code=403,
-            detail="CSRF validation failed",
-        )
-
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
     try:
-        router.assert_policy_enforcement_ready()
-        plan = get_live_policy_plan(ip)
-
-        if plan.get("temporary_override"):
-            raise RouterError(
-                f"{ip} currently has temporary NORMAL access; "
-                "reconciliation is suspended until it ends"
-            )
-
-        if not plan.get("policy_actionable"):
-            audit(
-                "POLICY_ALREADY_SYNCED",
-                user["username"],
-                (
-                    f"{ip}: mode={plan['desired_mode'].upper()} "
-                    f"bandwidth={plan['bandwidth_preset']} "
-                    f"services={','.join(plan['desired_supported_blocked_services']) or 'none'}"
-                ),
-            )
-            return RedirectResponse("/?view=devices&section=managed#devices/managed", status_code=303)
-
-        applied = []
-
-        if plan.get("mode_drift"):
-            before = plan["live_mode"]
-            result = router.set_device_mode(
-                ip,
-                plan["desired_mode"],
-                description=f"policy:{plan['mode_source']}",
-            )
-            applied.append(
-                f"mode {before.upper()}->{result['mode'].upper()}"
-            )
-
-        if plan.get("bandwidth_drift"):
-            target_preset = (
-                plan["bandwidth_preset"]
-                if plan.get("bandwidth_expected_active")
-                else "normal"
-            )
-            bandwidth_result = router.set_device_bandwidth(
-                ip,
-                target_preset,
-                plan["bandwidth_upload"],
-                plan["bandwidth_download"],
-                description=f"policy:{plan['mode_source']}",
-            )
-            applied.append(
-                "bandwidth="
-                + (
-                    bandwidth_result.get("max_limit")
-                    if bandwidth_result.get("active")
-                    else "unlimited"
-                )
-            )
-            audit(
-                "POLICY_BANDWIDTH_APPLIED",
-                user["username"],
-                (
-                    f"{ip}: {plan.get('live_bandwidth_limit') or 'unlimited'} -> "
-                    f"{bandwidth_result.get('max_limit') or 'unlimited'}; "
-                    f"preset={target_preset}"
-                ),
-            )
-
-        if plan.get("service_drift"):
-            service_result = router.set_device_services(
-                ip,
-                plan["desired_supported_blocked_services"],
-                description=f"policy:{plan['mode_source']}",
-                service_catalog=runtime_service_catalog(),
-            )
-            applied.append(
-                "services="
-                + (
-                    ",".join(service_result["blocked_services"])
-                    or "none"
-                )
-            )
-            if service_result.get("terminated_connections"):
-                applied.append(
-                    "connections_reset="
-                    f"{service_result['terminated_connections']}"
-                )
-
-        verified = get_live_policy_plan(ip)
-        if (
-            verified.get("mode_drift")
-            or verified.get("service_drift")
-            or verified.get("bandwidth_drift")
-        ):
-            raise RouterError(
-                f"Policy apply did not converge for {ip}"
-            )
-
-        audit(
-            "POLICY_APPLIED",
-            user["username"],
-            (
-                f"{ip}: {'; '.join(applied)}; "
-                f"source={plan['mode_source']}; "
-                f"unsupported_services="
-                f"{','.join(plan['unsupported_blocked_services']) or 'none'}"
-            ),
+        queued = auto_reconciler.request_reconciliation(
+            target=ip,
+            actor=user["username"],
+            reason="Manual device policy apply requested",
         )
-
-    except (RouterError, PolicyPlanError, ValueError) as exc:
         audit(
-            "POLICY_APPLY_FAILED",
-            user["username"],
-            f"{ip}: {exc}",
+            "POLICY_RECONCILE_QUEUED", user["username"],
+            f"id={queued['id']} target={ip} revision={queued['requested_revision']}",
         )
-        raise HTTPException(status_code=502, detail=str(exc))
-
-    return RedirectResponse("/?view=devices&section=managed#devices/managed", status_code=303)
+    except (ValueError, ReconciliationError) as exc:
+        audit("POLICY_RECONCILE_QUEUE_FAILED", user["username"], f"{ip}: {exc}")
+        raise HTTPException(status_code=409, detail=str(exc))
+    return redirect_ok(
+        "devices/managed",
+        f"Policy apply queued for {ip}; desired revision {queued['requested_revision']} will reconcile in the background",
+    )
 
 
 @app.post("/devices/policy/apply-all")
-@coherent_router_mutation
 def apply_all_device_policies(
     request: Request,
     csrf: str = Form(...),
     user=Depends(require_role("admin", "operator")),
 ):
-    """Reconcile mode, bandwidth and RouterOS-backed service drift for all devices."""
+    """Queue all-device convergence without holding the HTTP request on RouterOS."""
     if not csrf_ok(request, csrf):
-        raise HTTPException(
-            status_code=403,
-            detail="CSRF validation failed",
-        )
-
-    applied = []
-    synced = []
-    temporary = []
-    partial = []
-    failures = []
-
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
     try:
-        router.assert_policy_enforcement_ready()
-        devices = get_live_devices()
-
-        for device in devices:
-            ip = device["ip"]
-
-            try:
-                plan = get_live_policy_plan(ip)
-
-                if plan.get("temporary_override"):
-                    temporary.append(ip)
-                    continue
-
-                if not plan.get("policy_actionable"):
-                    synced.append(ip)
-                    if plan.get("unsupported_blocked_services"):
-                        partial.append(ip)
-                    continue
-
-                changes = []
-
-                if plan.get("mode_drift"):
-                    before = plan["live_mode"]
-                    result = router.set_device_mode(
-                        ip,
-                        plan["desired_mode"],
-                        description=f"policy:{plan['mode_source']}",
-                    )
-                    changes.append(
-                        f"mode {before}->{result['mode']}"
-                    )
-
-                if plan.get("bandwidth_drift"):
-                    target_preset = (
-                        plan["bandwidth_preset"]
-                        if plan.get("bandwidth_expected_active")
-                        else "normal"
-                    )
-                    bandwidth_result = router.set_device_bandwidth(
-                        ip,
-                        target_preset,
-                        plan["bandwidth_upload"],
-                        plan["bandwidth_download"],
-                        description=f"policy:{plan['mode_source']}",
-                    )
-                    changes.append(
-                        "bandwidth="
-                        + (
-                            bandwidth_result.get("max_limit")
-                            if bandwidth_result.get("active")
-                            else "unlimited"
-                        )
-                    )
-                    audit(
-                        "POLICY_BANDWIDTH_APPLIED",
-                        user["username"],
-                        (
-                            f"{ip}: {plan.get('live_bandwidth_limit') or 'unlimited'} -> "
-                            f"{bandwidth_result.get('max_limit') or 'unlimited'}; "
-                            f"preset={target_preset}"
-                        ),
-                    )
-
-                if plan.get("service_drift"):
-                    service_result = router.set_device_services(
-                        ip,
-                        plan["desired_supported_blocked_services"],
-                        description=f"policy:{plan['mode_source']}",
-                        service_catalog=runtime_service_catalog(),
-                    )
-                    changes.append(
-                        "services="
-                        + (
-                            ",".join(service_result["blocked_services"])
-                            or "none"
-                        )
-                    )
-
-                verified = get_live_policy_plan(ip)
-                if (
-                    verified.get("mode_drift")
-                    or verified.get("service_drift")
-                    or verified.get("bandwidth_drift")
-                ):
-                    raise RouterError(
-                        f"Policy apply did not converge for {ip}"
-                    )
-
-                applied.append(ip)
-                if verified.get("unsupported_blocked_services"):
-                    partial.append(ip)
-
-                audit(
-                    "POLICY_APPLIED",
-                    user["username"],
-                    f"{ip}: {'; '.join(changes)}; source={plan['mode_source']}",
-                )
-
-            except (RouterError, PolicyPlanError, ValueError) as exc:
-                failures.append(f"{ip}: {exc}")
-
-        audit(
-            "POLICY_RECONCILE_ALL",
-            user["username"],
-            (
-                f"applied={len(applied)} "
-                f"synced={len(synced)} "
-                f"temporary={len(temporary)} "
-                f"partial={len(partial)} "
-                f"failed={len(failures)}"
-            ),
+        queued = auto_reconciler.request_reconciliation(
+            target="*",
+            actor=user["username"],
+            reason="Manual all-device policy apply requested",
         )
-
-        if failures:
-            raise RouterError(
-                "Reconciliation completed with failures: "
-                + "; ".join(failures)
-            )
-
-    except RouterError as exc:
         audit(
-            "POLICY_RECONCILE_ALL_FAILED",
-            user["username"],
-            str(exc),
+            "POLICY_RECONCILE_ALL_QUEUED", user["username"],
+            f"id={queued['id']} revision={queued['requested_revision']}",
         )
-        raise HTTPException(status_code=502, detail=str(exc))
-
-    return RedirectResponse("/?view=devices&section=managed#devices/managed", status_code=303)
+    except (ValueError, ReconciliationError) as exc:
+        audit("POLICY_RECONCILE_ALL_QUEUE_FAILED", user["username"], str(exc))
+        raise HTTPException(status_code=409, detail=str(exc))
+    return redirect_ok(
+        "devices/managed",
+        f"All-device policy reconciliation queued at desired revision {queued['requested_revision']}",
+    )
 
 
 @app.get("/api/devices/{ip}/rewards")

@@ -313,6 +313,15 @@ class AutoReconciler:
         except Exception:
             mutation = {"schema": "zen_router_mutation_lane_v1", "busy": False, "available": False}
 
+        try:
+            requested = self.policy_store.reconciliation_request_stats()
+        except Exception as exc:
+            requested = {
+                "schema": "zen_reconciliation_queue_v1",
+                "pending": 0, "running": 0, "failed": 0,
+                "counts": {}, "latest": None, "error": str(exc),
+            }
+
         return {
             **settings,
             "worker_alive": bool(self._thread and self._thread.is_alive()),
@@ -322,6 +331,7 @@ class AutoReconciler:
             "hold_active": hold_active,
             "hold_until": hold_until_iso,
             "last": last,
+            "requested": requested,
             "router_mutation": mutation,
         }
 
@@ -369,6 +379,25 @@ class AutoReconciler:
         posture = posture_getter()
         return posture, self._failed_security_names(posture)
 
+    def _publish_security_posture(self, posture: dict) -> None:
+        """Publish advisory posture outside mutation authority.
+
+        Prepared-view persistence must never extend the RouterOS mutation-lane
+        hold time. Mutation paths always re-prove posture live and never consume
+        this cached observation.
+        """
+        try:
+            self.policy_store.save_prepared_view(
+                view_key="router:security-posture",
+                kind="router.observation",
+                scope="router:security",
+                payload=posture,
+                source_revision=int(self.policy_store.current_config_revision().get("revision") or 0),
+                ttl_seconds=180,
+            )
+        except Exception:
+            pass
+
     def _observe_plans(self, devices: list[dict]) -> dict:
         usable = [
             device for device in devices
@@ -381,6 +410,142 @@ class AutoReconciler:
                 str(device.get("ip") or device.get("address"))
             ),
         )
+
+    def request_reconciliation(
+        self, *, target="*", actor="system:manual", reason="Manual reconciliation requested"
+    ) -> dict:
+        request = self.policy_store.enqueue_reconciliation_request(
+            target=target,
+            actor=actor,
+            reason=reason,
+            requested_revision=int(self.policy_store.current_config_revision().get("revision") or 0),
+        )
+        self._wake.set()
+        return request
+
+    @timed("worker.reconciler.requested")
+    def run_requested_reconciliation(self, *, actor="system:requested") -> dict | None:
+        """Consume one durable manual request through the normal mutation lane.
+
+        Explicit requests remain available even when automatic reconciliation is
+        OFF. They never reuse pre-queue RouterOS observations. If desired state
+        changes while a request is running, the completed request is marked
+        superseded and a new request is queued for the latest revision.
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            return None
+        request = None
+        try:
+            request = self.policy_store.claim_reconciliation_request()
+            if not request:
+                return None
+            target = str(request.get("target") or "*")
+            request_actor = str(request.get("actor") or actor)
+            requested_revision = int(request.get("requested_revision") or 0)
+            started_revision = int(self.policy_store.current_config_revision().get("revision") or 0)
+            outcomes = []
+            failures = []
+
+            with self._mutation_context(f"requested-reconcile:{request['id']}"):
+                _posture, failed_names = self._security_posture()
+                if failed_names:
+                    raise ReconciliationError(
+                        "RouterOS enforcement contract is degraded: "
+                        + (", ".join(failed_names[:6]) or "critical hardening check failed")
+                    )
+
+                if target == "*":
+                    addresses = [
+                        str(item.get("ip") or item.get("address") or "").strip()
+                        for item in self.device_loader()
+                    ]
+                    addresses = [item for item in addresses if item]
+                else:
+                    addresses = [target]
+
+                for address in addresses:
+                    try:
+                        outcome = reconcile_device(
+                            address,
+                            plan_loader=self.plan_loader,
+                            router=self.router,
+                            description="requested:effective-policy",
+                        )
+                        outcomes.append({
+                            "address": address,
+                            "status": outcome.get("status"),
+                            "changes": list(outcome.get("changes") or []),
+                        })
+                    except Exception as exc:
+                        failures.append(f"{address}: {exc}")
+
+            finished_revision = int(self.policy_store.current_config_revision().get("revision") or 0)
+            result = {
+                "schema": "zen_requested_reconciliation_result_v1",
+                "target": target,
+                "requested_revision": requested_revision,
+                "started_revision": started_revision,
+                "finished_revision": finished_revision,
+                "outcomes": outcomes,
+                "failures": failures,
+            }
+            if failures:
+                status = "failed"
+                error = "; ".join(failures[:6])
+            elif finished_revision != started_revision:
+                status = "superseded"
+                error = "Desired state changed during reconciliation; latest revision re-queued"
+            elif any(item.get("status") == "temporary" for item in outcomes):
+                status = "temporary"
+                error = ""
+            elif any(item.get("status") == "partial" for item in outcomes):
+                status = "partial"
+                error = ""
+            else:
+                status = "succeeded"
+                error = ""
+
+            finished = self.policy_store.finish_reconciliation_request(
+                request["id"],
+                status=status,
+                applied_revision=finished_revision,
+                result=result,
+                error=error,
+            )
+            if status == "superseded":
+                self.request_reconciliation(
+                    target=target,
+                    actor=request_actor,
+                    reason=f"Superseding request {request['id']} at revision {finished_revision}",
+                )
+            event = "POLICY_RECONCILE_REQUEST_FAILED" if status == "failed" else "POLICY_RECONCILE_REQUEST_COMPLETED"
+            self.audit(
+                event, request_actor,
+                f"id={request['id']} target={target} status={status} revision={finished_revision} outcomes={len(outcomes)} failures={len(failures)}",
+            )
+            return finished
+        except Exception as exc:
+            if request:
+                try:
+                    self.policy_store.finish_reconciliation_request(
+                        request["id"], status="failed",
+                        applied_revision=int(self.policy_store.current_config_revision().get("revision") or 0),
+                        result={"target": request.get("target"), "outcomes": []},
+                        error=str(exc),
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.audit(
+                        "POLICY_RECONCILE_REQUEST_FAILED",
+                        str(request.get("actor") or actor),
+                        f"id={request['id']} target={request.get('target')} error={exc}",
+                    )
+                except Exception:
+                    pass
+            return None
+        finally:
+            self._cycle_lock.release()
 
     @timed("worker.reconciler.cycle")
     def run_cycle(
@@ -450,6 +615,7 @@ class AutoReconciler:
             # immediately before the first possible write.
             if mode == "enforce":
                 _posture, failed_names = self._security_posture()
+                self._publish_security_posture(_posture)
                 if failed_names:
                     result = "security_hold"
                     failures = ["security: " + ", ".join(failed_names[:8])]
@@ -659,9 +825,26 @@ class AutoReconciler:
         # Delay the first background cycle slightly so application startup and
         # health/readiness are not coupled to RouterOS availability.
         self._stop.wait(2.0)
+        try:
+            self.policy_store.recover_reconciliation_requests()
+        except Exception:
+            pass
 
         while not self._stop.is_set():
             settings = self.settings()
+
+            # Explicit user reconciliation is durable and independent of the
+            # automatic OFF/OBSERVE/ENFORCE setting. Consume a bounded number per
+            # wake so request acknowledgement is never coupled to RouterOS speed.
+            for _ in range(4):
+                try:
+                    handled = self.run_requested_reconciliation()
+                except Exception as exc:
+                    self.audit("REQUESTED_RECONCILE_WORKER_ERROR", "system:requested", str(exc))
+                    break
+                if not handled:
+                    break
+
             if settings["mode"] != "off":
                 try:
                     self.run_cycle(trigger="background", actor="system:auto")

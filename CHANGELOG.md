@@ -1,3 +1,14 @@
+## v0.54.5.1 — RouterOS request-path decoupling & reconciliation closure
+
+- Converts manual **Apply desired policy** and **Reconcile all** from synchronous RouterOS HTTP work into durable reconciliation requests that ACK after local queue persistence.
+- Adds a durable `reconciliation_requests` journal with restart recovery, same-target pending-request supersession, requested/applied revision evidence and explicit terminal states.
+- Keeps RouterOS writes exclusively in `AutoReconciler`: requested work acquires the existing cycle lock and serialized mutation lane, re-proves security posture live, re-reads policy/RouterOS state through `reconcile_device`, verifies convergence, and re-queues the latest revision if desired state changes mid-run.
+- Separates user-visible ACK latency from queue wait, worker processing and total verified convergence latency; `/api/performance` and the Performance page surface the distinction.
+- Removes multi-second security-posture and custom-service-contract probes from ordinary Dashboard navigation. Dashboard consumes revision-bound prepared RouterOS observations with explicit FRESH / STALE / MISSING semantics; authority-changing paths never consume prepared observations.
+- Publishes fresh security observations from the reconciler and fresh service-contract observations from explicit live Service Intelligence/API reads.
+- Tightens formal performance evidence so an alive but `degraded`/`error` background worker, or a cycle reporting failed jobs, is **FAIL** rather than timing-only PASS; the worker performance snapshot now exposes `last_error` for diagnosis.
+- Adds hostile coverage for queue coalescing, restart recovery, OFF-mode explicit reconciliation, serialized authority ownership, dashboard non-blocking reads and degraded-worker truthfulness.
+
 ## v0.54.5 — Final release-readiness closure
 
 - Upgrades the portable readiness contract to `zen_release_readiness_v2` and fixes the final application gate at exactly eight current checks. Final readiness requires `PASS 8 / PENDING 0 / FAIL 0`; contradictory counts/state are rejected by the CLI.

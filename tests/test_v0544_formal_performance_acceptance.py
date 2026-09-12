@@ -104,7 +104,7 @@ class FormalPerformanceAcceptanceTests(unittest.TestCase):
         snapshot = perf.snapshot()
         snapshot["configuration"]["budget_navigation_p95_ms"] = 5000.0
         operational = {
-            "background_worker": {"worker_alive": True, "last_duration_ms": 12.5},
+            "background_worker": {"worker_alive": True, "last_duration_ms": 12.5, "last_result": "ok", "last_failed": 0},
             "parallel_observation": {
                 "items": 4, "workers": 4, "max_active": 4,
                 "utilisation_percent": 100.0, "failed": 0,
@@ -120,13 +120,38 @@ class FormalPerformanceAcceptanceTests(unittest.TestCase):
         self.assertIn("budget_navigation_p95_ms", row["relaxed"])
         self.assertEqual("fail", formal["state"])
 
+    def test_degraded_background_worker_is_formal_fail(self):
+        perf = PerformanceCollector()
+        self._populate_request_classes(perf)
+        perf.record_evidence("prepared_view.hit")
+        snapshot = perf.snapshot()
+        operational = {
+            "background_worker": {
+                "worker_alive": True, "last_duration_ms": 66009.0,
+                "last_result": "degraded", "last_failed": 6,
+            },
+            "parallel_observation": {
+                "items": 4, "workers": 4, "max_active": 4,
+                "utilisation_percent": 100.0, "failed": 0,
+            },
+            "mutation_lane": {
+                "acquisitions": 1, "contentions": 0,
+                "last_wait_ms": 0.0, "max_wait_ms": 0.0,
+            },
+        }
+        formal = build_formal_acceptance(snapshot, operational)
+        row = next(item for item in formal["evidence_targets"] if item["key"] == "background_worker")
+        self.assertEqual("fail", row["state"])
+        self.assertEqual(6, row["last_failed"])
+        self.assertEqual("fail", formal["state"])
+
     def test_formal_gate_passes_with_complete_observational_evidence(self):
         perf = PerformanceCollector()
         self._populate_request_classes(perf)
         perf.record_evidence("prepared_view.hit")
         snapshot = perf.snapshot()
         operational = {
-            "background_worker": {"worker_alive": True, "last_duration_ms": 12.5},
+            "background_worker": {"worker_alive": True, "last_duration_ms": 12.5, "last_result": "ok", "last_failed": 0},
             "parallel_observation": {
                 "items": 4,
                 "workers": 4,
@@ -166,11 +191,11 @@ class FormalPerformanceSourceContractTests(unittest.TestCase):
         self.assertIn('or path.startswith("/local/performance/")', self.main)
 
     def test_release_and_formal_contract_are_v0544(self):
-        self.assertIn('version="0.54.5"', self.main)
+        self.assertIn('version="0.54.5.1"', self.main)
         self.assertIn("zen_performance_acceptance_v2", self.performance)
         self.assertIn("zen_formal_performance_acceptance_v1", self.performance)
         self.assertIn("ZEN Control v0.54.4 formal performance acceptance", self.script)
-        self.assertIn("Current release: **v0.54.5**", self.readme)
+        self.assertIn("Current release: **v0.54.5.1**", self.readme)
         self.assertIn("## v0.54.4 — Formal performance acceptance", self.changelog)
 
     def test_prepared_view_hit_miss_fallback_evidence_is_explicit(self):

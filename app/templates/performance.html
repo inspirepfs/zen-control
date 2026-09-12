@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   {% include "_pwa_head.jinja" %}
   <title>Performance · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.54.5">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.5">
-  <link rel="stylesheet" href="/static/performance.css?v=0.54.5">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/performance.css?v=0.54.5.1">
 </head>
 <body class="standalone-page">
 <main class="standalone-shell performance-shell">
@@ -82,7 +82,7 @@
             <td>
               {% if row.key == 'threshold_profile' %}min samples {{ row.configured_min_samples }} · relaxed {% if row.relaxed %}{{ row.relaxed|join(', ') }}{% else %}none{% endif %}
               {% elif row.key == 'prepared_views' %}hits {{ row.hits }} · misses {{ row.misses }} · fallbacks {{ row.fallbacks }}
-              {% elif row.key == 'background_worker' %}alive {{ row.worker_alive }} · last {{ row.last_duration_ms if row.last_duration_ms is not none else 'n/a' }} ms
+              {% elif row.key == 'background_worker' %}alive {{ row.worker_alive }} · result {{ row.last_result or 'n/a' }} · failed {{ row.last_failed or 0 }} · last {{ row.last_duration_ms if row.last_duration_ms is not none else 'n/a' }} ms
               {% elif row.key == 'parallel_observation' %}items {{ row.items }} · workers {{ row.workers }} · max active {{ row.max_active }} · utilisation {{ row.utilisation_percent if row.utilisation_percent is not none else 'n/a' }}%
               {% elif row.key == 'mutation_lane' %}acquisitions {{ row.acquisitions if row.acquisitions is not none else 'n/a' }} · contentions {{ row.contentions if row.contentions is not none else 'n/a' }} · wait {{ row.last_wait_ms if row.last_wait_ms is not none else 'n/a' }} / {{ row.max_wait_ms if row.max_wait_ms is not none else 'n/a' }} ms
               {% endif %}
@@ -93,6 +93,27 @@
         </tbody>
       </table>
     </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading">
+      <div>
+        <h2>Reconciliation acknowledgement vs convergence</h2>
+        <p class="muted">Declarative Apply actions now ACK after durable local queueing. RouterOS convergence is measured separately so a fast UI response never hides slow control-plane work.</p>
+      </div>
+    </div>
+    {% set rq = snapshot.operational_evidence.reconciliation_queue or {} %}
+    {% set lat = rq.latency or {} %}
+    <div class="auto-reconcile-status">
+      <div><span class="muted small">Pending</span><strong>{{rq.pending or 0}}</strong></div>
+      <div><span class="muted small">Running</span><strong>{{rq.running or 0}}</strong></div>
+      <div><span class="muted small">Failed</span><strong>{{rq.failed or 0}}</strong></div>
+      <div><span class="muted small">Convergence samples</span><strong>{{(lat.convergence or {}).count or 0}}</strong></div>
+      <div><span class="muted small">Queue wait p95</span><strong>{{ '%.1f'|format((lat.queue_wait or {}).p95_ms or 0) }} ms</strong></div>
+      <div><span class="muted small">Worker processing p95</span><strong>{{ '%.1f'|format((lat.processing or {}).p95_ms or 0) }} ms</strong></div>
+      <div><span class="muted small">Total convergence p95</span><strong>{{ '%.1f'|format((lat.convergence or {}).p95_ms or 0) }} ms</strong></div>
+    </div>
+    <p class="muted small">HTTP POST latency remains part of the Local configuration write acceptance class; convergence latency starts at durable queue creation and ends only after verified reconciliation completes.</p>
   </section>
 
   <section class="card">

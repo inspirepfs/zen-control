@@ -313,13 +313,22 @@ class V0542SourceContractTests(unittest.TestCase):
         for name in (
             "set_mode", "temporary", "add_schedule", "remove_schedule",
             "local_service_provision", "local_service_unprovision",
-            "local_security_cleanup_stale", "apply_device_policy",
-            "apply_all_device_policies", "redeem_device_rewards",
+            "local_security_cleanup_stale", "redeem_device_rewards",
             "start_device_temporary_access", "cancel_device_temporary_access",
             "set_device_enforcement", "add_device", "remove_device", "set_web_policy",
         ):
             with self.subTest(name=name):
                 self.assertIn(f"@coherent_router_mutation\ndef {name}", self.main)
+
+        # v0.54.5.1.1 deliberately moves the declarative Apply buttons off the
+        # synchronous RouterOS request path. The reconciler, not the HTTP route,
+        # owns the mutation lane for those queued requests.
+        for name in ("apply_device_policy", "apply_all_device_policies"):
+            with self.subTest(name=f"queued:{name}"):
+                self.assertNotIn(f"@coherent_router_mutation\ndef {name}", self.main)
+                block = self.main.split(f"def {name}", 1)[1].split("\n@app.", 1)[0]
+                self.assertIn("request_reconciliation", block)
+                self.assertNotIn("router.", block)
 
     def test_authority_transfer_preserves_cycle_then_mutation_lock_order(self):
         self.assertIn('with self._mutation_context("authority-transfer"):', self.reconciler)
@@ -357,8 +366,8 @@ class V0542SourceContractTests(unittest.TestCase):
         self.assertIn("reconciler_status.router_mutation", template)
 
     def test_release_identity_is_v0542(self):
-        self.assertIn('version="0.54.5"', self.main)
-        self.assertIn("v0.54.5", (ROOT / "README.md").read_text())
+        self.assertIn('version="0.54.5.1"', self.main)
+        self.assertIn("v0.54.5.1", (ROOT / "README.md").read_text())
         self.assertIn("## v0.54.2 — Parallel observation / serialized enforcement", (ROOT / "CHANGELOG.md").read_text())
 
 

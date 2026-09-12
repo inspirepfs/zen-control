@@ -452,6 +452,27 @@ class PolicyStore:
                 CREATE INDEX IF NOT EXISTS idx_background_jobs_claim
                     ON background_jobs(status, available_at, id);
 
+                CREATE TABLE IF NOT EXISTS reconciliation_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target TEXT NOT NULL,
+                    requested_revision INTEGER NOT NULL DEFAULT 0,
+                    applied_revision INTEGER NOT NULL DEFAULT 0,
+                    actor TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_reconciliation_requests_status_id
+                    ON reconciliation_requests(status, id);
+
+                CREATE INDEX IF NOT EXISTS idx_reconciliation_requests_target_id
+                    ON reconciliation_requests(target, id DESC);
+
                 CREATE TABLE IF NOT EXISTS background_scope_locks (
                     scope TEXT PRIMARY KEY,
                     owner TEXT NOT NULL,
@@ -977,6 +998,186 @@ class PolicyStore:
                 (worker_name, token, expires, now, now, *params),
             ).fetchone()
         return self._background_job_dict(row)
+
+    @staticmethod
+    def _reconciliation_request_dict(row):
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["result"] = json.loads(item.pop("result_json"))
+        except (json.JSONDecodeError, TypeError):
+            item["result"] = {}
+        return item
+
+    def enqueue_reconciliation_request(
+        self, *, target="*", actor="system:reconciler", reason="Manual reconciliation requested", requested_revision=None
+    ):
+        """Durably request reconciliation without granting RouterOS authority.
+
+        The row is intent/evidence only. AutoReconciler remains the sole consumer
+        that may enter the serialized RouterOS mutation lane. Repeated pending
+        requests for the same target are superseded so rapid UI actions converge
+        on the latest desired state instead of replaying stale work.
+        """
+        target = str(target or "*").strip() or "*"
+        if target != "*":
+            ipaddress.ip_address(target)
+        actor = str(actor or "system:reconciler")[:100]
+        reason = str(reason or "Manual reconciliation requested")[:240]
+        if requested_revision is None:
+            requested_revision = int(self.current_config_revision().get("revision") or 0)
+        requested_revision = max(0, int(requested_revision))
+        now = self._operations_now_iso()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE reconciliation_requests
+                   SET status='superseded', finished_at=?, error='Superseded by newer request'
+                   WHERE target=? AND status='pending'""",
+                (now, target),
+            )
+            cur = db.execute(
+                """INSERT INTO reconciliation_requests
+                   (target, requested_revision, actor, reason, status, created_at)
+                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                (target, requested_revision, actor, reason, now),
+            )
+            row = db.execute(
+                "SELECT * FROM reconciliation_requests WHERE id=?", (int(cur.lastrowid),)
+            ).fetchone()
+        return self._reconciliation_request_dict(row)
+
+    def recover_reconciliation_requests(self):
+        """Replay an interrupted request after restart using fresh reads.
+
+        Router mutations are idempotently re-derived from current RouterOS and
+        desired state; no pre-restart observation is promoted to authority.
+        """
+        now = self._operations_now_iso()
+        with self._db() as db:
+            cur = db.execute(
+                """UPDATE reconciliation_requests
+                   SET status='pending', started_at='', error='Recovered interrupted reconciliation'
+                   WHERE status='running'"""
+            )
+        return int(cur.rowcount or 0)
+
+    def claim_reconciliation_request(self):
+        now = self._operations_now_iso()
+        with self._db() as db:
+            row = db.execute(
+                """UPDATE reconciliation_requests
+                   SET status='running', started_at=?, error=''
+                   WHERE id=(
+                       SELECT id FROM reconciliation_requests
+                       WHERE status='pending' ORDER BY id LIMIT 1
+                   ) AND status='pending'
+                   RETURNING *""",
+                (now,),
+            ).fetchone()
+        return self._reconciliation_request_dict(row)
+
+    def finish_reconciliation_request(
+        self, request_id, *, status, applied_revision=0, result=None, error=""
+    ):
+        status = str(status or "failed").strip().lower()
+        if status not in {"succeeded", "partial", "temporary", "failed", "superseded"}:
+            raise ValueError("Invalid reconciliation request status")
+        now = self._operations_now_iso()
+        with self._db() as db:
+            cur = db.execute(
+                """UPDATE reconciliation_requests
+                   SET status=?, applied_revision=?, result_json=?, error=?, finished_at=?
+                   WHERE id=? AND status='running'""",
+                (
+                    status, max(0, int(applied_revision or 0)), self._bounded_json(result),
+                    str(error or "")[:500], now, int(request_id),
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Reconciliation request is no longer running")
+            row = db.execute(
+                "SELECT * FROM reconciliation_requests WHERE id=?", (int(request_id),)
+            ).fetchone()
+        return self._reconciliation_request_dict(row)
+
+    def list_reconciliation_requests(self, limit=50):
+        limit = max(1, min(500, int(limit)))
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT * FROM reconciliation_requests ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._reconciliation_request_dict(row) for row in rows]
+
+    def reconciliation_request_stats(self):
+        with self._db() as db:
+            counts = {
+                row["status"]: int(row["count"])
+                for row in db.execute(
+                    "SELECT status, COUNT(*) AS count FROM reconciliation_requests GROUP BY status"
+                ).fetchall()
+            }
+            latest = db.execute(
+                "SELECT * FROM reconciliation_requests ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            recent = db.execute(
+                """SELECT created_at, started_at, finished_at, status
+                   FROM reconciliation_requests
+                   WHERE status IN ('succeeded','partial','temporary')
+                     AND started_at<>'' AND finished_at<>''
+                   ORDER BY id DESC LIMIT 100"""
+            ).fetchall()
+
+        def elapsed_ms(start, end):
+            try:
+                a = datetime.fromisoformat(str(start or ""))
+                b = datetime.fromisoformat(str(end or ""))
+                if a.tzinfo is None:
+                    a = a.replace(tzinfo=timezone.utc)
+                if b.tzinfo is None:
+                    b = b.replace(tzinfo=timezone.utc)
+                return max(0.0, (b - a).total_seconds() * 1000.0)
+            except (TypeError, ValueError):
+                return None
+
+        def latency_stats(values):
+            values = sorted(float(value) for value in values if value is not None)
+            if not values:
+                return {"count": 0, "min_ms": 0.0, "avg_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+            def percentile(p):
+                if len(values) == 1:
+                    return values[0]
+                rank = (len(values) - 1) * p
+                lower = int(rank)
+                upper = min(lower + 1, len(values) - 1)
+                fraction = rank - lower
+                return values[lower] + (values[upper] - values[lower]) * fraction
+            return {
+                "count": len(values),
+                "min_ms": round(values[0], 3),
+                "avg_ms": round(sum(values) / len(values), 3),
+                "p50_ms": round(percentile(0.50), 3),
+                "p95_ms": round(percentile(0.95), 3),
+                "max_ms": round(values[-1], 3),
+            }
+
+        queue_wait = [elapsed_ms(row["created_at"], row["started_at"]) for row in recent]
+        processing = [elapsed_ms(row["started_at"], row["finished_at"]) for row in recent]
+        convergence = [elapsed_ms(row["created_at"], row["finished_at"]) for row in recent]
+        return {
+            "schema": "zen_reconciliation_queue_v1",
+            "counts": counts,
+            "pending": int(counts.get("pending", 0)),
+            "running": int(counts.get("running", 0)),
+            "failed": int(counts.get("failed", 0)),
+            "latest": self._reconciliation_request_dict(latest),
+            "latency": {
+                "queue_wait": latency_stats(queue_wait),
+                "processing": latency_stats(processing),
+                "convergence": latency_stats(convergence),
+            },
+        }
 
     def acquire_background_scope_lock(self, *, scope, owner, token, lease_seconds=30):
         scope = str(scope or "global")[:160]
@@ -2112,7 +2313,7 @@ class PolicyStore:
             "summary_deliveries", "policy_state_history", "managed_device_identity",
             "config_revision_state", "config_revisions", "outbox_events",
             "background_jobs", "background_scope_locks", "background_worker_metrics",
-            "prepared_views",
+            "prepared_views", "reconciliation_requests",
         }
         try:
             with sqlite3.connect(self.path, timeout=5.0) as db:
