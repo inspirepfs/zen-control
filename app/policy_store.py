@@ -71,6 +71,10 @@ DEVICE_CATEGORIES = [
 ]
 
 
+class ConfigRevisionConflict(ValueError):
+    """A caller attempted to write against a stale configuration revision."""
+
+
 class PolicyStore:
     """Container-local desired-policy configuration.
 
@@ -389,8 +393,94 @@ class PolicyStore:
                     last_seen TEXT NOT NULL DEFAULT '',
                     seen_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS config_revision_state (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    digest TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    actor TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS config_revisions (
+                    revision INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    actor TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT 'config',
+                    digest TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS outbox_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    aggregate_type TEXT NOT NULL DEFAULT '',
+                    aggregate_key TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    dispatched_at TEXT NOT NULL DEFAULT '',
+                    background_job_id INTEGER NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_outbox_status_id
+                    ON outbox_events(status, id);
+
+                CREATE TABLE IF NOT EXISTS background_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'global',
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    available_at TEXT NOT NULL,
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_token TEXT NOT NULL DEFAULT '',
+                    lease_expires_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_background_jobs_claim
+                    ON background_jobs(status, available_at, id);
+
+                CREATE TABLE IF NOT EXISTS background_scope_locks (
+                    scope TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    token TEXT NOT NULL,
+                    lease_expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS background_worker_metrics (
+                    worker_name TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL DEFAULT '',
+                    heartbeat_at TEXT NOT NULL DEFAULT '',
+                    cycles INTEGER NOT NULL DEFAULT 0,
+                    jobs_claimed INTEGER NOT NULL DEFAULT 0,
+                    jobs_succeeded INTEGER NOT NULL DEFAULT 0,
+                    jobs_failed INTEGER NOT NULL DEFAULT 0,
+                    jobs_deferred INTEGER NOT NULL DEFAULT 0,
+                    last_duration_ms REAL NOT NULL DEFAULT 0,
+                    last_result TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
+            db.execute(
+                """INSERT OR IGNORE INTO config_revision_state
+                   (singleton, revision, digest, updated_at, actor, reason)
+                   VALUES (1, 0, '', '', '', '')"""
+            )
+
             for key, (name, upload, download, description) in DEFAULT_BANDWIDTH_PRESETS.items():
                 db.execute(
                     """INSERT OR IGNORE INTO bandwidth_presets
@@ -563,6 +653,506 @@ class PolicyStore:
     @staticmethod
     def _operations_now_iso():
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _bounded_json(payload):
+        return json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+
+    def _assert_config_revision_db(self, db, expected_revision):
+        row = db.execute(
+            "SELECT revision FROM config_revision_state WHERE singleton=1"
+        ).fetchone()
+        current = int(row["revision"] if row else 0)
+        if expected_revision is not None and int(expected_revision) != current:
+            raise ConfigRevisionConflict(
+                f"Configuration changed from revision {int(expected_revision)} to {current}; reload before saving"
+            )
+        return current
+
+    def _advance_config_revision_db(
+        self,
+        db,
+        *,
+        actor="system:policy-store",
+        reason="Configuration updated",
+        scope="config",
+        digest="",
+    ):
+        current = self._assert_config_revision_db(db, None)
+        revision = current + 1
+        now = self._operations_now_iso()
+        actor = str(actor or "system:policy-store")[:100]
+        reason = str(reason or "Configuration updated")[:240]
+        scope = str(scope or "config")[:100]
+        digest = str(digest or "")[:128]
+        db.execute(
+            """UPDATE config_revision_state
+               SET revision=?, digest=?, updated_at=?, actor=?, reason=?
+               WHERE singleton=1""",
+            (revision, digest, now, actor, reason),
+        )
+        db.execute(
+            """INSERT INTO config_revisions
+               (revision, created_at, actor, reason, scope, digest)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (revision, now, actor, reason, scope, digest),
+        )
+        payload = {
+            "revision": revision,
+            "scope": scope,
+            "reason": reason,
+            "actor": actor,
+        }
+        db.execute(
+            """INSERT INTO outbox_events
+               (created_at, topic, aggregate_type, aggregate_key, revision, payload_json, status)
+               VALUES (?, 'config.changed', 'configuration', 'global', ?, ?, 'pending')""",
+            (now, revision, self._bounded_json(payload)),
+        )
+        return revision
+
+    @contextmanager
+    def config_write(
+        self,
+        *,
+        actor="system:policy-store",
+        reason="Configuration updated",
+        scope="config",
+        expected_revision=None,
+    ):
+        """Open one configuration transaction with optimistic concurrency.
+
+        The application write, revision journal entry and outbox event commit in
+        the same SQLite transaction. Existing call sites may omit
+        ``expected_revision``; callers that present a revision gain stale-write
+        rejection without introducing a second authority path.
+        """
+        with self._db() as db:
+            self._assert_config_revision_db(db, expected_revision)
+            yield db
+            self._advance_config_revision_db(
+                db,
+                actor=actor,
+                reason=reason,
+                scope=scope,
+            )
+
+    def current_config_revision(self):
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM config_revision_state WHERE singleton=1"
+            ).fetchone()
+        return dict(row) if row else {
+            "singleton": 1,
+            "revision": 0,
+            "digest": "",
+            "updated_at": "",
+            "actor": "",
+            "reason": "",
+        }
+
+    def list_config_revisions(self, limit=50):
+        limit = max(1, min(500, int(limit)))
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT * FROM config_revisions ORDER BY revision DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def ensure_config_revision_baseline(self, actor="system:startup"):
+        current = self.current_config_revision()
+        if int(current.get("revision") or 0) > 0:
+            return current
+        digest = self.config_digest()
+        with self._db() as db:
+            revision = self._assert_config_revision_db(db, None)
+            if revision == 0:
+                self._advance_config_revision_db(
+                    db,
+                    actor=actor,
+                    reason="v0.54 revision journal baseline",
+                    scope="bootstrap",
+                    digest=digest,
+                )
+            else:
+                db.execute(
+                    "UPDATE config_revision_state SET digest=? WHERE singleton=1 AND digest=''",
+                    (digest,),
+                )
+        return self.current_config_revision()
+
+    def list_outbox_events(self, *, status=None, limit=100):
+        limit = max(1, min(500, int(limit)))
+        with self._db() as db:
+            if status:
+                rows = db.execute(
+                    "SELECT * FROM outbox_events WHERE status=? ORDER BY id DESC LIMIT ?",
+                    (str(status), limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM outbox_events ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.pop("payload_json"))
+            except (json.JSONDecodeError, TypeError):
+                item["payload"] = {}
+            result.append(item)
+        return result
+
+    def enqueue_background_job(
+        self,
+        *,
+        kind,
+        scope,
+        idempotency_key,
+        payload=None,
+        max_attempts=3,
+        available_at=None,
+    ):
+        kind = str(kind or "").strip()[:100]
+        scope = str(scope or "global").strip()[:160]
+        idempotency_key = str(idempotency_key or "").strip()[:240]
+        if not kind or not idempotency_key:
+            raise ValueError("Background job kind and idempotency key are required")
+        max_attempts = max(1, min(10, int(max_attempts)))
+        now = self._operations_now_iso()
+        available_at = str(available_at or now)
+        with self._db() as db:
+            db.execute(
+                """INSERT OR IGNORE INTO background_jobs
+                   (kind, scope, idempotency_key, payload_json, status, attempts,
+                    max_attempts, available_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                (
+                    kind,
+                    scope,
+                    idempotency_key,
+                    self._bounded_json(payload),
+                    max_attempts,
+                    available_at,
+                    now,
+                    now,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM background_jobs WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+        return self._background_job_dict(row)
+
+    @staticmethod
+    def _background_job_dict(row):
+        if not row:
+            return None
+        item = dict(row)
+        for source, target in (("payload_json", "payload"), ("result_json", "result")):
+            try:
+                item[target] = json.loads(item.pop(source))
+            except (json.JSONDecodeError, TypeError):
+                item[target] = {}
+        return item
+
+    def dispatch_outbox_to_background_jobs(self, limit=50):
+        limit = max(1, min(500, int(limit)))
+        now = self._operations_now_iso()
+        dispatched = 0
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT * FROM outbox_events
+                   WHERE status='pending' ORDER BY id LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            for row in rows:
+                topic = str(row["topic"] or "")
+                if topic != "config.changed":
+                    db.execute(
+                        "UPDATE outbox_events SET status='ignored', dispatched_at=? WHERE id=?",
+                        (now, row["id"]),
+                    )
+                    continue
+                revision = int(row["revision"] or 0)
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                key = f"config-analytics:r{revision}"
+                db.execute(
+                    """INSERT OR IGNORE INTO background_jobs
+                       (kind, scope, idempotency_key, payload_json, status, attempts,
+                        max_attempts, available_at, created_at, updated_at)
+                       VALUES ('analytics.config-summary', 'analytics:config', ?, ?, 'pending', 0, 3, ?, ?, ?)""",
+                    (key, self._bounded_json(payload), now, now, now),
+                )
+                job = db.execute(
+                    "SELECT id FROM background_jobs WHERE idempotency_key=?",
+                    (key,),
+                ).fetchone()
+                db.execute(
+                    """UPDATE outbox_events
+                       SET status='dispatched', dispatched_at=?, background_job_id=?
+                       WHERE id=?""",
+                    (now, int(job["id"]), int(row["id"])),
+                )
+                dispatched += 1
+        return dispatched
+
+    def recover_expired_background_work(self):
+        now = self._operations_now_iso()
+        with self._db() as db:
+            db.execute(
+                "DELETE FROM background_scope_locks WHERE lease_expires_at<>'' AND lease_expires_at<=?",
+                (now,),
+            )
+            cur = db.execute(
+                """UPDATE background_jobs
+                   SET status='pending', lease_owner='', lease_token='', lease_expires_at='',
+                       available_at=?, updated_at=?, error='Recovered expired worker lease'
+                   WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<=?
+                     AND attempts < max_attempts""",
+                (now, now, now),
+            )
+            db.execute(
+                """UPDATE background_jobs
+                   SET status='failed', finished_at=?, updated_at=?,
+                       error=CASE WHEN error='' THEN 'Lease expired after maximum attempts' ELSE error END
+                   WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<=?
+                     AND attempts >= max_attempts""",
+                (now, now, now),
+            )
+        return int(cur.rowcount or 0)
+
+    def claim_background_job(self, *, worker_name, lease_seconds=30, kinds=()):
+        worker_name = str(worker_name or "worker")[:80]
+        lease_seconds = max(5, min(300, int(lease_seconds)))
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        token = uuid.uuid4().hex
+        kinds = tuple(str(item) for item in kinds if str(item))
+        kind_sql = ""
+        params = [now]
+        if kinds:
+            kind_sql = " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
+            params.extend(kinds)
+        with self._db() as db:
+            row = db.execute(
+                f"""UPDATE background_jobs
+                    SET status='running', attempts=attempts+1, lease_owner=?, lease_token=?,
+                        lease_expires_at=?, started_at=CASE WHEN started_at='' THEN ? ELSE started_at END,
+                        updated_at=?
+                    WHERE id=(
+                        SELECT id FROM background_jobs
+                        WHERE status='pending' AND available_at<=? AND attempts < max_attempts
+                        {kind_sql}
+                        ORDER BY id LIMIT 1
+                    ) AND status='pending'
+                    RETURNING *""",
+                (worker_name, token, expires, now, now, *params),
+            ).fetchone()
+        return self._background_job_dict(row)
+
+    def acquire_background_scope_lock(self, *, scope, owner, token, lease_seconds=30):
+        scope = str(scope or "global")[:160]
+        owner = str(owner or "worker")[:80]
+        token = str(token or "")[:80]
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        expires = (now_dt + timedelta(seconds=max(5, int(lease_seconds)))).isoformat(timespec="seconds")
+        with self._db() as db:
+            db.execute(
+                "DELETE FROM background_scope_locks WHERE scope=? AND lease_expires_at<=?",
+                (scope, now),
+            )
+            try:
+                db.execute(
+                    """INSERT INTO background_scope_locks
+                       (scope, owner, token, lease_expires_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (scope, owner, token, expires, now),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                row = db.execute(
+                    "SELECT owner, token FROM background_scope_locks WHERE scope=?",
+                    (scope,),
+                ).fetchone()
+                return bool(row and row["owner"] == owner and row["token"] == token)
+
+    def release_background_scope_lock(self, *, scope, owner, token):
+        with self._db() as db:
+            cur = db.execute(
+                "DELETE FROM background_scope_locks WHERE scope=? AND owner=? AND token=?",
+                (str(scope), str(owner), str(token)),
+            )
+        return cur.rowcount == 1
+
+    def _update_background_job_with_lease(self, job_id, worker_name, lease_token, sql, values):
+        with self._db() as db:
+            cur = db.execute(
+                sql,
+                (*values, int(job_id), str(worker_name), str(lease_token)),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Background job lease no longer belongs to this worker")
+
+    def complete_background_job(self, job_id, *, worker_name, lease_token, result=None):
+        now = self._operations_now_iso()
+        self._update_background_job_with_lease(
+            job_id,
+            worker_name,
+            lease_token,
+            """UPDATE background_jobs
+               SET status='succeeded', result_json=?, error='', finished_at=?, updated_at=?,
+                   lease_owner='', lease_token='', lease_expires_at=''
+               WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?""",
+            (self._bounded_json(result), now, now),
+        )
+
+    def fail_background_job(self, job_id, *, worker_name, lease_token, error):
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        retry_at = (now_dt + timedelta(seconds=5)).isoformat(timespec="seconds")
+        with self._db() as db:
+            row = db.execute(
+                """SELECT attempts, max_attempts FROM background_jobs
+                   WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?""",
+                (int(job_id), str(worker_name), str(lease_token)),
+            ).fetchone()
+            if not row:
+                raise ValueError("Background job lease no longer belongs to this worker")
+            terminal = int(row["attempts"]) >= int(row["max_attempts"])
+            db.execute(
+                """UPDATE background_jobs
+                   SET status=?, error=?, available_at=?, finished_at=?, updated_at=?,
+                       lease_owner='', lease_token='', lease_expires_at=''
+                   WHERE id=?""",
+                (
+                    "failed" if terminal else "pending",
+                    str(error or "Background job failed")[:500],
+                    retry_at,
+                    now if terminal else "",
+                    now,
+                    int(job_id),
+                ),
+            )
+
+    def defer_background_job(self, job_id, *, worker_name, lease_token, delay_seconds=1, reason="deferred"):
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        available = (now_dt + timedelta(seconds=max(1, int(delay_seconds)))).isoformat(timespec="seconds")
+        self._update_background_job_with_lease(
+            job_id,
+            worker_name,
+            lease_token,
+            """UPDATE background_jobs
+               SET status='pending', attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END, available_at=?, error=?, updated_at=?,
+                   lease_owner='', lease_token='', lease_expires_at=''
+               WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?""",
+            (available, str(reason or "deferred")[:240], now),
+        )
+
+    def list_background_jobs(self, limit=100):
+        limit = max(1, min(500, int(limit)))
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT * FROM background_jobs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._background_job_dict(row) for row in rows]
+
+    def record_background_worker_metrics(self, *, worker_name, cycle):
+        now = self._operations_now_iso()
+        with self._db() as db:
+            existing = db.execute(
+                "SELECT started_at FROM background_worker_metrics WHERE worker_name=?",
+                (str(worker_name),),
+            ).fetchone()
+            started_at = str(existing["started_at"] or now) if existing else now
+            db.execute(
+                """INSERT INTO background_worker_metrics
+                   (worker_name, started_at, heartbeat_at, cycles, jobs_claimed,
+                    jobs_succeeded, jobs_failed, jobs_deferred, last_duration_ms,
+                    last_result, last_error)
+                   VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(worker_name) DO UPDATE SET
+                     heartbeat_at=excluded.heartbeat_at,
+                     cycles=background_worker_metrics.cycles+1,
+                     jobs_claimed=background_worker_metrics.jobs_claimed+excluded.jobs_claimed,
+                     jobs_succeeded=background_worker_metrics.jobs_succeeded+excluded.jobs_succeeded,
+                     jobs_failed=background_worker_metrics.jobs_failed+excluded.jobs_failed,
+                     jobs_deferred=background_worker_metrics.jobs_deferred+excluded.jobs_deferred,
+                     last_duration_ms=excluded.last_duration_ms,
+                     last_result=excluded.last_result,
+                     last_error=excluded.last_error""",
+                (
+                    str(worker_name)[:80],
+                    started_at,
+                    now,
+                    int(cycle.get("claimed") or 0),
+                    int(cycle.get("succeeded") or 0),
+                    int(cycle.get("failed") or 0),
+                    int(cycle.get("deferred") or 0),
+                    float(cycle.get("duration_ms") or 0.0),
+                    str(cycle.get("result") or "")[:40],
+                    str(cycle.get("last_error") or "")[:240],
+                ),
+            )
+
+    def background_work_stats(self):
+        with self._db() as db:
+            jobs = {
+                row["status"]: int(row["count"])
+                for row in db.execute(
+                    "SELECT status, COUNT(*) AS count FROM background_jobs GROUP BY status"
+                ).fetchall()
+            }
+            outbox = {
+                row["status"]: int(row["count"])
+                for row in db.execute(
+                    "SELECT status, COUNT(*) AS count FROM outbox_events GROUP BY status"
+                ).fetchall()
+            }
+            locks = int(db.execute("SELECT COUNT(*) FROM background_scope_locks").fetchone()[0])
+            metrics = [dict(row) for row in db.execute(
+                "SELECT * FROM background_worker_metrics ORDER BY worker_name"
+            ).fetchall()]
+        return {
+            "available": True,
+            "revision": self.current_config_revision(),
+            "jobs": jobs,
+            "outbox": outbox,
+            "scope_locks": locks,
+            "workers": metrics,
+        }
+
+    def build_config_analytics_snapshot(self):
+        """Read-only local analytics used by the first v0.54 background job."""
+        with self._db() as db:
+            counts = {}
+            for table in (
+                "profiles", "device_policy", "services", "schedule_plans",
+                "aggregate_policy_groups", "incidents",
+            ):
+                counts[table] = int(db.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            modes = {
+                row["mode_override"]: int(row["count"])
+                for row in db.execute(
+                    "SELECT mode_override, COUNT(*) AS count FROM device_policy GROUP BY mode_override"
+                ).fetchall()
+            }
+        return {
+            "schema": "zen_config_analytics_v1",
+            "captured_at": self._operations_now_iso(),
+            "revision": int(self.current_config_revision().get("revision") or 0),
+            "counts": counts,
+            "device_mode_overrides": modes,
+            "authority": "read-only-local",
+        }
 
     @staticmethod
     def _policy_history_instant_iso(value):
@@ -1183,6 +1773,9 @@ class PolicyStore:
         interval_seconds="60",
         bypass_min_status="elevated",
         retention_days="30",
+        *,
+        expected_revision=None,
+        actor="system:policy-store",
     ):
         enabled = "1" if str(enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
         interval = str(interval_seconds or "60").strip()
@@ -1203,7 +1796,12 @@ class PolicyStore:
             "incident_bypass_min_status": bypass_min_status,
             "incident_retention_days": str(retention),
         }
-        with self._db() as db:
+        with self.config_write(
+            scope="settings:incidents",
+            reason="Incident settings updated",
+            actor=actor,
+            expected_revision=expected_revision,
+        ) as db:
             for key, value in values.items():
                 db.execute(
                     """INSERT INTO app_settings (key, value) VALUES (?, ?)
@@ -1326,6 +1924,8 @@ class PolicyStore:
             "date_exceptions", "app_settings", "reward_accounts", "reward_ledger",
             "reward_redemptions", "discovery_cache", "audit_log", "config_snapshots",
             "summary_deliveries", "policy_state_history", "managed_device_identity",
+            "config_revision_state", "config_revisions", "outbox_events",
+            "background_jobs", "background_scope_locks", "background_worker_metrics",
         }
         try:
             with sqlite3.connect(self.path, timeout=5.0) as db:
@@ -1413,7 +2013,7 @@ class PolicyStore:
         service_quotas = normalize_service_quotas(
             service_quotas or {}, supported_service_keys=self.routeros_supported_service_keys() | self.policy_group_keys()
         )
-        with self._db() as db:
+        with self.config_write(scope="profiles", reason="Profile created") as db:
             try:
                 cur = db.execute(
                     """INSERT INTO profiles
@@ -1453,7 +2053,7 @@ class PolicyStore:
         service_quotas = normalize_service_quotas(
             service_quotas or {}, supported_service_keys=self.routeros_supported_service_keys() | self.policy_group_keys()
         )
-        with self._db() as db:
+        with self.config_write(scope="profiles", reason="Profile updated") as db:
             try:
                 cur = db.execute(
                     """UPDATE profiles
@@ -1473,7 +2073,7 @@ class PolicyStore:
         return self.get_profile(profile_id)
 
     def delete_profile(self, profile_id):
-        with self._db() as db:
+        with self.config_write(scope="profiles", reason="Profile deleted") as db:
             db.execute("UPDATE device_policy SET profile_id=NULL WHERE profile_id=?", (profile_id,))
             cur = db.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
             if cur.rowcount != 1:
@@ -1562,7 +2162,7 @@ class PolicyStore:
             if not self.get_profile(profile_id):
                 raise ValueError("Selected profile does not exist")
 
-        with self._db() as db:
+        with self.config_write(scope="devices", reason="Managed device policy updated") as db:
             db.execute(
                 """INSERT INTO device_policy
                    (ip, alias, notes, category, favourite, profile_id, mode_override)
@@ -1598,7 +2198,7 @@ class PolicyStore:
                 raise ValueError("Selected profile does not exist")
 
         valid_categories = {key for key, _ in DEVICE_CATEGORIES}
-        with self._db() as db:
+        with self.config_write(scope="devices", reason="Managed device policies bulk updated") as db:
             for ip in ips:
                 row = db.execute("SELECT * FROM device_policy WHERE ip=?", (ip,)).fetchone()
                 alias = row["alias"] if row else ""
@@ -1633,7 +2233,7 @@ class PolicyStore:
         if not name or len(name) > 50:
             raise ValueError("Template name must be 1-50 characters")
 
-        with self._db() as db:
+        with self.config_write(scope="templates", reason="Policy template created") as db:
             try:
                 cur = db.execute(
                     """INSERT INTO policy_templates
@@ -1656,7 +2256,7 @@ class PolicyStore:
         return cur.lastrowid
 
     def apply_template(self, template_id, profile_id):
-        with self._db() as db:
+        with self.config_write(scope="profiles", reason="Policy template applied") as db:
             template = db.execute(
                 "SELECT * FROM policy_templates WHERE id=?", (template_id,)
             ).fetchone()
@@ -1682,7 +2282,7 @@ class PolicyStore:
                 raise ValueError("Profile not found")
 
     def delete_template(self, template_id):
-        with self._db() as db:
+        with self.config_write(scope="templates", reason="Policy template deleted") as db:
             cur = db.execute("DELETE FROM policy_templates WHERE id=?", (template_id,))
             if cur.rowcount != 1:
                 raise ValueError("Template not found")
@@ -1715,7 +2315,7 @@ class PolicyStore:
         except BandwidthRateError as exc:
             raise ValueError(str(exc)) from exc
 
-        with self._db() as db:
+        with self.config_write(scope="bandwidth-presets", reason="Bandwidth preset saved") as db:
             existing = db.execute("SELECT builtin FROM bandwidth_presets WHERE key=?", (key,)).fetchone()
             if existing and existing["builtin"]:
                 raise ValueError("Built-in presets cannot be replaced")
@@ -1732,7 +2332,7 @@ class PolicyStore:
             )
 
     def delete_bandwidth_preset(self, key):
-        with self._db() as db:
+        with self.config_write(scope="bandwidth-presets", reason="Bandwidth preset deleted") as db:
             row = db.execute("SELECT builtin FROM bandwidth_presets WHERE key=?", (key,)).fetchone()
             if not row:
                 raise ValueError("Preset not found")
@@ -1853,7 +2453,7 @@ class PolicyStore:
             raise ValueError("Built-in RouterOS contracts are manually owned and cannot be reprovisioned")
         if approved:
             build_custom_service_contract(service)
-        with self._db() as db:
+        with self.config_write(scope="services", reason="Service enforcement approval changed") as db:
             db.execute(
                 """UPDATE services
                    SET enforcement_approved=?, enforcement_approved_at=?
@@ -1881,7 +2481,7 @@ class PolicyStore:
         dns_suffixes = self._normalize_dns_suffixes(dns_suffixes)
         tls_patterns = self._normalize_tls_patterns(tls_patterns)
         enabled = 1 if classifier_enabled else 0
-        with self._db() as db:
+        with self.config_write(scope="services", reason="Custom service saved") as db:
             existing = db.execute(
                 "SELECT builtin, tls_patterns, enforcement_approved FROM services WHERE key=?",
                 (key,),
@@ -1959,7 +2559,7 @@ class PolicyStore:
                 f"Custom service is still referenced by {usage['total']} policy/configuration "
                 f"reference(s) ({', '.join(labels)}); remove those references before deleting it"
             )
-        with self._db() as db:
+        with self.config_write(scope="services", reason="Custom service deleted") as db:
             cur = db.execute("DELETE FROM services WHERE key=?", (key,))
             if cur.rowcount != 1:
                 raise ValueError("Service not found")
@@ -2817,7 +3417,7 @@ class PolicyStore:
         else:
             action_value, _, _ = self._normalize_service_schedule_action(action_value)
 
-        with self._db() as db:
+        with self.config_write(scope="schedules", reason="Schedule plan created") as db:
             cur = db.execute(
                 """INSERT INTO schedule_plans
                    (label, target_type, target_value, action_type, action_value, clock_time, days)
@@ -2835,7 +3435,7 @@ class PolicyStore:
         return cur.lastrowid
 
     def set_schedule_plan_enabled(self, plan_id, enabled):
-        with self._db() as db:
+        with self.config_write(scope="schedules", reason="Schedule plan state updated") as db:
             cur = db.execute(
                 "UPDATE schedule_plans SET enabled=? WHERE id=?",
                 (1 if enabled else 0, int(plan_id)),
@@ -2844,7 +3444,7 @@ class PolicyStore:
                 raise ValueError("Schedule plan not found")
 
     def delete_schedule_plan(self, plan_id):
-        with self._db() as db:
+        with self.config_write(scope="schedules", reason="Schedule plan deleted") as db:
             cur = db.execute("DELETE FROM schedule_plans WHERE id=?", (plan_id,))
             if cur.rowcount != 1:
                 raise ValueError("Schedule plan not found")
@@ -2971,7 +3571,7 @@ class PolicyStore:
         clean = self._validate_policy_group_members(members)
         key = self._new_policy_group_key(name)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with self._db() as db:
+        with self.config_write(scope="policy-groups", reason="Aggregate policy group created") as db:
             try:
                 db.execute(
                     """INSERT INTO aggregate_policy_groups
@@ -3000,7 +3600,7 @@ class PolicyStore:
             raise ValueError("An aggregate policy group with that name already exists")
         clean = self._validate_policy_group_members(members, current_key=key)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with self._db() as db:
+        with self.config_write(scope="policy-groups", reason="Aggregate policy group updated") as db:
             try:
                 cur = db.execute(
                     """UPDATE aggregate_policy_groups
@@ -3063,7 +3663,7 @@ class PolicyStore:
             raise ValueError(
                 f"Aggregate policy group is still referenced by {usage['total']} policy reference(s); remove those references before deleting it"
             )
-        with self._db() as db:
+        with self.config_write(scope="policy-groups", reason="Aggregate policy group deleted") as db:
             cur = db.execute("DELETE FROM aggregate_policy_groups WHERE key=?", (key,))
             if cur.rowcount != 1:
                 raise ValueError("Aggregate policy group not found")
@@ -3086,7 +3686,7 @@ class PolicyStore:
             raise ValueError("Service group name must be 1-50 characters")
         valid = {s["key"] for s in self.list_services()} | set(self.policy_group_keys())
         clean = sorted({str(s).strip().lower() for s in services if str(s).strip().lower() in valid})
-        with self._db() as db:
+        with self.config_write(scope="service-groups", reason="Service collection created") as db:
             try:
                 cur = db.execute(
                     """INSERT INTO service_groups (name, description, services)
@@ -3141,7 +3741,7 @@ class PolicyStore:
         )
 
     def delete_service_group(self, group_id):
-        with self._db() as db:
+        with self.config_write(scope="service-groups", reason="Service collection deleted") as db:
             cur = db.execute("DELETE FROM service_groups WHERE id=?", (group_id,))
             if cur.rowcount != 1:
                 raise ValueError("Service group not found")
@@ -3200,7 +3800,7 @@ class PolicyStore:
         if not name or len(name) > 50:
             raise ValueError("Template name must be 1-50 characters")
         clean = self._normalize_schedule_template_entries(entries)
-        with self._db() as db:
+        with self.config_write(scope="schedule-templates", reason="Schedule template created") as db:
             try:
                 cur = db.execute(
                     """INSERT INTO schedule_templates (name, description, entries)
@@ -3212,7 +3812,7 @@ class PolicyStore:
         return cur.lastrowid
 
     def delete_schedule_template(self, template_id):
-        with self._db() as db:
+        with self.config_write(scope="schedule-templates", reason="Schedule template deleted") as db:
             in_use = db.execute(
                 "SELECT COUNT(*) AS count FROM date_exceptions WHERE template_id=?",
                 (int(template_id),),
@@ -3272,7 +3872,7 @@ class PolicyStore:
         else:
             template_id = None
 
-        with self._db() as db:
+        with self.config_write(scope="date-exceptions", reason="Date exception created") as db:
             cur = db.execute(
                 """INSERT INTO date_exceptions
                    (label, start_date, end_date, target_type, target_value, mode, template_id, notes)
@@ -3285,7 +3885,7 @@ class PolicyStore:
         return cur.lastrowid
 
     def delete_date_exception(self, exception_id):
-        with self._db() as db:
+        with self.config_write(scope="date-exceptions", reason="Date exception deleted") as db:
             cur = db.execute("DELETE FROM date_exceptions WHERE id=?", (exception_id,))
             if cur.rowcount != 1:
                 raise ValueError("Date exception not found")
@@ -3893,6 +4493,9 @@ class PolicyStore:
         webhook_url="",
         retry_limit="3",
         retention_days="90",
+        *,
+        expected_revision=None,
+        actor="system:policy-store",
     ):
         enabled = "1" if str(enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
         email_enabled = "1" if str(email_enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
@@ -3926,7 +4529,12 @@ class PolicyStore:
             "summary_delivery_retry_limit": retry_limit,
             "summary_delivery_retention_days": retention_days,
         }
-        with self._db() as db:
+        with self.config_write(
+            scope="settings:summary-delivery",
+            reason="Summary delivery settings updated",
+            actor=actor,
+            expected_revision=expected_revision,
+        ) as db:
             for key, value in values.items():
                 db.execute(
                     """INSERT INTO app_settings (key, value) VALUES (?, ?)
@@ -4568,6 +5176,9 @@ class PolicyStore:
         auto_reconcile_interval_seconds="30",
         auto_reconcile_failure_threshold="3",
         auto_reconcile_cooldown_seconds="300",
+        *,
+        expected_revision=None,
+        actor="system:policy-store",
     ):
         if default_profile_id not in ("", None):
             if not self.get_profile(int(default_profile_id)):
@@ -4619,7 +5230,12 @@ class PolicyStore:
             "auto_reconcile_failure_threshold": auto_reconcile_failure_threshold,
             "auto_reconcile_cooldown_seconds": auto_reconcile_cooldown_seconds,
         }
-        with self._db() as db:
+        with self.config_write(
+            scope="settings",
+            reason="Global settings updated",
+            actor=actor,
+            expected_revision=expected_revision,
+        ) as db:
             for key, value in values.items():
                 db.execute(
                     """INSERT INTO app_settings (key, value) VALUES (?, ?)
@@ -4629,7 +5245,7 @@ class PolicyStore:
         return values
 
 
-    def save_quota_settings(self, enabled="0", warning_percent="80"):
+    def save_quota_settings(self, enabled="0", warning_percent="80", *, expected_revision=None, actor="system:policy-store"):
         enabled = "1" if str(enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
         try:
             warning = int(warning_percent)
@@ -4641,7 +5257,12 @@ class PolicyStore:
             "quota_engine_enabled": enabled,
             "quota_warning_percent": str(warning),
         }
-        with self._db() as db:
+        with self.config_write(
+            scope="settings:quota",
+            reason="Quota settings updated",
+            actor=actor,
+            expected_revision=expected_revision,
+        ) as db:
             for key, value in values.items():
                 db.execute(
                     """INSERT INTO app_settings (key, value) VALUES (?, ?)
@@ -4660,6 +5281,9 @@ class PolicyStore:
         max_minutes="240",
         default_grant_minutes="30",
         max_redeem_minutes="60",
+        *,
+        expected_revision=None,
+        actor="system:policy-store",
     ):
         enabled = "1" if str(enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
         try:
@@ -4684,7 +5308,12 @@ class PolicyStore:
             "reward_default_grant_minutes": str(default_grant_i),
             "reward_max_redeem_minutes": str(max_redeem_i),
         }
-        with self._db() as db:
+        with self.config_write(
+            scope="settings:rewards",
+            reason="Reward settings updated",
+            actor=actor,
+            expected_revision=expected_revision,
+        ) as db:
             for key, value in values.items():
                 db.execute(
                     """INSERT INTO app_settings (key, value) VALUES (?, ?)

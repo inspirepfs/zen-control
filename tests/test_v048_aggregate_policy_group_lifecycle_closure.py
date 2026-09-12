@@ -407,7 +407,7 @@ class AggregatePolicyGroupLifecycleSourceGuards(unittest.TestCase):
         self.assertIn("Unsupported live service key(s)", block)
 
     def test_release_notes_state_aggregate_groups_never_create_routeros_authority(self):
-        self.assertIn("v0.53.1", self.readme)
+        self.assertIn("v0.54.0", self.readme)
         self.assertIn("never become RouterOS authority", self.readme)
 
 

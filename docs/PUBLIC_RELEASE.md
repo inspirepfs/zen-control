@@ -24,7 +24,7 @@ The supported host-side orchestration helper is `scripts/release_patch.py`. It p
 Important switches include:
 
 - `--patch NAME.patch` — apply a patch; a relative name also searches `../`.
-- `--resume` — skip patch application when the intended release changes are already present locally.
+- `--resume` — continue from an already-applied release tree or an already-committed HEAD; clean committed states do not manufacture an empty commit.
 - `--rebuild-service SERVICE` — repeat for additional services; default is `mikrotik-control`.
 - `--rebuild-all` — explicitly rebuild/start all Compose services.
 - `--expect-version VERSION` — require the live health JSON to expose the expected release.
@@ -33,7 +33,7 @@ Important switches include:
 - `--tag TAG` — create and push an annotated tag only after watched CI succeeds.
 - `--dry-run` — print the plan and commands without changing state.
 
-The normal flow expects a clean tree before patch application. `--resume` is the explicit exception for an already-applied, reviewed release tree.
+The normal flow expects a clean tree before patch application. `--resume` handles three explicit states: a dirty reviewed tree is validated/rebuilt and committed; a clean HEAD ahead of the remote is validated/rebuilt and then published; a clean HEAD already present on the remote reuses the commit-scoped CI evidence instead of rebuilding or attempting an empty commit. An existing release tag that resolves to a different commit is a hard `TAG TARGET MISMATCH` gate.
 
 ## License decision
 

@@ -2,6 +2,19 @@
 
 All notable ZEN Control release slices are recorded here. ZEN is developed as evidence-led, bounded slices; historical entries describe the authority and evidence contracts that were current for that release.
 
+## v0.54.0 — Revisioned state & background-work foundation
+
+- Adds a durable configuration revision journal with a singleton monotonic revision, actor/reason/scope evidence and a read-only revision API.
+- Adds optimistic-concurrency support through revision-aware configuration transactions. Stale callers fail before mutation instead of silently overwriting newer state.
+- Adds a transactional `config.changed` outbox written in the same SQLite transaction as revision-aware configuration updates.
+- Adds durable background jobs with idempotency keys, bounded attempts, worker leases, expired-lease recovery and per-scope locks.
+- Adds durable worker metrics and a read-only `/api/background/status` surface.
+- Adds the first background computation, `analytics.config-summary`, which reads local configuration only and has no RouterOS adapter or enforcement authority.
+- Starts/stops the read-side worker with the application and seeds an upgrade-safe revision baseline on startup.
+- Threads configuration revisions through the main settings forms so stale settings pages are rejected rather than overwriting a newer configuration revision.
+- Keeps the existing reconciler as the single normal RouterOS enforcement writer; background workers do not gain RouterOS write authority.
+- Hardens `scripts/release_patch.py` so `--resume` understands dirty trees, committed-but-unpublished HEADs and already-published clean HEADs, and fails early on tag-target mismatches instead of trying to manufacture an empty commit.
+
 ## v0.53.1 — Commissioning and public-repository closure
 
 

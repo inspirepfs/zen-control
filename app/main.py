@@ -19,6 +19,7 @@ from passlib.context import CryptContext
 from app.router import RouterOSAdapter, RouterError
 from app.bypass import DOH_ROUTER_RULES, summarize_bypass_evidence
 from app.policy_store import PolicyStore, DEVICE_CATEGORIES
+from app.background_work import BackgroundWorker
 from app.activity import (
     ActivityStore, ActivityError, build_policy_service_activity, build_service_intelligence,
     resolve_activity_window, compare_activity_totals, format_activity_bytes,
@@ -60,7 +61,7 @@ from app.help_content import get_help_topic, help_for_context, help_catalog, hel
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.53.1")
+app = FastAPI(title="ZEN Control", version="0.54.0")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -802,6 +803,19 @@ def get_device_360(address: str) -> dict:
     )
 
 
+def _background_config_analytics(_payload: dict) -> dict:
+    # Read-side only: this handler has no RouterOS adapter and cannot become an
+    # alternate enforcement writer.
+    return policy_store.build_config_analytics_snapshot()
+
+
+background_worker = BackgroundWorker(
+    policy_store=policy_store,
+    handlers={"analytics.config-summary": _background_config_analytics},
+    audit=audit,
+)
+
+
 auto_reconciler = AutoReconciler(
     policy_store=policy_store,
     router=router,
@@ -896,6 +910,11 @@ def current_release_readiness() -> dict:
 
 @app.on_event("startup")
 def start_auto_reconciler():
+    # Establish the durable configuration revision baseline before read-side
+    # background processing starts. This never writes RouterOS.
+    policy_store.ensure_config_revision_baseline(actor="system:startup")
+    background_worker.start()
+
     # Reconcile every reserved reward debit against fresh RouterOS evidence. A
     # crash may happen before *or after* the RouterOS grant, so restart recovery
     # must never blindly refund a potentially-used allowance.
@@ -929,6 +948,7 @@ def start_auto_reconciler():
 @app.on_event("shutdown")
 def stop_auto_reconciler():
     summary_delivery.stop()
+    background_worker.stop()
     incident_monitor.stop()
     auto_reconciler.stop()
     audit("APPLICATION_STOP", "system:shutdown", "FastAPI shutdown completed")
@@ -2082,6 +2102,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "schedule_templates": schedule_templates,
             "date_exceptions": date_exceptions,
             "app_settings": app_settings,
+            "config_revision": int(policy_store.current_config_revision().get("revision") or 0),
             "reconciler_status": reconciler_status,
             "security_posture": security_posture,
             "security_error": security_error,
@@ -4151,6 +4172,7 @@ def local_summary_delivery_settings(
     summary_delivery_webhook_url: str = Form(""),
     summary_delivery_retry_limit: str = Form("3"),
     summary_delivery_retention_days: str = Form("90"),
+    config_revision: int | None = Form(None),
     csrf: str = Form(...),
     user=Depends(require_role("admin")),
 ):
@@ -4167,6 +4189,8 @@ def local_summary_delivery_settings(
             summary_delivery_webhook_url,
             summary_delivery_retry_limit,
             summary_delivery_retention_days,
+            expected_revision=config_revision,
+            actor=user["username"],
         )
         audit(
             "SUMMARY_DELIVERY_SETTINGS_UPDATED",
@@ -4251,6 +4275,7 @@ def local_settings_save(
     default_bandwidth_preset: str = Form("normal"),
     default_temp_minutes: str = Form("30"),
     policy_timezone: str = Form("Europe/London"),
+    config_revision: int | None = Form(None),
     csrf: str = Form(...),
     user=Depends(require_role("admin")),
 ):
@@ -4268,6 +4293,8 @@ def local_settings_save(
             current_settings.get("auto_reconcile_interval_seconds", "30"),
             current_settings.get("auto_reconcile_failure_threshold", "3"),
             current_settings.get("auto_reconcile_cooldown_seconds", "300"),
+            expected_revision=config_revision,
+            actor=user["username"],
         )
     except ValueError as exc:
         return redirect_error("settings/policy", str(exc))
@@ -4281,6 +4308,7 @@ def local_reward_settings(
     reward_bank_max_minutes: str = Form("240"),
     reward_default_grant_minutes: str = Form("30"),
     reward_max_redeem_minutes: str = Form("60"),
+    config_revision: int | None = Form(None),
     csrf: str = Form(...),
     user=Depends(require_role("admin")),
 ):
@@ -4292,6 +4320,8 @@ def local_reward_settings(
             reward_bank_max_minutes,
             reward_default_grant_minutes,
             reward_max_redeem_minutes,
+            expected_revision=config_revision,
+            actor=user["username"],
         )
         audit(
             "REWARD_SETTINGS",
@@ -4313,6 +4343,7 @@ def local_quota_settings(
     request: Request,
     quota_engine_enabled: str = Form("0"),
     quota_warning_percent: str = Form("80"),
+    config_revision: int | None = Form(None),
     csrf: str = Form(...),
     user=Depends(require_role("admin")),
 ):
@@ -4320,7 +4351,10 @@ def local_quota_settings(
         return redirect_error("settings/policy", "CSRF validation failed")
     try:
         saved = policy_store.save_quota_settings(
-            quota_engine_enabled, quota_warning_percent
+            quota_engine_enabled,
+            quota_warning_percent,
+            expected_revision=config_revision,
+            actor=user["username"],
         )
         audit(
             "QUOTA_SETTINGS",
@@ -4341,6 +4375,7 @@ def local_reconciler_settings(
     auto_reconcile_interval_seconds: str = Form("30"),
     auto_reconcile_failure_threshold: str = Form("3"),
     auto_reconcile_cooldown_seconds: str = Form("300"),
+    config_revision: int | None = Form(None),
     csrf: str = Form(...),
     user=Depends(require_role("admin")),
 ):
@@ -4358,6 +4393,8 @@ def local_reconciler_settings(
             auto_reconcile_interval_seconds,
             auto_reconcile_failure_threshold,
             auto_reconcile_cooldown_seconds,
+            expected_revision=config_revision,
+            actor=user["username"],
         )
         auto_reconciler.clear_hold()
         auto_reconciler.wake()
@@ -4465,6 +4502,7 @@ def local_incident_settings(
     incident_scan_interval_seconds: str = Form("60"),
     incident_bypass_min_status: str = Form("elevated"),
     incident_retention_days: str = Form("30"),
+    config_revision: int | None = Form(None),
     csrf: str = Form(...),
     user=Depends(require_role("admin")),
 ):
@@ -4476,6 +4514,8 @@ def local_incident_settings(
             incident_scan_interval_seconds,
             incident_bypass_min_status,
             incident_retention_days,
+            expected_revision=config_revision,
+            actor=user["username"],
         )
     except ValueError as exc:
         return redirect_error("settings/automation", str(exc))
@@ -4560,6 +4600,23 @@ def local_security_cleanup_stale(
         "settings",
         f"Removed {result.get('total', 0)} stale app-owned RouterOS resource(s)",
     )
+
+
+@app.get("/api/config/revision")
+def api_config_revision(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return {
+        "current": policy_store.current_config_revision(),
+        "recent": policy_store.list_config_revisions(20),
+    }
+
+
+@app.get("/api/background/status")
+def api_background_status(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return background_worker.snapshot()
 
 
 @app.get("/api/reconciler/status")

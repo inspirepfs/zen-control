@@ -121,11 +121,11 @@ class PerformanceGatheringUxTests(unittest.TestCase):
         cls.runtime_script = (ROOT / "scripts/perf_runtime_snapshot.sh").read_text()
 
     def test_release_version_and_performance_routes(self):
-        self.assertIn('version="0.53.1"', self.main)
+        self.assertIn('version="0.54.0"', self.main)
         self.assertIn('@app.get("/api/performance")', self.main)
         self.assertIn('@app.get("/performance"', self.main)
         self.assertIn('@app.post("/local/performance/reset")', self.main)
-        self.assertIn('/static/performance.css?v=0.53.1', self.template)
+        self.assertIn('/static/performance.css?v=0.54.0', self.template)
 
     def test_request_middleware_exports_server_timing_headers(self):
         self.assertIn('@app.middleware("http")', self.main)

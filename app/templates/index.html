@@ -4,11 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.53.1">
-  <link rel="stylesheet" href="/static/layout.css?v=0.53.1">
-  <link rel="stylesheet" href="/static/activity.css?v=0.53.1">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.53.1">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.53.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.0">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -2382,6 +2382,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     </div>
     <form method="post" action="/local/settings" class="schedule-form-grid">
       <input type="hidden" name="csrf" value="{{csrf}}">
+      <input type="hidden" name="config_revision" value="{{config_revision}}">
       <label>Default profile
         <select name="default_profile_id">
           <option value="">None</option>
@@ -2826,6 +2827,11 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     <form method="post" action="/local/reconciler/settings" class="schedule-form-grid auto-reconcile-form"
           onsubmit="if (this.auto_reconcile_mode.value === 'enforce') return confirm('Enable automatic RouterOS reconciliation? Effective schedule/profile changes will be applied without a manual click.'); return true;">
       <input type="hidden" name="csrf" value="{{csrf}}">
+      <input type="hidden" name="config_revision" value="{{config_revision}}">
+      <input type="hidden" name="config_revision" value="{{config_revision}}">
+      <input type="hidden" name="config_revision" value="{{config_revision}}">
+      <input type="hidden" name="config_revision" value="{{config_revision}}">
+      <input type="hidden" name="config_revision" value="{{config_revision}}">
       <label>Mode
         <select name="auto_reconcile_mode">
           <option value="off" {% if app_settings.auto_reconcile_mode == 'off' %}selected{% endif %}>Off</option>

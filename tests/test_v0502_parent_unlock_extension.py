@@ -150,10 +150,10 @@ class ParentUnlockExtensionIntegrationTests(unittest.TestCase):
         self.assertIn('("parent_unlock", "Parent unlock & time-extension hardening", "0.50.2")', release)
 
     def test_release_version_and_pwa_assets_are_current(self):
-        self.assertIn('version="0.53.1"', self.main)
-        self.assertIn('/static/app.css?v=0.53.1', self.index)
-        self.assertIn("const RELEASE = '0.53.1'", (self.root / "app/static/pwa.js").read_text())
-        self.assertIn("PWA_RELEASE = \"0.53.1\"", (self.root / "app/pwa.py").read_text())
+        self.assertIn('version="0.54.0"', self.main)
+        self.assertIn('/static/app.css?v=0.54.0', self.index)
+        self.assertIn("const RELEASE = '0.54.0'", (self.root / "app/static/pwa.js").read_text())
+        self.assertIn("PWA_RELEASE = \"0.54.0\"", (self.root / "app/pwa.py").read_text())
 
 
 if __name__ == "__main__":

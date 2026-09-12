@@ -109,6 +109,31 @@ def git_status(*, dry_run: bool = False) -> str:
     return run(["git", "status", "--short"], capture=True, quiet=True).stdout
 
 
+def git_head(*, dry_run: bool = False) -> str:
+    if dry_run:
+        return "DRYRUN"
+    return run(["git", "rev-parse", "HEAD"], capture=True, quiet=True).stdout.strip()
+
+
+def remote_branch_head(remote: str, branch: str, *, dry_run: bool = False) -> str | None:
+    if dry_run:
+        return None
+    proc = run(
+        ["git", "rev-parse", "--verify", f"refs/remotes/{remote}/{branch}"],
+        capture=True,
+        quiet=True,
+        check=False,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def tag_target(tag: str | None, *, dry_run: bool = False) -> str | None:
+    if not tag or dry_run:
+        return None
+    proc = run(["git", "rev-list", "-n", "1", tag], capture=True, quiet=True, check=False)
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
 def apply_patch(path: Path, *, dry_run: bool = False) -> None:
     base = ["patch", "--batch", "--forward", "--fuzz=0", "-p0", "-i", str(path)]
     probe = run(["patch", "--dry-run", *base[1:]], capture=True, check=False, dry_run=dry_run)
@@ -182,7 +207,7 @@ def wait_for_health(url: str, timeout: int, expected_version: str | None, *, dry
     raise WorkflowError(f"health check did not pass within {timeout}s: {last_error}")
 
 
-def stage_changes(paths: list[str], *, dry_run: bool = False) -> None:
+def stage_changes(paths: list[str], *, dry_run: bool = False) -> bool:
     run(["git", "diff", "--check"], dry_run=dry_run)
     print("Working tree before stage:", flush=True)
     if not dry_run:
@@ -194,12 +219,12 @@ def stage_changes(paths: list[str], *, dry_run: bool = False) -> None:
     run(cmd, dry_run=dry_run)
     run(["git", "diff", "--cached", "--check"], dry_run=dry_run)
     run(["git", "diff", "--cached", "--stat"], dry_run=dry_run)
-    if not dry_run:
-        proc = run(["git", "diff", "--cached", "--quiet"], check=False, capture=True, quiet=True)
-        if proc.returncode == 0:
-            raise WorkflowError("nothing is staged; refusing empty release commit")
-        if proc.returncode not in (0, 1):
-            raise WorkflowError("unable to determine staged Git state")
+    if dry_run:
+        return True
+    proc = run(["git", "diff", "--cached", "--quiet"], check=False, capture=True, quiet=True)
+    if proc.returncode not in (0, 1):
+        raise WorkflowError("unable to determine staged Git state")
+    return proc.returncode == 1
 
 
 def load_message(args: argparse.Namespace, patch: Path | None) -> str:
@@ -285,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Apply -> qualify -> rebuild -> commit -> push -> watch CI -> tag a ZEN release patch."
     )
     parser.add_argument("--patch", help="Patch file. Relative names also resolve from ../ by default.")
-    parser.add_argument("--resume", action="store_true", help="Patch is already applied; start with the current dirty tree.")
+    parser.add_argument("--resume", action="store_true", help="Patch is already applied; continue from dirty changes or an already-committed HEAD.")
     parser.add_argument("--message", help="Git commit message. Defaults from --tag or patch filename.")
     parser.add_argument("--message-file", help="Read the Git commit message from a text file.")
     parser.add_argument("--tag", help="Annotated release tag. Created only after successful watched CI by default.")
@@ -349,6 +374,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         message = load_message(args, patch)
         tag_message = args.tag_message or message.splitlines()[0]
 
+        resume_status = git_status(dry_run=args.dry_run) if args.resume else ""
+        resume_clean = bool(args.resume and not resume_status.strip())
+        head_before = git_head(dry_run=args.dry_run)
+        remote_before = remote_branch_head(args.remote, branch, dry_run=args.dry_run)
+        existing_tag_target = tag_target(args.tag, dry_run=args.dry_run)
+        if args.tag and existing_tag_target and existing_tag_target != head_before:
+            raise WorkflowError(
+                f"TAG TARGET MISMATCH: {args.tag} points to {existing_tag_target[:12]} "
+                f"but HEAD is {head_before[:12]}"
+            )
+        already_published = bool(resume_clean and remote_before == head_before and head_before != "DRYRUN")
+
         if not args.resume and not args.dry_run:
             status = git_status()
             if status.strip():
@@ -362,6 +399,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"branch={branch} remote={args.remote}")
         print(f"rebuild={'ALL' if args.rebuild_all else ','.join(services)}")
         print(f"workflow={args.workflow} tag={args.tag or '-'}")
+        if args.resume:
+            state = "dirty-tree"
+            if resume_clean and remote_before != head_before:
+                state = "committed-not-published"
+            elif already_published:
+                state = "committed-published"
+            print(f"resume_state={state}")
         if not args.yes and not args.dry_run:
             answer = input("Proceed with this release workflow? [y/N] ").strip().lower()
             if answer not in {"y", "yes"}:
@@ -370,19 +414,38 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if patch:
             apply_patch(patch, dry_run=args.dry_run)
-        if not args.skip_validate:
-            validate(dry_run=args.dry_run)
-        if not args.skip_rebuild:
-            rebuild(services, all_services=args.rebuild_all, no_deps=args.no_deps, dry_run=args.dry_run)
-            if not args.skip_health:
-                wait_for_health(args.health_url, args.health_timeout, args.expect_version, dry_run=args.dry_run)
 
-        stage_changes(args.stage, dry_run=args.dry_run)
-        commit_sha = commit(message, dry_run=args.dry_run)
+        # A clean --resume at a commit already present on origin is a publish/tag
+        # continuation, not a reason to rerun the entire host qualification and
+        # certainly not a reason to manufacture an empty commit.
+        if not already_published:
+            if not args.skip_validate:
+                validate(dry_run=args.dry_run)
+            if not args.skip_rebuild:
+                rebuild(services, all_services=args.rebuild_all, no_deps=args.no_deps, dry_run=args.dry_run)
+                if not args.skip_health:
+                    wait_for_health(args.health_url, args.health_timeout, args.expect_version, dry_run=args.dry_run)
+
+        commit_sha = head_before
+        if not resume_clean or patch:
+            staged = stage_changes(args.stage, dry_run=args.dry_run)
+            if staged:
+                commit_sha = commit(message, dry_run=args.dry_run)
+            elif not args.resume:
+                raise WorkflowError("nothing is staged; refusing empty release commit")
+            else:
+                commit_sha = git_head(dry_run=args.dry_run)
+                print(f"Resume: no new changes to commit; continuing from HEAD {commit_sha[:12]}", flush=True)
+        else:
+            print(f"Resume: clean tree; continuing from existing HEAD {commit_sha[:12]}", flush=True)
 
         run_id = None
         if not args.skip_push:
-            push(args.remote, branch, dry_run=args.dry_run)
+            remote_now = remote_branch_head(args.remote, branch, dry_run=args.dry_run)
+            if remote_now != commit_sha:
+                push(args.remote, branch, dry_run=args.dry_run)
+            else:
+                print(f"Push: {args.remote}/{branch} already at {commit_sha[:12]}; skipping branch push", flush=True)
             if not args.skip_watch:
                 run_id = wait_for_workflow(
                     commit_sha,

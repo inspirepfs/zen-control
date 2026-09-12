@@ -47,7 +47,7 @@ When a patch has already been applied intentionally, resume from the dirty relea
 ```bash
 python3 scripts/release_patch.py \
   --resume \
-  --message "Fix v0.53.1 clean-runner CI qualification"
+  --message "Fix v0.54.0 clean-runner CI qualification"
 ```
 
 Use `--dry-run` to print the planned commands without modifying source, Git or containers. Run `python3 scripts/release_patch.py --help` for all workflow switches.

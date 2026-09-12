@@ -55,12 +55,16 @@ Examples:
 - A desired-policy checkpoint does not prove historical enforcement for every instant in the interval.
 - DNS/IPFIX observations do not prove foreground application use, browser history, intent or user identity.
 
-## Current persistence model
+## Current persistence and background-work model
 
-v0.53.1 uses:
+v0.54.0 uses:
 
 - SQLite for policy/configuration and durable control-plane state.
-- PostgreSQL 17 for retained telemetry/history.
+- a monotonic configuration revision journal for revision-aware writes;
+- a transactional SQLite outbox for `config.changed` events;
+- durable background jobs with idempotency keys, bounded attempts, leases and scope locks;
+- durable worker metrics for operational evidence;
+- PostgreSQL 17 for retained telemetry/history;
 - named Docker volumes for Pi-hole, Caddy and telemetry state.
 
-The next architecture slice is planned to add revisioned configuration state, optimistic concurrency, a transactional outbox and durable background-job primitives while retaining one logical enforcement writer.
+The first background handler is deliberately read-only: `analytics.config-summary` reads local configuration and stores only job/result bookkeeping. The background worker receives no RouterOS adapter. RouterOS mutation remains serialized through the existing reconciliation/authority paths. v0.54.1 can build prepared read models on this foundation without creating another enforcement writer.
