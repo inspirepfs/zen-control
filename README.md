@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.54.5.1** — RouterOS request-path decoupling and reconciliation closure: declarative Apply actions ACK from durable local intent, RouterOS convergence runs through the serialized reconciler, and Dashboard authority evidence is prepared/stale-aware rather than navigation-blocking.
+> Current release: **v0.54.5.2** — prepared-view and read-path fan-out closure: ordinary Dashboard, Activity and Managed Devices navigation consumes revision-bound advisory read models, heavy telemetry preparation reuses one coherent PostgreSQL session, and cached evidence remains excluded from RouterOS mutation authority.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -42,6 +42,7 @@ ZEN currently provides:
 - Controlled migration from MikroTik Kid Control with guarded cutover and rollback.
 - Revisioned configuration state, optimistic concurrency, a transactional outbox and durable read-side background jobs.
 - Prepared read models for Dashboard, Activity, Classification, Services, 7-day history and Device 360 activity evidence, with revision/age gating and bounded maintenance.
+- Read-path fan-out closure for normal Dashboard, Activity and Managed Devices navigation: stale same-revision evidence is explicit, prepared refresh work is coalesced, and live PostgreSQL/RouterOS fallback is removed from ordinary navigation.
 - Bounded parallel device observation/planning in the automatic reconciler, with deterministic results and per-device failure isolation.
 - A process-wide re-entrant RouterOS mutation lane that serializes app-owned writes while leaving read-only observation parallel-capable.
 - Topology-aware release deployment that rebuilds affected Compose services and proves the pre-release service topology plus embedded workers recovered before publication/tagging.

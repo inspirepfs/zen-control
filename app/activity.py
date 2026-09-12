@@ -1,6 +1,8 @@
 import ipaddress
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, time as dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import psycopg
@@ -235,6 +237,9 @@ class ActivityStore:
         self.username = os.getenv("TELEMETRY_DB_USER", "mikrotik")
         self.password = os.getenv("TELEMETRY_DB_PASSWORD", "change-me")
         self.timeout = int(os.getenv("TELEMETRY_DB_TIMEOUT", "3"))
+        self._session_connection = ContextVar(
+            f"zen_activity_session_connection_{id(self)}", default=None
+        )
 
     def _connect(self):
         with perf_span("postgres.connect"):
@@ -244,11 +249,50 @@ class ActivityStore:
                 connect_timeout=self.timeout, row_factory=dict_row,
             )
 
+    @contextmanager
+    def coherent_session(self):
+        """Reuse one PostgreSQL connection for one coherent read bundle.
+
+        Activity preparation is read-only. Reusing the connection removes repeated
+        TCP/authentication overhead while keeping every SQL statement visible to
+        the existing performance instrumentation. Nested callers reuse the outer
+        session, so helpers can opt in without creating connection ownership races.
+        """
+        existing = self._session_connection.get()
+        if existing is not None:
+            yield self
+            return
+
+        conn = None
+        token = None
+        try:
+            conn = self._connect()
+            token = self._session_connection.set(conn)
+            yield self
+            conn.commit()
+        except psycopg.Error as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg.Error:
+                    pass
+            raise ActivityError(f"Telemetry database unavailable: {exc}") from exc
+        finally:
+            if token is not None:
+                self._session_connection.reset(token)
+            if conn is not None:
+                conn.close()
+
     def _query(self, sql, params=()):
         try:
             with perf_sql(sql):
-                with self._connect() as conn:
+                conn = self._session_connection.get()
+                if conn is not None:
                     with conn.cursor() as cur:
+                        cur.execute(sql, params)
+                        return cur.fetchall()
+                with self._connect() as owned_conn:
+                    with owned_conn.cursor() as cur:
                         cur.execute(sql, params)
                         return cur.fetchall()
         except psycopg.Error as exc:

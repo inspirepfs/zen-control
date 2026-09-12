@@ -635,11 +635,21 @@ def build_formal_acceptance(snapshot: dict, operational_evidence: dict) -> dict:
     request_state = str(request_acceptance.get("state") or "pending").lower()
     counters = dict(snapshot.get("evidence_counters") or {})
 
+    prepared_lookups = int(counters.get("prepared_view.lookup", 0) or 0)
     prepared_hits = int(counters.get("prepared_view.hit", 0) or 0)
     prepared_misses = int(counters.get("prepared_view.miss", 0) or 0)
     prepared_fallbacks = int(counters.get("prepared_view.fallback", 0) or 0)
-    prepared_observed = prepared_hits + prepared_misses
-    prepared_state = "pass" if prepared_observed > 0 else "pending"
+    prepared_stale_hits = int(counters.get("prepared_view.stale_hit", 0) or 0)
+    prepared_hit_rate = (
+        round(prepared_hits * 100.0 / prepared_lookups, 1)
+        if prepared_lookups > 0 else None
+    )
+    if prepared_lookups < 5:
+        prepared_state = "pending"
+    elif prepared_hit_rate is not None and prepared_hit_rate < 90.0:
+        prepared_state = "fail"
+    else:
+        prepared_state = "pass"
 
     background = dict(operational_evidence.get("background_worker") or {})
     background_alive = background.get("worker_alive")
@@ -706,10 +716,15 @@ def build_formal_acceptance(snapshot: dict, operational_evidence: dict) -> dict:
             "key": "prepared_views",
             "label": "Prepared-view effectiveness",
             "state": prepared_state,
+            "lookups": prepared_lookups,
             "hits": prepared_hits,
+            "stale_hits": prepared_stale_hits,
             "misses": prepared_misses,
             "fallbacks": prepared_fallbacks,
-            "description": "At least one prepared-view lookup must be observed; hits and live fallbacks remain distinct.",
+            "hit_rate_percent": prepared_hit_rate,
+            "minimum_lookups": 5,
+            "minimum_hit_rate_percent": 90.0,
+            "description": "At least five warmed prepared-view lookups must be observed and at least 90% must be served from fresh or explicitly stale same-revision prepared evidence; live fallbacks remain distinct.",
         },
         {
             "key": "background_worker",

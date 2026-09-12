@@ -170,11 +170,14 @@ class PerformanceClosureContractTests(unittest.TestCase):
         cls.script = (ROOT / "scripts/perf_acceptance.py").read_text()
         cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
-    def test_root_uses_bounded_snapshot_only_for_dashboard_and_managed_devices(self):
-        self.assertIn("get_managed_device_observation_snapshot", self.main)
-        self.assertIn('active_view in {"dashboard", "devices"}', self.main)
-        self.assertEqual(1, self.main.count("get_managed_device_observation_snapshot("))
-        self.assertIn("Write and validation routes do", self.main)
+    def test_root_uses_reconciler_prepared_observation_for_dashboard_and_managed_devices(self):
+        dashboard = self.main.split("def dashboard(", 1)[1].split('@app.get("/api/services/health")', 1)[0]
+        self.assertIn('"router:managed-device-observation"', dashboard)
+        self.assertNotIn("get_managed_device_observation_snapshot(", dashboard)
+        # The adapter keeps an explicit fresh snapshot helper for diagnostics/tests;
+        # ordinary navigation no longer pays for it synchronously.
+        self.assertIn("get_managed_device_observation_snapshot", self.router)
+        self.assertIn("write_validation_source", self.router)
 
     def test_snapshot_contract_explicitly_excludes_cross_request_cache_and_write_validation(self):
         self.assertIn("does *not* cache values across requests", self.router)

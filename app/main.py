@@ -63,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.5.1")
+app = FastAPI(title="ZEN Control", version="0.54.5.2")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -658,7 +658,7 @@ def get_live_policy_plan(
     if global_mode is None:
         global_mode = router.get_status().get("mode", "normal")
 
-    return build_device_policy_plan(
+    plan = build_device_policy_plan(
         address,
         desired_policy,
         live_enforcement,
@@ -668,6 +668,17 @@ def get_live_policy_plan(
         global_mode,
         service_catalog=service_catalog,
     )
+    # Observation workers may publish this read-only evidence for advisory UI
+    # surfaces. Mutation paths never consume the published copy: they call this
+    # function again while owning the serialized mutation lane and therefore
+    # re-read RouterOS immediately before any write.
+    plan["live_evidence"] = {
+        "enforcement": dict(live_enforcement or {}),
+        "temporary_access": dict(temporary_access or {}),
+        "services": dict(live_services or {}),
+        "bandwidth": dict(live_bandwidth or {}),
+    }
+    return plan
 
 
 @timed("policy.explanation")
@@ -757,17 +768,51 @@ def _prepared_view(view_key: str, *, max_age_seconds: int | None = None):
     )
 
 
-def _prepared_payload(view_key: str, *, max_age_seconds: int | None = None):
-    prepared = _prepared_view(view_key, max_age_seconds=max_age_seconds)
+def _wake_background_read_worker() -> None:
+    worker = globals().get("background_worker")
+    if worker is not None:
+        try:
+            worker.wake()
+        except Exception:
+            pass
+
+
+def _prepared_payload(
+    view_key: str,
+    *,
+    max_age_seconds: int | None = None,
+    allow_stale_same_revision: bool = False,
+):
+    """Read one prepared model with explicit hit/miss/staleness evidence.
+
+    Interactive advisory pages may consume last-known-good evidence after its
+    freshness TTL, but never after a configuration revision change.  A stale
+    same-revision hit is labelled STALE and wakes the background read worker; it
+    is never promoted into RouterOS write authority.
+    """
+    revision = int(policy_store.current_config_revision().get("revision") or 0)
+    max_age = max_age_seconds or PREPARED_VIEW_MAX_AGE.get(view_key, 300)
+    prepared = policy_store.get_prepared_view(
+        view_key,
+        required_revision=revision,
+        max_age_seconds=max_age,
+        include_stale=True,
+    )
     performance_collector.record_evidence("prepared_view.lookup")
-    if not prepared:
+
+    if prepared is None:
         performance_collector.record_evidence("prepared_view.miss")
-        performance_collector.record_evidence("prepared_view.fallback")
-        performance_collector.record_evidence(f"prepared_view.fallback:{view_key}")
-        return None, None
-    performance_collector.record_evidence("prepared_view.hit")
-    performance_collector.record_evidence(f"prepared_view.hit:{view_key}")
-    payload = dict(prepared.get("payload") or {})
+        performance_collector.record_evidence("prepared_view.miss:not_found")
+        performance_collector.record_evidence(f"prepared_view.miss:{view_key}:not_found")
+        _wake_background_read_worker()
+        return None, {
+            "view_key": view_key,
+            "state": "missing",
+            "reason": "not_found",
+            "source_revision": revision,
+        }
+
+    stale_grace_seconds = min(1800, max(300, int(max_age) * 5))
     meta = {
         "view_key": prepared.get("view_key"),
         "captured_at": prepared.get("captured_at"),
@@ -775,8 +820,70 @@ def _prepared_payload(view_key: str, *, max_age_seconds: int | None = None):
         "source_revision": prepared.get("source_revision"),
         "generation": prepared.get("generation"),
         "payload_bytes": prepared.get("payload_bytes"),
+        "state": "fresh" if prepared.get("eligible") else "stale",
+        "reason": None,
+        "stale_grace_seconds": stale_grace_seconds,
     }
-    return payload, meta
+
+    if prepared.get("eligible"):
+        performance_collector.record_evidence("prepared_view.hit")
+        performance_collector.record_evidence(f"prepared_view.hit:{view_key}")
+        return dict(prepared.get("payload") or {}), meta
+
+    if prepared.get("revision_stale"):
+        reason = "revision_mismatch"
+    elif str(prepared.get("status") or "") != "ready":
+        reason = "status_not_ready"
+    elif prepared.get("expired"):
+        reason = "expired"
+    elif prepared.get("too_old"):
+        reason = "too_old"
+    else:
+        reason = "ineligible"
+    meta["reason"] = reason
+    _wake_background_read_worker()
+
+    prepared_age = prepared.get("age_seconds")
+    within_stale_grace = (
+        prepared_age is not None
+        and float(prepared_age) <= float(stale_grace_seconds)
+    )
+    can_serve_stale = (
+        allow_stale_same_revision
+        and not prepared.get("revision_stale")
+        and str(prepared.get("status") or "") == "ready"
+        and bool(prepared.get("payload"))
+        and within_stale_grace
+    )
+    if (
+        allow_stale_same_revision
+        and not prepared.get("revision_stale")
+        and str(prepared.get("status") or "") == "ready"
+        and bool(prepared.get("payload"))
+        and not within_stale_grace
+    ):
+        reason = "stale_grace_exceeded"
+        meta["reason"] = reason
+        meta["state"] = "missing"
+    if can_serve_stale:
+        # A same-revision last-known-good row is a usable advisory hit, not a
+        # live-query fallback. Keep the reason separately so freshness can be
+        # diagnosed without corrupting hit-rate accounting.
+        performance_collector.record_evidence("prepared_view.hit")
+        performance_collector.record_evidence("prepared_view.stale_hit")
+        performance_collector.record_evidence(f"prepared_view.stale_hit:{view_key}")
+        performance_collector.record_evidence(f"prepared_view.stale_reason:{reason}")
+        return dict(prepared.get("payload") or {}), meta
+
+    performance_collector.record_evidence("prepared_view.miss")
+    performance_collector.record_evidence(f"prepared_view.miss:{reason}")
+    performance_collector.record_evidence(f"prepared_view.miss:{view_key}:{reason}")
+    return None, meta
+
+
+def _record_prepared_fallback(view_key: str) -> None:
+    performance_collector.record_evidence("prepared_view.fallback")
+    performance_collector.record_evidence(f"prepared_view.fallback:{view_key}")
 
 
 def _publish_router_observation(view_key: str, payload: dict, *, scope: str, ttl_seconds: int = 180):
@@ -812,7 +919,27 @@ def _advisory_router_payload(view_key: str, *, max_age_seconds: int = 180):
     performance_collector.record_evidence("router_observation.lookup")
     if not row or row.get("revision_stale"):
         performance_collector.record_evidence("router_observation.miss")
-        return None, {"state": "missing", "view_key": view_key}
+        return None, {
+            "state": "missing", "view_key": view_key,
+            "reason": "revision_mismatch" if row else "not_found",
+        }
+    stale_grace_seconds = min(1800, max(300, int(max_age_seconds) * 5))
+    age_seconds = row.get("age_seconds")
+    if (
+        not row.get("eligible")
+        and (age_seconds is None or float(age_seconds) > float(stale_grace_seconds))
+    ):
+        performance_collector.record_evidence("router_observation.miss")
+        performance_collector.record_evidence("router_observation.miss:stale_grace_exceeded")
+        return None, {
+            "state": "missing",
+            "view_key": view_key,
+            "captured_at": row.get("captured_at"),
+            "age_seconds": age_seconds,
+            "source_revision": row.get("source_revision"),
+            "reason": "stale_grace_exceeded",
+            "stale_grace_seconds": stale_grace_seconds,
+        }
     payload = dict(row.get("payload") or {})
     state = "fresh" if row.get("eligible") else "stale"
     performance_collector.record_evidence(f"router_observation.{state}")
@@ -820,10 +947,11 @@ def _advisory_router_payload(view_key: str, *, max_age_seconds: int = 180):
         "state": state,
         "view_key": view_key,
         "captured_at": row.get("captured_at"),
-        "age_seconds": row.get("age_seconds"),
+        "age_seconds": age_seconds,
         "source_revision": row.get("source_revision"),
         "expired": bool(row.get("expired")),
         "too_old": bool(row.get("too_old")),
+        "stale_grace_seconds": stale_grace_seconds,
     }
 
 
@@ -1041,6 +1169,7 @@ def get_device_360(address: str) -> dict:
         activity = dict(prepared.get("activity") or {})
         activity_error = prepared.get("activity_error") or None
     else:
+        _record_prepared_fallback(f"device360:{address}")
         activity, activity_error = _build_device360_activity(
             address, explanation.get("timezone") or None
         )
@@ -1083,27 +1212,31 @@ def _background_config_analytics(_payload: dict) -> dict:
 def _background_prepared_view(payload: dict) -> dict:
     view = str((payload or {}).get("view") or "").strip()
     ttl_seconds = int((payload or {}).get("ttl_seconds") or 300)
-    if view == "dashboard:24h":
-        output = _prepare_dashboard_payload()
-    elif view == "activity:24h":
-        output = _prepare_activity_payload()
-    elif view == "services:24h":
-        output = _prepare_services_payload()
-    elif view == "classification:24h":
-        output = _classification_workbench_payload(24)
-    elif view == "history:7d":
-        output = _prepare_history_payload()
-    elif view.startswith("device360:"):
-        address = view.split(":", 1)[1]
-        activity, activity_error = _build_device360_activity(address)
-        output = {
-            "schema": "zen_prepared_device360_activity_v1",
-            "address": address,
-            "activity": activity,
-            "activity_error": activity_error,
-        }
-    else:
-        raise ValueError(f"Unknown prepared view: {view}")
+    # A prepared model is one coherent analytical read bundle. Reuse one
+    # PostgreSQL connection for the bundle instead of reconnecting for every
+    # static query; the worker remains read-only and carries no RouterOS adapter.
+    with activity_store.coherent_session():
+        if view == "dashboard:24h":
+            output = _prepare_dashboard_payload()
+        elif view == "activity:24h":
+            output = _prepare_activity_payload()
+        elif view == "services:24h":
+            output = _prepare_services_payload()
+        elif view == "classification:24h":
+            output = _classification_workbench_payload(24)
+        elif view == "history:7d":
+            output = _prepare_history_payload()
+        elif view.startswith("device360:"):
+            address = view.split(":", 1)[1]
+            activity, activity_error = _build_device360_activity(address)
+            output = {
+                "schema": "zen_prepared_device360_activity_v1",
+                "address": address,
+                "activity": activity,
+                "activity_error": activity_error,
+            }
+        else:
+            raise ValueError(f"Unknown prepared view: {view}")
     saved = policy_store.save_prepared_view(
         view_key=view,
         kind="analytics.prepared-view",
@@ -1162,6 +1295,7 @@ def _schedule_background_analytics() -> int:
             idempotency_key=key,
             payload={"view": view, "scope": scope, "ttl_seconds": ttl},
             max_attempts=3,
+            replace_pending=True,
         )
         if queued and queued.get("created"):
             scheduled += 1
@@ -2126,6 +2260,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     activity_unknown_domains = []
     prepared_view_evidence = {}
     router_observation_evidence = {}
+    managed_observation = None
     service_prefill_dns = (
         str(request.query_params.get("prefill_dns") or "").strip().lower().rstrip(".")[:253]
         if active_view == "policies" and active_section == "services" else ""
@@ -2165,6 +2300,20 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                 for item in custom_service_defs
             }
 
+    if active_view == "activity":
+        # Activity identity is a local desired-state concern. Do not block an
+        # analytics page on a RouterOS inventory read merely to obtain names.
+        devices = [
+            {
+                "name": str((cfg or {}).get("alias") or ip),
+                "ip": str(ip),
+                "address": str(ip),
+                "dynamic": False,
+            }
+            for ip, cfg in sorted(local_device_policy.items())
+            if str(ip)
+        ]
+
     if active_view == "policies" and active_section in {"profiles", "tools"}:
         policy_templates = policy_store.list_templates()
         service_groups = policy_store.list_service_groups()
@@ -2188,28 +2337,17 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         date_exceptions = policy_store.list_date_exceptions()
 
     needs_devices = (
-        active_view in {"dashboard", "devices", "schedules", "activity"}
+        active_view == "schedules"
         or (active_view == "policies" and active_section == "assignments")
         or (active_view == "settings" and active_section == "security")
     )
     router_read_error = None
 
-    needs_router = (
-        needs_devices
-        or (active_view == "policies" and active_section == "services")
-        or (active_view == "settings" and active_section in {"security", "operations"})
-    )
-
-    if active_view == "dashboard":
-        cached_security, security_meta = _advisory_router_payload(
-            "router:security-posture", max_age_seconds=180
-        )
-        router_observation_evidence["security_posture"] = security_meta
-        if cached_security:
-            security_posture = cached_security
-            if security_meta.get("state") == "stale":
-                security_error = "Advisory RouterOS security evidence is stale; enforcement writes still re-prove live posture."
-
+    # Normal Dashboard/Devices/Activity navigation is advisory.  It consumes
+    # the reconciler's already-fresh observation evidence instead of repeating
+    # expensive RouterOS reads in the browser request. Explicit diagnostics,
+    # Service Intelligence and mutation paths retain fresh RouterOS reads.
+    if active_view in {"dashboard", "activity"}:
         cached_services, service_meta = _advisory_router_payload(
             "router:service-contract-health", max_age_seconds=180
         )
@@ -2221,122 +2359,127 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                 for item in service_contract_health.get("services", [])
             }
             if service_meta.get("state") == "stale":
-                service_contract_error = "Advisory service-contract evidence is stale; open Service Intelligence for a fresh read."
+                service_contract_error = (
+                    "Advisory service-contract evidence is stale; background "
+                    "reconciliation is refreshing it."
+                )
+        else:
+            service_contract_error = (
+                "Advisory service-contract evidence is not ready; background "
+                "reconciliation will refresh it without blocking this page."
+            )
 
-    # Reuse one RouterOS transport for the whole synchronous page composition.
-    # Read-only Dashboard/Managed-device composition additionally uses one fresh
-    # RouterOS observational snapshot so per-device mode/service/bandwidth state
-    # does not create an N×service query pattern.  Write and validation routes do
-    # not consume this snapshot and continue to fresh-read RouterOS directly.
+    if active_view == "dashboard":
+        cached_security, security_meta = _advisory_router_payload(
+            "router:security-posture", max_age_seconds=180
+        )
+        router_observation_evidence["security_posture"] = security_meta
+        if cached_security:
+            security_posture = cached_security
+            if security_meta.get("state") == "stale":
+                security_error = (
+                    "Advisory RouterOS security evidence is stale; enforcement "
+                    "writes still re-prove live posture."
+                )
+
+    if active_view in {"dashboard", "devices"}:
+        managed_observation, managed_meta = _advisory_router_payload(
+            "router:managed-device-observation", max_age_seconds=180
+        )
+        router_observation_evidence["managed_devices"] = managed_meta
+        if managed_observation:
+            observed_plans = dict(managed_observation.get("plans") or {})
+            observed_errors = dict(managed_observation.get("errors") or {})
+            devices = [dict(item) for item in (managed_observation.get("devices") or [])]
+            for device in devices:
+                address = str(device.get("ip") or device.get("address") or "")
+                device["ip"] = address
+                device["address"] = address
+                plan = dict(observed_plans.get(address) or {})
+                if address in observed_errors and not plan:
+                    plan = {
+                        "address": address, "status": "error",
+                        "error": observed_errors[address], "mode_actionable": False,
+                    }
+                policy_plans[address] = plan
+                live_evidence = dict(plan.get("live_evidence") or {})
+                if live_evidence:
+                    device["live_enforcement"] = dict(live_evidence.get("enforcement") or {})
+                    device["temporary_access"] = dict(live_evidence.get("temporary_access") or {})
+                    device["live_services"] = dict(live_evidence.get("services") or {})
+                    device["live_bandwidth"] = dict(live_evidence.get("bandwidth") or {})
+                if active_view == "devices":
+                    try:
+                        device["reward_account"] = policy_store.get_reward_account(address, ledger_limit=6)
+                    except ValueError as exc:
+                        device["reward_account"] = {
+                            "ip": address, "balance_minutes": 0, "ledger": [],
+                            "enabled": False, "error": str(exc),
+                        }
+            global_modes = [
+                str(plan.get("global_mode") or "").upper()
+                for plan in observed_plans.values() if plan.get("global_mode")
+            ]
+            if global_modes:
+                live_status["mode"] = global_modes[0]
+        else:
+            # Missing observation is explicit UNKNOWN evidence.  Local desired
+            # identities remain useful, but live controls are withheld until the
+            # reconciler publishes a fresh observation.
+            devices = [
+                {
+                    "name": str((cfg or {}).get("alias") or ip),
+                    "ip": str(ip), "address": str(ip), "dynamic": False,
+                }
+                for ip, cfg in sorted(local_device_policy.items()) if str(ip)
+            ]
+            for device in devices:
+                policy_plans[device["ip"]] = {
+                    "address": device["ip"], "status": "error",
+                    "error": "RouterOS advisory observation is not ready",
+                    "mode_actionable": False,
+                }
+        if active_view == "devices":
+            discovered = policy_store.list_discovery_cache()
+            restricted_ips = {d["ip"] for d in devices}
+            discovered_devices = []
+            for item in discovered:
+                ip = item.get("address") or item.get("ip")
+                if ip:
+                    discovered_devices.append({**item, "ip": ip, "managed": ip in restricted_ips})
+
+    needs_router = (
+        needs_devices
+        or active_view == "dashboard"  # cheap web-policy status only
+        or (active_view == "policies" and active_section == "services")
+        or (active_view == "settings" and active_section in {"security", "operations"})
+    )
+
+    # Reuse one RouterOS transport for the synchronous surfaces that explicitly
+    # require fresh RouterOS state. Dashboard/Managed Devices consume the
+    # reconciler's revision-bound advisory observation above instead of repeating
+    # the multi-second inventory/service scan in the browser request. Write and
+    # validation routes never consume that prepared evidence and continue to
+    # fresh-read RouterOS directly inside the mutation authority boundary.
     if needs_router:
         try:
             with router.coherent_session():                # Dashboard consumes advisory prepared RouterOS evidence above.
                 # Fresh service-contract probes stay on the explicit Activity /
                 # Service Intelligence paths instead of blocking navigation.
 
-                device_snapshot = None
-                if active_view in {"dashboard", "devices"}:
-                    device_snapshot = router.get_managed_device_observation_snapshot(
-                        service_catalog=service_enforcement_catalog,
-                        service_health_map=(service_contract_health_map if active_view == "dashboard" else None),
-                    )
-                    devices = [
-                        {
-                            "name": item["name"],
-                            "ip": item["address"],
-                            "address": item["address"],
-                            "dynamic": item.get("dynamic", False),
-                        }
-                        for item in device_snapshot.get("devices", [])
-                    ]
-                elif needs_devices:
+                if needs_devices:
                     devices = get_live_devices()
 
-                if active_view in {"dashboard", "devices"}:
-                    live_status = get_live_status()
-
                 if active_view == "dashboard":
+                    # The expensive managed-device observation is supplied by the
+                    # reconciler read model above. Keep only this small explicit
+                    # web-policy status read on the normal Dashboard request.
                     web_policy = router.get_web_policy_status()
 
                 if active_view == "schedules":
                     schedules = router.get_managed_schedules()
 
-                if active_view in {"dashboard", "devices"}:
-                    snapshot_states = (device_snapshot or {}).get("states", {})
-                    for device in devices:
-                        address = device["ip"]
-                        state = snapshot_states.get(address) or {}
-                        if state.get("error"):
-                            device["live_enforcement_error"] = str(state["error"])
-                        else:
-                            device["live_enforcement"] = state.get("live_enforcement")
-                            device["live_services"] = state.get("live_services")
-                            device["live_bandwidth"] = state.get("live_bandwidth")
-                            try:
-                                # Temporary access retains its existing reader so
-                                # bounded cleanup of expired MC scheduler/script
-                                # artefacts is not silently removed by an
-                                # observational performance optimization.
-                                device["temporary_access"] = router.get_device_temporary_access(address)
-                            except RouterError as exc:
-                                device["live_enforcement_error"] = str(exc)
-                        if active_view == "devices":
-                            try:
-                                device["reward_account"] = policy_store.get_reward_account(address, ledger_limit=6)
-                            except ValueError as exc:
-                                device["reward_account"] = {
-                                    "ip": address, "balance_minutes": 0, "ledger": [],
-                                    "enabled": False, "error": str(exc),
-                                }
-
-                    policy_clock = policy_store.get_policy_clock()
-                    effective_policies = {
-                        d["ip"]: get_effective_policy(d["ip"], at=policy_clock["iso"])
-                        for d in devices
-                    }
-                    for device in devices:
-                        address = device["ip"]
-                        if device.get("live_enforcement_error"):
-                            policy_plans[address] = {
-                                "address": address, "status": "error",
-                                "error": str(device["live_enforcement_error"]),
-                                "mode_actionable": False,
-                            }
-                            continue
-                        try:
-                            policy_plans[address] = get_live_policy_plan(
-                                address,
-                                desired_policy=effective_policies.get(address),
-                                live_enforcement=device.get("live_enforcement"),
-                                temporary_access=device.get("temporary_access"),
-                                live_services=device.get("live_services"),
-                                live_bandwidth=device.get("live_bandwidth"),
-                                global_mode=str(live_status.get("mode", "normal")).lower(),
-                            )
-                        except (RouterError, PolicyPlanError, ValueError) as exc:
-                            policy_plans[address] = {
-                                "address": address, "status": "error", "error": str(exc),
-                                "mode_actionable": False,
-                            }
-
-                    if active_view == "devices":
-                        try:
-                            discovered = router.get_discovered_devices()
-                            policy_store.update_discovery_cache(discovered)
-                        except RouterError as exc:
-                            discovery_error = str(exc)
-                            discovered = policy_store.list_discovery_cache()
-                        restricted_ips = {d["ip"] for d in devices}
-                        discovered_devices = []
-                        for item in discovered:
-                            ip = item.get("address") or item.get("ip")
-                            if ip:
-                                discovered_devices.append({**item, "ip": ip, "managed": ip in restricted_ips})
-
-                if (
-                    active_view == "activity"
-                    or (active_view == "policies" and active_section == "services")
-                ):
+                if active_view == "policies" and active_section == "services":
                     try:
                         service_contract_health = router.get_service_contract_health(custom_service_defs)
                         _publish_router_observation(
@@ -2384,54 +2527,35 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     if active_view in {"dashboard", "policies"}:
         policy_summary = policy_store.build_policy_summary(devices)
 
-    if (
-        active_view in {"activity", "dashboard"}
-        or (active_view == "settings" and active_section == "security")
-    ):
+    if active_view in {"activity", "dashboard"}:
         try:
             managed_ips = [device.get("ip") for device in devices if device.get("ip")]
-            telemetry_available = activity_store.health()
-            if active_view == "activity":
-                prepared, prepared_meta = _prepared_payload("activity:24h")
-                if prepared and telemetry_available:
-                    prepared_view_evidence["activity"] = prepared_meta
-                    activity_overview = dict(prepared.get("overview") or {})
-                    activity_devices = [dict(row) for row in (prepared.get("devices") or [])]
-                    observed_services = [dict(row) for row in (prepared.get("observed_services") or [])]
-                    activity_services = observed_services[:12]
-                    activity_domains = list(prepared.get("domains") or [])
-                    activity_device_summaries = dict(prepared.get("device_summaries") or {})
-                    dns_service_rows = [dict(row) for row in (prepared.get("dns_service_rows") or [])]
-                    activity_coverage = dict(prepared.get("coverage") or {})
-                    activity_unknown_domains = list(prepared.get("unknown_domains") or [])
-                    activity_insights = dict(prepared.get("activity_insights") or {})
-                else:
-                    if telemetry_available:
-                        activity_overview = activity_store.overview(24)
-                        activity_devices = activity_store.top_devices(24, 12)
-                        observed_services = activity_store.top_services(24, 100)
-                        activity_services = observed_services[:12]
-                        activity_domains = activity_store.dns_top_domains(24, 30)
-                        activity_device_summaries = activity_store.device_activity_summaries(
-                            [row.get("client_ip") for row in activity_devices], 24, 5, 6
-                        )
-                        dns_service_rows = activity_store.dns_top_services(24, 100)
-                        activity_coverage = activity_store.classification_coverage(24)
-                        activity_unknown_domains = activity_store.unknown_domains(24, 30)
-                        activity_insights = {
-                            "observed_services": int(activity_overview.get("observed_services", 0)),
-                            "attributed_percent": float(activity_overview.get("attributed_percent", 0.0)),
-                            "dns_block_percent": float(activity_overview.get("dns_block_percent", 0.0)),
-                            "managed_devices_seen": activity_store.managed_activity_count(managed_ips, 24),
-                            "unique_domains": int(activity_overview.get("unique_domains", 0)),
-                            "latest_flow": activity_overview.get("latest_flow"),
-                            "latest_dns": activity_overview.get("latest_dns"),
-                            "traffic_classified_percent": activity_coverage.get("traffic_percent"),
-                            "dns_classified_percent": activity_coverage.get("dns_percent"),
-                            "traffic_classification_status": activity_coverage.get("traffic_evidence_status", "no_evidence"),
-                            "dns_classification_status": activity_coverage.get("dns_evidence_status", "no_evidence"),
-                            "unknown_domains": int(activity_coverage.get("unknown_domains", 0)),
-                        }
+            view_key = "activity:24h" if active_view == "activity" else "dashboard:24h"
+            prepared, prepared_meta = _prepared_payload(
+                view_key, allow_stale_same_revision=True
+            )
+            prepared_view_evidence[active_view] = prepared_meta
+            if prepared:
+                telemetry_available = bool(prepared.get("telemetry_available", True))
+            else:
+                telemetry_available = False
+                activity_error = (
+                    "Prepared telemetry evidence is not ready yet; the background "
+                    "read worker has been asked to refresh it. No live analytics "
+                    "fallback was run in this navigation request."
+                )
+
+            if active_view == "activity" and prepared:
+                activity_overview = dict(prepared.get("overview") or {})
+                activity_devices = [dict(row) for row in (prepared.get("devices") or [])]
+                observed_services = [dict(row) for row in (prepared.get("observed_services") or [])]
+                activity_services = observed_services[:12]
+                activity_domains = list(prepared.get("domains") or [])
+                activity_device_summaries = dict(prepared.get("device_summaries") or {})
+                dns_service_rows = [dict(row) for row in (prepared.get("dns_service_rows") or [])]
+                activity_coverage = dict(prepared.get("coverage") or {})
+                activity_unknown_domains = list(prepared.get("unknown_domains") or [])
+                activity_insights = dict(prepared.get("activity_insights") or {})
                 if telemetry_available:
                     managed_names = {}
                     for device in devices:
@@ -2459,33 +2583,29 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                         "tls_contracts_total": int(service_contract_health.get("total", 0)),
                         "detector_addresses": int(service_contract_health.get("detector_addresses", 0)),
                     })
-            else:
-                prepared, prepared_meta = _prepared_payload("dashboard:24h")
-                if prepared and telemetry_available:
-                    prepared_view_evidence["dashboard"] = prepared_meta
-                    activity_insights = dict(prepared.get("activity_insights") or {})
-                    activity_coverage = dict(prepared.get("activity_coverage") or {})
-                    security_bypass_attempts = list(prepared.get("security_bypass_attempts") or [])
-                    security_bypass_evidence = list(prepared.get("security_bypass_evidence") or [])
-                    security_bypass_summary = dict(
-                        prepared.get("security_bypass_summary") or summarize_bypass_evidence([])
-                    )
-                    activity_insights["managed_devices"] = len(managed_ips)
-                else:
-                    if telemetry_available:
-                        activity_coverage = activity_store.classification_coverage(24)
-                        activity_insights = {
-                            "managed_devices": len(managed_ips),
-                            "managed_devices_seen": activity_store.managed_activity_count(managed_ips, 24),
-                            "traffic_classified_percent": activity_coverage.get("traffic_percent"),
-                            "dns_classified_percent": activity_coverage.get("dns_percent"),
-                            "traffic_classification_status": activity_coverage.get("traffic_evidence_status", "no_evidence"),
-                            "dns_classification_status": activity_coverage.get("dns_evidence_status", "no_evidence"),
-                            "unknown_domains": int(activity_coverage.get("unknown_domains", 0)),
-                        }
-                        security_bypass_attempts = activity_store.bypass_attempts(managed_ips, 24, 30)
-                        security_bypass_evidence = activity_store.bypass_evidence(managed_ips, 24, 120)
-                        security_bypass_summary = summarize_bypass_evidence(security_bypass_evidence)
+            elif active_view == "dashboard" and prepared:
+                activity_insights = dict(prepared.get("activity_insights") or {})
+                activity_coverage = dict(prepared.get("activity_coverage") or {})
+                security_bypass_attempts = list(prepared.get("security_bypass_attempts") or [])
+                security_bypass_evidence = list(prepared.get("security_bypass_evidence") or [])
+                security_bypass_summary = dict(
+                    prepared.get("security_bypass_summary") or summarize_bypass_evidence([])
+                )
+                activity_insights["managed_devices"] = len(managed_ips)
+        except ActivityError as exc:
+            activity_error = str(exc)
+
+    elif active_view == "settings" and active_section == "security":
+        # The explicit security surface may still gather fresh telemetry evidence;
+        # it is not part of the fast advisory navigation contract above.
+        try:
+            managed_ips = [device.get("ip") for device in devices if device.get("ip")]
+            telemetry_available = activity_store.health()
+            if telemetry_available:
+                activity_coverage = activity_store.classification_coverage(24)
+                security_bypass_attempts = activity_store.bypass_attempts(managed_ips, 24, 30)
+                security_bypass_evidence = activity_store.bypass_evidence(managed_ips, 24, 120)
+                security_bypass_summary = summarize_bypass_evidence(security_bypass_evidence)
         except ActivityError as exc:
             activity_error = str(exc)
 
@@ -2656,7 +2776,9 @@ def api_activity_overview(
 ):
     try:
         if int(hours) == 24:
-            prepared, meta = _prepared_payload("activity:24h")
+            prepared, meta = _prepared_payload(
+                "activity:24h", allow_stale_same_revision=True
+            )
             if prepared and prepared.get("telemetry_available"):
                 return {
                     "overview": prepared.get("overview") or {},
@@ -2665,13 +2787,20 @@ def api_activity_overview(
                     "domains": list(prepared.get("domains") or [])[:20],
                     "prepared_view": meta,
                 }
-        return {
-            "overview": activity_store.overview(hours),
-            "devices": activity_store.top_devices(hours, 20),
-            "services": activity_store.top_services(hours, 20),
-            "domains": activity_store.dns_top_domains(hours, 20),
-            "prepared_view": None,
-        }
+            return {
+                "state": "preparing",
+                "overview": {}, "devices": [], "services": [], "domains": [],
+                "prepared_view": meta,
+                "evidence_note": "Prepared activity evidence is not ready; background refresh requested.",
+            }
+        with activity_store.coherent_session():
+            return {
+                "overview": activity_store.overview(hours),
+                "devices": activity_store.top_devices(hours, 20),
+                "services": activity_store.top_services(hours, 20),
+                "domains": activity_store.dns_top_domains(hours, 20),
+                "prepared_view": None,
+            }
     except ActivityError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -2703,21 +2832,32 @@ def api_activity_services(
     try:
         prepared = meta = None
         if int(hours) == 24:
-            prepared, meta = _prepared_payload("services:24h")
+            prepared, meta = _prepared_payload(
+                "services:24h", allow_stale_same_revision=True
+            )
         if prepared and prepared.get("telemetry_available"):
             observed = [dict(row) for row in (prepared.get("traffic") or [])]
             dns_rows = [dict(row) for row in (prepared.get("dns") or [])]
             coverage = dict(prepared.get("coverage") or {})
             unknown = list(prepared.get("unknown_domains") or [])
+        elif int(hours) == 24:
+            observed, dns_rows, coverage, unknown = [], [], {}, []
         else:
-            observed = activity_store.top_services(hours, 100)
-            dns_rows = activity_store.dns_top_services(hours, 100)
-            coverage = activity_store.classification_coverage(hours)
-            unknown = activity_store.unknown_domains(hours, 50)
-        try:
-            health = router.get_service_contract_health()
-        except RouterError:
-            health = {"available": False, "services": []}
+            with activity_store.coherent_session():
+                observed = activity_store.top_services(hours, 100)
+                dns_rows = activity_store.dns_top_services(hours, 100)
+                coverage = activity_store.classification_coverage(hours)
+                unknown = activity_store.unknown_domains(hours, 50)
+        if int(hours) == 24:
+            health, _health_meta = _advisory_router_payload(
+                "router:service-contract-health", max_age_seconds=180
+            )
+            health = health or {"available": False, "services": []}
+        else:
+            try:
+                health = router.get_service_contract_health()
+            except RouterError:
+                health = {"available": False, "services": []}
         return {
             "traffic": observed,
             "policy_services": build_service_intelligence(
@@ -2996,6 +3136,7 @@ def api_activity_analytics(
                     "active_periods": [],
                     "prepared_view": meta,
                 }
+            _record_prepared_fallback("history:7d")
         settings = policy_store.get_settings()
         timezone_name = settings.get("policy_timezone", "Europe/London")
         window = resolve_activity_window(period, timezone_name, start, end)
@@ -3057,6 +3198,8 @@ def activity_analytics_page(
             timezone_name = str(prepared.get("timezone_name") or timezone_name)
             selected_name = "All devices"
         else:
+            if str(period or "7d").lower() == "7d" and not selected and not start and not end:
+                _record_prepared_fallback("history:7d")
             if selected:
                 import ipaddress as _ipaddress
                 _ipaddress.ip_address(selected)
@@ -3314,6 +3457,40 @@ def _classification_workbench_payload(hours: int = 24) -> dict:
     return payload
 
 
+def _classification_preparing_payload(hours: int, prepared_meta: dict | None = None) -> dict:
+    return {
+        "schema": "zen_classification_intelligence_v1",
+        "state": "preparing",
+        "hours": int(hours) if int(hours) in {24, 168, 720} else 24,
+        "current": {}, "previous": {},
+        "deltas": {"traffic_pp": None, "dns_pp": None},
+        "trend": "unknown", "daily": [], "candidates": [],
+        "candidate_counts": {"signature_match": 0, "name_hint": 0, "unmatched": 0},
+        "candidate_accounting": {
+            "unknown_queries": 0, "listed_queries": 0,
+            "listed_share_percent": None, "valid": True,
+        },
+        "evidence": {
+            "status": "unavailable", "traffic_observed": False,
+            "dns_observed": False, "traffic_accounting_valid": False,
+            "dns_accounting_valid": False, "accounting_valid": False,
+        },
+        "catalogue": {}, "service_changes": [], "trend_days": 7,
+        "classifier_consumer": {
+            "availability": "unavailable", "source": "unknown",
+            "services": 0, "signatures": 0, "has_live": False,
+            "degraded": True, "error": "Prepared classification evidence is not ready",
+            "observed_at": None, "age_seconds": None,
+        },
+        "timezone_name": policy_store.get_settings().get("policy_timezone", "Europe/London"),
+        "evidence_note": (
+            "Prepared classification evidence is not ready. Background refresh has "
+            "been requested; missing evidence is not converted into zero activity."
+        ),
+        "prepared_view": prepared_meta,
+    }
+
+
 @app.get("/api/activity/classification")
 def api_activity_classification(
     hours: int = 24,
@@ -3321,10 +3498,14 @@ def api_activity_classification(
 ):
     try:
         if int(hours) == 24:
-            prepared, meta = _prepared_payload("classification:24h")
+            prepared, meta = _prepared_payload(
+                "classification:24h", allow_stale_same_revision=True
+            )
             if prepared:
                 return {**prepared, "prepared_view": meta}
-        return {**_classification_workbench_payload(hours), "prepared_view": None}
+            return _classification_preparing_payload(hours, meta)
+        with activity_store.coherent_session():
+            return {**_classification_workbench_payload(hours), "prepared_view": None}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except ActivityError as exc:
@@ -3341,26 +3522,20 @@ def activity_classification_page(
     try:
         prepared = meta = None
         if int(hours) == 24:
-            prepared, meta = _prepared_payload("classification:24h")
-        payload = dict(prepared) if prepared else _classification_workbench_payload(hours)
+            prepared, meta = _prepared_payload(
+                "classification:24h", allow_stale_same_revision=True
+            )
+            payload = dict(prepared) if prepared else _classification_preparing_payload(hours, meta)
+        else:
+            with activity_store.coherent_session():
+                payload = _classification_workbench_payload(hours)
         payload["prepared_view"] = meta
     except (ValueError, ActivityError) as exc:
         error = str(exc)
-        payload = {
-            "schema": "zen_classification_intelligence_v1",
-            "hours": hours if hours in {24, 168, 720} else 24,
-            "current": {}, "previous": {}, "deltas": {"traffic_pp": None, "dns_pp": None},
-            "trend": "unknown", "daily": [], "candidates": [],
-            "candidate_counts": {"signature_match": 0, "name_hint": 0, "unmatched": 0},
-            "candidate_accounting": {"unknown_queries": 0, "listed_queries": 0, "listed_share_percent": None, "valid": True},
-            "evidence": {"status": "unavailable", "traffic_observed": False, "dns_observed": False, "traffic_accounting_valid": False, "dns_accounting_valid": False, "accounting_valid": False},
-            "catalogue": {}, "classifier_consumer": {"availability": "unavailable", "source": "unknown", "services": 0, "signatures": 0, "has_live": False, "degraded": True, "error": "Classifier consumer heartbeat is unavailable", "observed_at": None, "age_seconds": None}, "service_changes": [], "trend_days": 7,
-            "timezone_name": policy_store.get_settings().get("policy_timezone", "Europe/London"),
-            "evidence_note": (
-                "Classification evidence is unavailable. ZEN does not convert missing telemetry into zero activity."
-            ),
-            "prepared_view": None,
-        }
+        payload = _classification_preparing_payload(hours, None)
+        payload["evidence_note"] = (
+            "Classification evidence is unavailable. ZEN does not convert missing telemetry into zero activity."
+        )
     return templates.TemplateResponse(
         "classification.html",
         {"request": request, "user": user, "error": error, **payload},

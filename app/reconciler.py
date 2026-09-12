@@ -398,6 +398,110 @@ class AutoReconciler:
         except Exception:
             pass
 
+    def _publish_managed_observation(self, devices: list[dict], batch: dict) -> None:
+        """Publish the reconciler's fresh read results for advisory UI use.
+
+        The payload is derived observation only.  It is written before the
+        serialized mutation phase and is never read by ``reconcile_device`` or
+        any mutation-authority path.  A later configuration revision makes it
+        ineligible automatically through the prepared-view revision guard.
+        """
+        results = dict(batch.get("results") or {})
+        errors = {str(key): str(value) for key, value in (batch.get("errors") or {}).items()}
+        normalized_devices = []
+        for item in devices or []:
+            address = str(item.get("ip") or item.get("address") or "").strip()
+            if not address:
+                continue
+            normalized_devices.append({
+                "name": str(item.get("name") or item.get("comment") or address),
+                "address": address,
+                "ip": address,
+                "dynamic": bool(item.get("dynamic", False)),
+            })
+
+        try:
+            revision = int(self.policy_store.current_config_revision().get("revision") or 0)
+        except Exception:
+            # Read-model publication is optional observational work. A legacy or
+            # degraded store must not make an otherwise-valid reconciliation
+            # cycle fail merely because advisory persistence is unavailable.
+            return
+        payload = {
+            "schema": "zen_managed_device_observation_v1",
+            "observed_at": self._iso_now(),
+            "devices": normalized_devices,
+            "plans": results,
+            "errors": errors,
+            "observation": {
+                key: batch.get(key)
+                for key in ("schema", "items", "workers", "max_active", "duration_ms")
+            },
+        }
+        try:
+            self.policy_store.save_prepared_view(
+                view_key="router:managed-device-observation",
+                kind="router.observation",
+                scope="router:managed-devices",
+                payload=payload,
+                source_revision=revision,
+                ttl_seconds=180,
+            )
+        except Exception:
+            # Advisory publication must never turn an otherwise-valid observe or
+            # enforcement cycle into a control-plane failure.
+            pass
+
+        # Service primitive availability has already been proven while building
+        # each device plan.  Publish a conservative aggregate for ordinary
+        # Activity navigation so it does not repeat the same multi-second live
+        # contract probe.  Explicit Service Intelligence still owns its fresh
+        # RouterOS refresh endpoint.
+        services: dict[str, dict] = {}
+        for plan in results.values():
+            for state in plan.get("service_states") or []:
+                key = str(state.get("key") or "").strip()
+                if not key:
+                    continue
+                row = services.setdefault(key, {
+                    "key": key,
+                    "name": str(state.get("name") or key),
+                    "healthy": True,
+                    "status": "healthy",
+                    "error": "",
+                    "detector_addresses": 0,
+                    "evidence_source": "reconciler-device-plan",
+                })
+                if not bool(state.get("available", True)):
+                    row["healthy"] = False
+                    row["status"] = "degraded"
+                    if not row.get("error"):
+                        row["error"] = str(state.get("error") or "Service contract unavailable")
+        if services:
+            rows = [services[key] for key in sorted(services)]
+            health = {
+                "schema": "zen_service_contract_observation_v1",
+                "available": True,
+                "services": rows,
+                "healthy": sum(1 for row in rows if row.get("healthy")),
+                "total": len(rows),
+                "degraded": sum(1 for row in rows if not row.get("healthy")),
+                "reporting_only": 0,
+                "detector_addresses": 0,
+                "evidence_source": "reconciler-device-plan",
+            }
+            try:
+                self.policy_store.save_prepared_view(
+                    view_key="router:service-contract-health",
+                    kind="router.observation",
+                    scope="router:service-contracts",
+                    payload=health,
+                    source_revision=revision,
+                    ttl_seconds=180,
+                )
+            except Exception:
+                pass
+
     def _observe_plans(self, devices: list[dict]) -> dict:
         usable = [
             device for device in devices
@@ -640,6 +744,7 @@ class AutoReconciler:
             observation["failed"] = len(batch.get("errors") or {})
             counts["observed"] = len(batch.get("results") or {})
             counts["plan_failed"] = len(batch.get("errors") or {})
+            self._publish_managed_observation(devices, batch)
 
             for address, error in (batch.get("errors") or {}).items():
                 counts["failed"] += 1

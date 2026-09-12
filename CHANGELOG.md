@@ -1,3 +1,17 @@
+## v0.54.5.2 — Prepared-view hit-rate & read-path fan-out closure
+
+- Removes the remaining synchronous live analytics fallback from ordinary Dashboard and Activity navigation. Missing prepared evidence is shown as explicit PREPARING/MISSING state and wakes the background worker instead of blocking the browser on multi-second PostgreSQL fan-out.
+- Allows last-known-good prepared evidence to remain usable only when it is from the current configuration revision and status is `ready`; stale evidence stays visibly STALE, while revision-mismatched evidence is never served.
+- Adds explicit prepared-view miss reasons (`not_found`, `revision_mismatch`, `status_not_ready`, `expired`, `too_old`, `stale_grace_exceeded`) and separates a true live fallback counter from a simple prepared-view miss. Same-revision stale evidence has a bounded grace window; it cannot remain a performance "hit" indefinitely.
+- Reuses one coherent PostgreSQL connection for each background analytics bundle, preserving individual SQL timing evidence while eliminating repeated connection/authentication overhead across related static queries.
+- Coalesces obsolete pending prepared-view jobs per kind/scope while never deleting running leased work, preventing slow analytics generation from accumulating stale two-minute refresh buckets.
+- Publishes the automatic reconciler's already-fresh managed-device observation and conservative service-contract evidence as revision-bound advisory read models. Normal Dashboard/Managed Devices/Activity rendering consumes those models rather than repeating the same multi-second RouterOS reads.
+- Keeps all prepared RouterOS evidence observational only. Reconciliation and every authority-changing path continue to acquire the serialized mutation lane, re-prove security posture, fresh-read RouterOS state, calculate, write and verify without consulting the advisory cache.
+- Tightens formal acceptance so prepared-view effectiveness requires at least five warmed lookups and at least a 90% fresh-or-explicit-stale-same-revision hit rate; low hit rates are FAIL rather than hidden behind successful fallback work.
+- Improves UI evidence labels for Dashboard, Activity and Managed Devices so FRESH / STALE / MISSING advisory state is visible and cannot be confused with verified live enforcement.
+
+Read-path boundary: a fast browser response is allowed to show stale/missing advisory evidence, but it is never allowed to use stale evidence as RouterOS write authority or silently convert missing data into healthy/zero state.
+
 ## v0.54.5.1 — RouterOS request-path decoupling & reconciliation closure
 
 - Converts manual **Apply desired policy** and **Reconcile all** from synchronous RouterOS HTTP work into durable reconciliation requests that ACK after local queue persistence.

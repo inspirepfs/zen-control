@@ -28,6 +28,12 @@ class FormalPerformanceAcceptanceTests(unittest.TestCase):
             self._finish(perf, method="POST", route="/devices/enforcement", duration_ms=600, router=True)
             self._finish(perf, method="GET", route="/devices/{address}", duration_ms=450, router=True)
 
+    @staticmethod
+    def _populate_prepared_hits(perf, *, count=5):
+        for _ in range(count):
+            perf.record_evidence("prepared_view.lookup")
+            perf.record_evidence("prepared_view.hit")
+
     def test_stats_include_min_and_outliers_are_retained(self):
         perf = PerformanceCollector()
         for value in [100.0] * 19 + [2200.0]:
@@ -100,7 +106,7 @@ class FormalPerformanceAcceptanceTests(unittest.TestCase):
     def test_relaxed_threshold_profile_cannot_manufacture_formal_pass(self):
         perf = PerformanceCollector()
         self._populate_request_classes(perf)
-        perf.record_evidence("prepared_view.hit")
+        self._populate_prepared_hits(perf)
         snapshot = perf.snapshot()
         snapshot["configuration"]["budget_navigation_p95_ms"] = 5000.0
         operational = {
@@ -123,7 +129,7 @@ class FormalPerformanceAcceptanceTests(unittest.TestCase):
     def test_degraded_background_worker_is_formal_fail(self):
         perf = PerformanceCollector()
         self._populate_request_classes(perf)
-        perf.record_evidence("prepared_view.hit")
+        self._populate_prepared_hits(perf)
         snapshot = perf.snapshot()
         operational = {
             "background_worker": {
@@ -148,7 +154,7 @@ class FormalPerformanceAcceptanceTests(unittest.TestCase):
     def test_formal_gate_passes_with_complete_observational_evidence(self):
         perf = PerformanceCollector()
         self._populate_request_classes(perf)
-        perf.record_evidence("prepared_view.hit")
+        self._populate_prepared_hits(perf)
         snapshot = perf.snapshot()
         operational = {
             "background_worker": {"worker_alive": True, "last_duration_ms": 12.5, "last_result": "ok", "last_failed": 0},
@@ -191,11 +197,11 @@ class FormalPerformanceSourceContractTests(unittest.TestCase):
         self.assertIn('or path.startswith("/local/performance/")', self.main)
 
     def test_release_and_formal_contract_are_v0544(self):
-        self.assertIn('version="0.54.5.1"', self.main)
+        self.assertIn('version="0.54.5.2"', self.main)
         self.assertIn("zen_performance_acceptance_v2", self.performance)
         self.assertIn("zen_formal_performance_acceptance_v1", self.performance)
         self.assertIn("ZEN Control v0.54.4 formal performance acceptance", self.script)
-        self.assertIn("Current release: **v0.54.5.1**", self.readme)
+        self.assertIn("Current release: **v0.54.5.2**", self.readme)
         self.assertIn("## v0.54.4 — Formal performance acceptance", self.changelog)
 
     def test_prepared_view_hit_miss_fallback_evidence_is_explicit(self):

@@ -4,11 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.54.5.1">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.1">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.5.1">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.5.1">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.5.2">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.2">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.5.2">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.5.2">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.5.2">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -108,7 +108,8 @@
       <div>
         <h2>Connected system health</h2>
         <p class="muted">One view across policy, RouterOS authority, service intelligence, telemetry and operational evidence. Every row drills back into the feature that owns the state.</p>
-        {% if prepared_view_evidence.dashboard %}<p class="muted small">Telemetry summary prepared {{prepared_view_evidence.dashboard.age_seconds|round(1)}}s ago at config revision {{prepared_view_evidence.dashboard.source_revision}}.</p>{% endif %}
+        {% set dash_prepared = prepared_view_evidence.get('dashboard', {}) %}
+        {% if dash_prepared %}<p class="muted small">Telemetry read model {{ dash_prepared.get('state', 'missing')|upper }}{% if dash_prepared.get('age_seconds') is not none %} · {{dash_prepared.get('age_seconds')|round(1)}}s old{% endif %}{% if dash_prepared.get('source_revision') is not none %} · config revision {{dash_prepared.get('source_revision')}}{% endif %}{% if dash_prepared.get('reason') %} · {{dash_prepared.get('reason')|replace('_', ' ')}}{% endif %}.</p>{% endif %}
         {% set sec_obs = router_observation_evidence.get('security_posture', {}) %}
         {% set svc_obs = router_observation_evidence.get('service_contract_health', {}) %}
         <p class="muted small">RouterOS dashboard evidence is non-blocking: security {{ sec_obs.get('state', 'missing')|upper }}{% if sec_obs.get('age_seconds') is not none %} · {{sec_obs.get('age_seconds')|round(1)}}s old{% endif %}; service contracts {{ svc_obs.get('state', 'missing')|upper }}{% if svc_obs.get('age_seconds') is not none %} · {{svc_obs.get('age_seconds')|round(1)}}s old{% endif %}. Authority-changing operations always re-read RouterOS live.</p>
@@ -336,7 +337,8 @@
         {% else %}
           <span class="policy-badge disabled">AUTO OFF</span>
         {% endif %}
-        <span class="policy-badge enabled">LIVE CONTROL</span>
+        {% set managed_obs = router_observation_evidence.get('managed_devices', {}) %}
+        <span class="policy-badge {% if managed_obs.get('state') == 'fresh' %}enabled{% elif managed_obs.get('state') == 'stale' %}auto-observe{% else %}disabled{% endif %}">ADVISORY {{managed_obs.get('state', 'missing')|upper}}</span>
         {% if user.role in ['admin', 'operator'] %}
           <form
             method="post"
@@ -349,6 +351,9 @@
         {% endif %}
       </div>
     </div>
+
+    {% set managed_obs = router_observation_evidence.get('managed_devices', {}) %}
+    <p class="muted small">RouterOS device evidence is {{managed_obs.get('state', 'missing')|upper}}{% if managed_obs.get('age_seconds') is not none %} · {{managed_obs.get('age_seconds')|round(1)}}s old{% endif %}. Normal browsing uses reconciler observation evidence; Apply still re-proves and re-reads RouterOS live inside the serialized mutation lane.</p>
 
     <div class="managed-device-list">
     {% for d in devices %}
@@ -1834,7 +1839,8 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       <div>
         <h2>Activity &amp; Usage</h2>
         <p class="muted">Parent-facing IPFIX traffic and Pi-hole DNS evidence for the last 24 hours.</p>
-        {% if prepared_view_evidence.activity %}<p class="muted small">Prepared read model · {{prepared_view_evidence.activity.age_seconds|round(1)}}s old · config revision {{prepared_view_evidence.activity.source_revision}}</p>{% endif %}
+        {% set activity_prepared = prepared_view_evidence.get('activity', {}) %}
+        {% if activity_prepared %}<p class="muted small">Prepared read model {{activity_prepared.get('state', 'missing')|upper}}{% if activity_prepared.get('age_seconds') is not none %} · {{activity_prepared.get('age_seconds')|round(1)}}s old{% endif %}{% if activity_prepared.get('source_revision') is not none %} · config revision {{activity_prepared.get('source_revision')}}{% endif %}{% if activity_prepared.get('reason') %} · {{activity_prepared.get('reason')|replace('_', ' ')}}{% endif %}</p>{% endif %}
       </div>
       {% if telemetry_available %}
         <span class="policy-badge enabled">TELEMETRY ONLINE</span>

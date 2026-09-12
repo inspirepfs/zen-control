@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   {% include "_pwa_head.jinja" %}
   <title>Performance · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.54.5.1">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.1">
-  <link rel="stylesheet" href="/static/performance.css?v=0.54.5.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.5.2">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.2">
+  <link rel="stylesheet" href="/static/performance.css?v=0.54.5.2">
 </head>
 <body class="standalone-page">
 <main class="standalone-shell performance-shell">
@@ -81,7 +81,7 @@
             <td><strong>{{ row.label }}</strong><div class="muted small">{{ row.description }}</div></td>
             <td>
               {% if row.key == 'threshold_profile' %}min samples {{ row.configured_min_samples }} · relaxed {% if row.relaxed %}{{ row.relaxed|join(', ') }}{% else %}none{% endif %}
-              {% elif row.key == 'prepared_views' %}hits {{ row.hits }} · misses {{ row.misses }} · fallbacks {{ row.fallbacks }}
+              {% elif row.key == 'prepared_views' %}lookups {{ row.lookups }} · hits {{ row.hits }} ({{ row.hit_rate_percent }}%) · stale hits {{ row.stale_hits }} · misses {{ row.misses }} · live fallbacks {{ row.fallbacks }}
               {% elif row.key == 'background_worker' %}alive {{ row.worker_alive }} · result {{ row.last_result or 'n/a' }} · failed {{ row.last_failed or 0 }} · last {{ row.last_duration_ms if row.last_duration_ms is not none else 'n/a' }} ms
               {% elif row.key == 'parallel_observation' %}items {{ row.items }} · workers {{ row.workers }} · max active {{ row.max_active }} · utilisation {{ row.utilisation_percent if row.utilisation_percent is not none else 'n/a' }}%
               {% elif row.key == 'mutation_lane' %}acquisitions {{ row.acquisitions if row.acquisitions is not none else 'n/a' }} · contentions {{ row.contentions if row.contentions is not none else 'n/a' }} · wait {{ row.last_wait_ms if row.last_wait_ms is not none else 'n/a' }} / {{ row.max_wait_ms if row.max_wait_ms is not none else 'n/a' }} ms

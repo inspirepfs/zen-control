@@ -853,6 +853,7 @@ class PolicyStore:
         payload=None,
         max_attempts=3,
         available_at=None,
+        replace_pending=False,
     ):
         kind = str(kind or "").strip()[:100]
         scope = str(scope or "global").strip()[:160]
@@ -863,6 +864,17 @@ class PolicyStore:
         now = self._operations_now_iso()
         available_at = str(available_at or now)
         with self._db() as db:
+            if replace_pending:
+                # Prepared analytics are derived state. Keep only the newest
+                # pending job for a kind/scope so a slow refresh cycle cannot
+                # build an ever-growing queue of obsolete time buckets. Running
+                # work is never cancelled underneath its lease owner.
+                db.execute(
+                    """DELETE FROM background_jobs
+                       WHERE kind=? AND scope=? AND status='pending'
+                         AND idempotency_key<>?""",
+                    (kind, scope, idempotency_key),
+                )
             cur = db.execute(
                 """INSERT OR IGNORE INTO background_jobs
                    (kind, scope, idempotency_key, payload_json, status, attempts,
