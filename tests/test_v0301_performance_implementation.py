@@ -96,7 +96,7 @@ class PerformanceImplementationContractTests(unittest.TestCase):
             offset = self.main.index(route)
             prefix = self.main[max(0, offset - 260):offset]
             self.assertIn("@coherent_router_mutation", prefix, route)
-        # v0.54.5.2 deliberately decouples declarative Apply from synchronous
+        # v0.54.5.2.1 deliberately decouples declarative Apply from synchronous
         # RouterOS mutation. The request durably queues desired-state intent;
         # AutoReconciler owns the later coherent mutation session.
         route = "def apply_device_policy("

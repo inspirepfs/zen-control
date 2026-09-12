@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def ready_inputs():
     return {
-        "version": "0.54.5.2",
+        "version": "0.54.5.2.1",
         "operations": {"ok": True, "issues": []},
         "startup": {"status": "ready", "issues": []},
         "diagnostics": {
@@ -137,8 +137,8 @@ class FinalReleaseReadinessSourceTests(unittest.TestCase):
         main = (ROOT / "app/main.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn('version="0.54.5.2"', main)
-        self.assertIn("Current release: **v0.54.5.2**", readme)
+        self.assertIn('version="0.54.5.2.1"', main)
+        self.assertIn("Current release: **v0.54.5.2.1**", readme)
         self.assertIn("## v0.54.5 — Final release-readiness closure", changelog)
         self.assertIn("## v0.54.5.1 — RouterOS request-path decoupling", changelog)
 

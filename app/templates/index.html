@@ -4,11 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.54.5.2">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.2">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.5.2">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.5.2">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.5.2">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.5.2.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.2.1">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.5.2.1">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.5.2.1">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.5.2.1">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -1842,7 +1842,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
         {% set activity_prepared = prepared_view_evidence.get('activity', {}) %}
         {% if activity_prepared %}<p class="muted small">Prepared read model {{activity_prepared.get('state', 'missing')|upper}}{% if activity_prepared.get('age_seconds') is not none %} · {{activity_prepared.get('age_seconds')|round(1)}}s old{% endif %}{% if activity_prepared.get('source_revision') is not none %} · config revision {{activity_prepared.get('source_revision')}}{% endif %}{% if activity_prepared.get('reason') %} · {{activity_prepared.get('reason')|replace('_', ' ')}}{% endif %}</p>{% endif %}
       </div>
-      {% if telemetry_available %}
+      {% if telemetry_source_available %}
         <span class="policy-badge enabled">TELEMETRY ONLINE</span>
       {% else %}
         <span class="policy-badge disabled">TELEMETRY OFFLINE</span>
@@ -1851,7 +1851,12 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
 
     {% if not telemetry_available %}
       <div class="local-only-note">
-        {% if activity_error %}{{activity_error}}{% else %}Waiting for PostgreSQL / IPFIX / Pi-hole telemetry.{% endif %}
+        {% if activity_error %}{{activity_error}}{% else %}Prepared activity evidence is not ready yet.{% endif %}
+        {% if activity_prepared.get('state') == 'failed' %}
+          <strong>Read model FAILED.</strong>
+        {% elif activity_prepared.get('state') == 'preparing' %}
+          <strong>Read model PREPARING.</strong>
+        {% endif %}
         The rest of ZEN Control continues to operate normally.
       </div>
     {% else %}

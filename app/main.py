@@ -63,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.5.2")
+app = FastAPI(title="ZEN Control", version="0.54.5.2.1")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -801,15 +801,32 @@ def _prepared_payload(
     performance_collector.record_evidence("prepared_view.lookup")
 
     if prepared is None:
+        job = policy_store.prepared_view_job_state(view_key) or {}
+        job_status = str(job.get("status") or "")
+        job_error = str(job.get("error") or "")
+        attempts = int(job.get("attempts") or 0)
+        max_attempts = max(1, int(job.get("max_attempts") or 1))
+        if job_status == "failed":
+            state, reason = "failed", "generation_failed"
+        elif job_status in {"pending", "running"}:
+            state = "preparing"
+            reason = "retrying_after_error" if job_error and attempts > 0 else job_status
+        elif job_status == "succeeded":
+            state, reason = "missing", "published_view_missing"
+        else:
+            state, reason = "missing", "not_found"
         performance_collector.record_evidence("prepared_view.miss")
-        performance_collector.record_evidence("prepared_view.miss:not_found")
-        performance_collector.record_evidence(f"prepared_view.miss:{view_key}:not_found")
+        performance_collector.record_evidence(f"prepared_view.miss:{reason}")
+        performance_collector.record_evidence(f"prepared_view.miss:{view_key}:{reason}")
         _wake_background_read_worker()
         return None, {
             "view_key": view_key,
-            "state": "missing",
-            "reason": "not_found",
+            "state": state,
+            "reason": reason,
             "source_revision": revision,
+            "job_status": job_status or None,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
         }
 
     stale_grace_seconds = min(1800, max(300, int(max_age) * 5))
@@ -1288,7 +1305,12 @@ def _schedule_background_analytics() -> int:
             specs.append((f"device360:{address}", f"analytics:device:{address}", 150))
     scheduled = 0
     for view, scope, ttl in specs:
-        key = f"prepared:{view}:r{revision}:b{bucket}"
+        # Include the running release in derived-job identity so a deployment
+        # that fixes a deterministic preparation defect can immediately publish
+        # a new attempt even when it lands inside the same two-minute bucket as
+        # a terminal job from the previous release. Pending obsolete work is
+        # still coalesced by kind/scope.
+        key = f"prepared:{view}:v{app.version}:r{revision}:b{bucket}"
         queued = policy_store.enqueue_background_job(
             kind="analytics.prepared-view",
             scope=scope,
@@ -2249,6 +2271,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     service_contract_health_map = {}
     service_contract_error = None
     telemetry_available = False
+    telemetry_source_available = False
     activity_overview = {}
     activity_devices = []
     activity_services = []
@@ -2537,13 +2560,34 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             prepared_view_evidence[active_view] = prepared_meta
             if prepared:
                 telemetry_available = bool(prepared.get("telemetry_available", True))
+                telemetry_source_available = telemetry_available
             else:
                 telemetry_available = False
-                activity_error = (
-                    "Prepared telemetry evidence is not ready yet; the background "
-                    "read worker has been asked to refresh it. No live analytics "
-                    "fallback was run in this navigation request."
-                )
+                try:
+                    telemetry_source_available = bool(activity_store.health())
+                except ActivityError:
+                    telemetry_source_available = False
+                prepared_state = str((prepared_meta or {}).get("state") or "missing")
+                if telemetry_source_available and prepared_state == "failed":
+                    activity_error = (
+                        "Telemetry source is online, but prepared read-model generation failed. "
+                        "The background worker will retry without running live analytics in this request."
+                    )
+                elif telemetry_source_available and prepared_state == "preparing":
+                    activity_error = (
+                        "Telemetry source is online and the prepared read model is being generated. "
+                        "No live analytics fallback was run in this navigation request."
+                    )
+                elif telemetry_source_available:
+                    activity_error = (
+                        "Telemetry source is online, but prepared evidence is not published yet; "
+                        "the background worker has been asked to refresh it."
+                    )
+                else:
+                    activity_error = (
+                        "Telemetry source health is unavailable and prepared evidence is not ready. "
+                        "The rest of ZEN Control continues to operate normally."
+                    )
 
             if active_view == "activity" and prepared:
                 activity_overview = dict(prepared.get("overview") or {})
@@ -2643,7 +2687,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             security_posture=security_posture,
             reconciler_status=reconciler_status,
             service_contract_health=service_contract_health,
-            telemetry_available=telemetry_available,
+            telemetry_available=telemetry_source_available,
             activity_insights=activity_insights,
             database_integrity=database_integrity,
             operations_startup=operations_startup,
@@ -2732,6 +2776,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "service_contract_health_map": service_contract_health_map,
             "service_contract_error": service_contract_error,
             "telemetry_available": telemetry_available,
+            "telemetry_source_available": telemetry_source_available,
             "activity_overview": activity_overview,
             "activity_devices": activity_devices,
             "activity_services": activity_services,
@@ -2788,7 +2833,7 @@ def api_activity_overview(
                     "prepared_view": meta,
                 }
             return {
-                "state": "preparing",
+                "state": str((meta or {}).get("state") or "preparing"),
                 "overview": {}, "devices": [], "services": [], "domains": [],
                 "prepared_view": meta,
                 "evidence_note": "Prepared activity evidence is not ready; background refresh requested.",

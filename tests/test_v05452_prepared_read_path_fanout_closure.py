@@ -211,7 +211,8 @@ class V05452SourceContractTests(unittest.TestCase):
         block = self.main[start:end]
         self.assertIn('"activity:24h"', block)
         self.assertIn("allow_stale_same_revision=True", block)
-        self.assertIn("Prepared telemetry evidence is not ready yet", block)
+        self.assertIn("telemetry_source_available = bool(activity_store.health())", block)
+        self.assertIn("No live analytics fallback was run", block)
         self.assertNotIn("router.get_service_contract_health()", block)
 
     def test_dashboard_and_devices_use_advisory_reconciler_observation_not_snapshot_request(self):

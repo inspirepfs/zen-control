@@ -1,3 +1,14 @@
+## v0.54.5.2.1 — Prepared-view serialization recovery & telemetry-health closure
+
+- Fixes a deterministic prepared-view publication failure where PostgreSQL aggregate `Decimal` values in `activity:24h` and `services:24h` could not cross the SQLite JSON persistence boundary, causing repeated worker retries and permanently missing read models.
+- Normalizes derived JSON scalars centrally at the bounded persistence boundary while preserving integer values as integers, fractional decimals as JSON numbers, and ISO formatting for date/time values.
+- Distinguishes telemetry-source health from prepared-model availability: Activity can now report **TELEMETRY ONLINE** while its read model is PREPARING/FAILED instead of falsely declaring the source offline. Missing prepared evidence is still never rendered as zero activity.
+- Adds explicit prepared-job state attribution (`PREPARING`, `FAILED`, generation/retry reasons) on read-model misses without reintroducing synchronous heavy analytics fallback.
+- Extends background runtime health with bounded durable prepared-job evidence. A live worker thread no longer makes runtime health green while the latest prepared job for a scope is failed or retrying after an error; old superseded failures do not poison health after a newer success.
+- Keeps RouterOS authority unchanged: prepared data remains read-only derived evidence and is never consulted by the serialized mutation path.
+
+Recovery boundary: telemetry ingestion health, prepared-model generation health and RouterOS mutation authority are separate contracts. A failure in one must not be mislabeled as another or converted into invented/zero evidence.
+
 ## v0.54.5.2 — Prepared-view hit-rate & read-path fan-out closure
 
 - Removes the remaining synchronous live analytics fallback from ordinary Dashboard and Activity navigation. Missing prepared evidence is shown as explicit PREPARING/MISSING state and wakes the background worker instead of blocking the browser on multi-second PostgreSQL fan-out.

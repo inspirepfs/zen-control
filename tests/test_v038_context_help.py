@@ -28,8 +28,8 @@ class ContextHelpContractTests(unittest.TestCase):
         }
 
     def test_release_is_v038(self):
-        self.assertIn('version="0.54.5.2"', self.main)
-        self.assertIn('/static/help.css?v=0.54.5.2', (ROOT / "app" / "templates" / "_pwa_head.jinja").read_text())
+        self.assertIn('version="0.54.5.2.1"', self.main)
+        self.assertIn('/static/help.css?v=0.54.5.2.1', (ROOT / "app" / "templates" / "_pwa_head.jinja").read_text())
 
     def test_main_views_keep_subsection_help_mapping_behind_top_level_help(self):
         self.assertIn('data-tab="help"', self.index)

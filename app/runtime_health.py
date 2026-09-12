@@ -53,6 +53,22 @@ def build_runtime_health(
             "alive": alive,
         }
 
+    background_snapshot = raw["background"]
+    durable = background_snapshot.get("durable") if isinstance(background_snapshot, dict) else None
+    durable_exposed = isinstance(durable, dict)
+    durable_available = durable_exposed and durable.get("available") is not False
+    prepared_jobs = dict((durable or {}).get("prepared_jobs") or {}) if durable_available else {}
+    failed_latest = int(prepared_jobs.get("failed") or 0)
+    retrying_latest = int(prepared_jobs.get("retrying") or 0)
+    if durable_exposed:
+        prepared_work_healthy = bool(
+            durable_available and failed_latest == 0 and retrying_latest == 0
+        )
+    else:
+        # Minimal test/compatibility snapshots predate durable worker evidence.
+        # The real BackgroundWorker always exposes the durable object.
+        prepared_work_healthy = True
+
     reconciler_snapshot = raw["reconciler"]
     mutation = reconciler_snapshot.get("router_mutation") or {}
     mutation_available = bool(mutation.get("available", True))
@@ -62,13 +78,25 @@ def build_runtime_health(
         observers = 1
     observers = max(1, min(8, observers))
 
-    ok = all(row["available"] and row["alive"] for row in workers.values()) and mutation_available
+    ok = (
+        all(row["available"] and row["alive"] for row in workers.values())
+        and mutation_available
+        and prepared_work_healthy
+    )
     return {
         "schema": "zen_runtime_health_v1",
         "ok": ok,
         "status": "healthy" if ok else "degraded",
         "version": str(version or ""),
         "workers": workers,
+        "background_read_models": {
+            "durable_available": durable_available,
+            "healthy": prepared_work_healthy,
+            "failed_latest": failed_latest,
+            "retrying_latest": retrying_latest,
+            "warming_latest": int(prepared_jobs.get("warming") or 0),
+            "succeeded_latest": int(prepared_jobs.get("succeeded") or 0),
+        },
         "parallel_observation": {
             "configured_workers": observers,
             "model": "ephemeral-bounded",

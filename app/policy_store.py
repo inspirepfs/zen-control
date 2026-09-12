@@ -6,6 +6,7 @@ import ipaddress
 import hashlib
 import uuid
 from datetime import date, datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from contextlib import contextmanager
 from pathlib import Path
@@ -694,8 +695,31 @@ class PolicyStore:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     @staticmethod
+    def _json_storage_default(value):
+        """Convert bounded derived-state values to stable JSON scalars.
+
+        PostgreSQL aggregate functions may return ``Decimal`` even when the
+        logical value is an integer/percentage. Prepared analytics are derived
+        evidence, so normalize those scalars at the persistence boundary rather
+        than requiring every query helper to know about JSON serialization.
+        """
+        if isinstance(value, Decimal):
+            integral = value.to_integral_value()
+            return int(integral) if value == integral else float(value)
+        if isinstance(value, (datetime, date, dt_time)):
+            return value.isoformat()
+        if isinstance(value, set):
+            return sorted(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+    @staticmethod
     def _bounded_json(payload):
-        return json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+        return json.dumps(
+            payload or {},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=PolicyStore._json_storage_default,
+        )
 
     def _assert_config_revision_db(self, db, expected_revision):
         row = db.execute(
@@ -1291,6 +1315,27 @@ class PolicyStore:
             (available, str(reason or "deferred")[:240], now),
         )
 
+    def prepared_view_job_state(self, view_key):
+        """Return bounded status for the newest durable preparation attempt.
+
+        This is diagnostics/read-model evidence only. It never carries a job
+        payload or grants execution/mutation authority.
+        """
+        prefix = f"prepared:{str(view_key or '').strip()}:"
+        if prefix == "prepared::":
+            return None
+        with self._db() as db:
+            row = db.execute(
+                """SELECT id, status, attempts, max_attempts, error, created_at,
+                          available_at, started_at, finished_at, updated_at
+                   FROM background_jobs
+                   WHERE kind='analytics.prepared-view'
+                     AND substr(idempotency_key, 1, ?) = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (len(prefix), prefix),
+            ).fetchone()
+        return dict(row) if row else None
+
     def list_background_jobs(self, limit=100):
         limit = max(1, min(500, int(limit)))
         with self._db() as db:
@@ -1516,6 +1561,39 @@ class PolicyStore:
             prepared = db.execute(
                 "SELECT COUNT(*) AS count, COALESCE(SUM(payload_bytes),0) AS bytes FROM prepared_views"
             ).fetchone()
+            latest_prepared_jobs = db.execute(
+                """SELECT j.status, j.attempts, j.max_attempts, j.error
+                   FROM background_jobs j
+                   JOIN (
+                       SELECT scope, MAX(id) AS id
+                       FROM background_jobs
+                       WHERE kind='analytics.prepared-view'
+                         AND scope IN ('analytics:dashboard','analytics:activity',
+                                       'analytics:services','analytics:classification',
+                                       'analytics:history')
+                       GROUP BY scope
+                   ) latest ON latest.id=j.id"""
+            ).fetchall()
+        prepared_job_summary = {
+            "scopes": len(latest_prepared_jobs),
+            "succeeded": 0,
+            "warming": 0,
+            "retrying": 0,
+            "failed": 0,
+        }
+        for row in latest_prepared_jobs:
+            status = str(row["status"] or "")
+            error = str(row["error"] or "")
+            attempts = int(row["attempts"] or 0)
+            max_attempts = max(1, int(row["max_attempts"] or 1))
+            if status == "failed":
+                prepared_job_summary["failed"] += 1
+            elif status in {"pending", "running"} and error and attempts > 0:
+                prepared_job_summary["retrying"] += 1
+            elif status == "succeeded":
+                prepared_job_summary["succeeded"] += 1
+            else:
+                prepared_job_summary["warming"] += 1
         return {
             "available": True,
             "revision": self.current_config_revision(),
@@ -1527,6 +1605,7 @@ class PolicyStore:
                 "count": int(prepared["count"] or 0),
                 "payload_bytes": int(prepared["bytes"] or 0),
             },
+            "prepared_jobs": prepared_job_summary,
         }
 
     def build_config_analytics_snapshot(self):
