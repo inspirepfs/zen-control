@@ -1,8 +1,10 @@
+import functools
 import ipaddress
 import os
 import re
 import secrets
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
@@ -31,6 +33,21 @@ def _ros_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).lower() in {"true", "yes", "1"}
+
+
+def serialized_router_mutation(func):
+    """Serialize one logical RouterOS mutation through the adapter boundary.
+
+    Every app-owned public mutator uses the same process-wide re-entrant lock.
+    Higher-level routes may hold the lock across several adapter calls; nested
+    adapter mutators then reuse the same ownership without allowing another
+    writer to interleave. Read-only methods never acquire this lock.
+    """
+    @functools.wraps(func)
+    def wrapped(self, *args, **kwargs):
+        with self.mutation_session(owner=f"router.{func.__name__}"):
+            return func(self, *args, **kwargs)
+    return wrapped
 
 
 class RouterOSAdapter:
@@ -75,6 +92,17 @@ class RouterOSAdapter:
         # thread-local coherent session so one request/action can reuse the
         # transport while every RouterOS resource query remains a fresh read.
         self._session_local = threading.local()
+        self._mutation_lock = threading.RLock()
+        self._mutation_local = threading.local()
+        self._mutation_state_lock = threading.Lock()
+        self._mutation_state = {
+            "owner": None,
+            "started_at": None,
+            "acquisitions": 0,
+            "contentions": 0,
+            "last_wait_ms": 0.0,
+            "max_wait_ms": 0.0,
+        }
 
     class _SharedPoolHandle:
         """Facade used by methods that unconditionally disconnect their pool.
@@ -140,6 +168,79 @@ class RouterOSAdapter:
             self._session_local.depth = 0
             self._session_local.authority_proven = False
             pool.disconnect()
+
+    def _ensure_mutation_state(self) -> None:
+        """Lazily initialise mutation coordination for legacy unit-test adapters."""
+        if not hasattr(self, "_mutation_lock"):
+            self._mutation_lock = threading.RLock()
+        if not hasattr(self, "_mutation_local"):
+            self._mutation_local = threading.local()
+        if not hasattr(self, "_mutation_state_lock"):
+            self._mutation_state_lock = threading.Lock()
+        if not hasattr(self, "_mutation_state"):
+            self._mutation_state = {
+                "owner": None,
+                "started_at": None,
+                "acquisitions": 0,
+                "contentions": 0,
+                "last_wait_ms": 0.0,
+                "max_wait_ms": 0.0,
+            }
+
+    @contextmanager
+    def mutation_session(self, *, owner: str = "router.mutation", timeout: float = 30.0):
+        """Own the one logical RouterOS mutation lane.
+
+        Observation/read sessions remain parallel-capable. All app-owned writes
+        are serialized here so manual actions, automatic reconciliation and
+        authority transfer cannot interleave RouterOS mutations. The lock is
+        re-entrant for one thread, allowing a route to own a multi-step mutation
+        while individual adapter mutators keep their own final-boundary guard.
+        """
+        self._ensure_mutation_state()
+        nested = int(getattr(self._mutation_local, "depth", 0)) > 0
+        started = time.monotonic()
+        acquired = self._mutation_lock.acquire(timeout=max(0.1, float(timeout)))
+        wait_ms = round((time.monotonic() - started) * 1000.0, 3)
+        if not acquired:
+            raise RouterError(
+                f"RouterOS mutation lane is busy; timed out after {max(0.1, float(timeout)):.1f}s"
+            )
+
+        if nested:
+            self._mutation_local.depth += 1
+        else:
+            self._mutation_local.depth = 1
+            self._mutation_local.owner = str(owner or "router.mutation")[:120]
+            with self._mutation_state_lock:
+                self._mutation_state["owner"] = self._mutation_local.owner
+                self._mutation_state["started_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                self._mutation_state["acquisitions"] += 1
+                self._mutation_state["last_wait_ms"] = wait_ms
+                self._mutation_state["max_wait_ms"] = max(
+                    float(self._mutation_state.get("max_wait_ms") or 0.0), wait_ms
+                )
+                if wait_ms >= 1.0:
+                    self._mutation_state["contentions"] += 1
+        try:
+            yield
+        finally:
+            self._mutation_local.depth -= 1
+            if self._mutation_local.depth <= 0:
+                self._mutation_local.depth = 0
+                self._mutation_local.owner = None
+                with self._mutation_state_lock:
+                    self._mutation_state["owner"] = None
+                    self._mutation_state["started_at"] = None
+            self._mutation_lock.release()
+
+    def mutation_status(self) -> dict:
+        self._ensure_mutation_state()
+        with self._mutation_state_lock:
+            state = dict(self._mutation_state)
+        state["busy"] = state.get("owner") is not None
+        state["schema"] = "zen_router_mutation_lane_v1"
+        return state
 
     @staticmethod
     def _validate_ipv4(address: str) -> str:
@@ -731,6 +832,7 @@ class RouterOSAdapter:
             return None
         return self.assert_policy_enforcement_ready()
 
+    @serialized_router_mutation
     def cleanup_stale_managed_resources(self) -> dict:
         """Remove only app-owned MC resources for devices no longer restricted."""
         pool, api = self._connect()
@@ -1022,6 +1124,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_mode(self, mode: str) -> dict:
         mode = mode.lower()
         if mode not in self.MODE_SCRIPTS:
@@ -1075,6 +1178,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_web_policy(self, enabled: bool) -> dict:
         pool, api = self._connect()
         try:
@@ -1349,6 +1453,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def provision_custom_service_contract(self, service: dict) -> dict:
         """Create one absent custom contract, then fresh-read and validate it."""
         self._require_policy_write_gate()
@@ -1460,6 +1565,7 @@ class RouterOSAdapter:
             )
         return {**verified, "idempotent": False, "created": len(created_ids)}
 
+    @serialized_router_mutation
     def remove_custom_service_contract(self, service: dict) -> dict:
         """Remove one healthy app-owned custom contract and its app-owned list data."""
         self._require_policy_write_gate()
@@ -1948,6 +2054,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_device_services(self, address: str, blocked_services, description: str = "", service_catalog=None) -> dict:
         """Reconcile source-list membership for the current approved service catalogue."""
         address = self._validate_ipv4(address)
@@ -2352,6 +2459,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_device_temporary_normal(
         self,
         address: str,
@@ -2553,6 +2661,7 @@ class RouterOSAdapter:
         result["restore_at_iso"] = target.isoformat(timespec="seconds")
         return result
 
+    @serialized_router_mutation
     def cancel_device_temporary_access(
         self,
         address: str,
@@ -2712,6 +2821,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_device_bandwidth(
         self,
         address: str,
@@ -2894,6 +3004,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_device_mode(
         self,
         address: str,
@@ -3176,6 +3287,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def add_managed_schedule(
         self,
         label: str,
@@ -3245,6 +3357,7 @@ class RouterOSAdapter:
             "days": clean_days,
         }
 
+    @serialized_router_mutation
     def remove_managed_schedule(self, group_id: str) -> dict:
         if not re.fullmatch(r"[A-Za-z0-9]+", group_id):
             raise RouterError("Invalid schedule id")
@@ -3298,6 +3411,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_temporary_normal(self, minutes: int, restore_mode: str) -> dict:
         if minutes not in {15, 30, 60}:
             raise RouterError("Temporary access supports 15, 30 or 60 minutes")
@@ -3354,6 +3468,7 @@ class RouterOSAdapter:
             "restore_at": target.isoformat(),
         }
 
+    @serialized_router_mutation
     def cancel_temporary_access(self) -> dict:
         pool, api = self._connect()
         try:
@@ -3440,6 +3555,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def prepare_kid_control_migration_device(self, address: str, expected_mac: str, description: str) -> dict:
         """Adopt one already-static Kid Control device into ZEN's restricted list.
 
@@ -3500,6 +3616,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def rollback_kid_control_migration_device(self, address: str) -> dict:
         """Remove only a Restricted_Devices row created by the migration path."""
         address = self._validate_ipv4(address)
@@ -3525,6 +3642,7 @@ class RouterOSAdapter:
         finally:
             pool.disconnect()
 
+    @serialized_router_mutation
     def set_legacy_kid_control_profile_disabled(
         self, profile_name: str, disabled: bool, *, expected_id: str = ""
     ) -> dict:
@@ -3636,6 +3754,7 @@ class RouterOSAdapter:
             )
         return result
 
+    @serialized_router_mutation
     def add_restricted_device(self, address: str, description: str) -> dict:
         address = self._validate_ipv4(address)
         description = self._validate_description(description)
@@ -3717,6 +3836,7 @@ class RouterOSAdapter:
             "dhcp_reserved": True,
         }
 
+    @serialized_router_mutation
     def remove_restricted_device(self, address: str) -> dict:
         address = self._validate_ipv4(address)
         self._require_policy_write_gate()

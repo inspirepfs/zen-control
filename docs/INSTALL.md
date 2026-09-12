@@ -32,6 +32,7 @@ Important settings include:
 - `PIHOLE_PASSWORD`
 - `ZEN_LAN_BIND_IP`, `ZEN_LAN_CIDRS`
 - `ZEN_LOCAL_HOST`, `CADDY_CF_API_TOKEN` when local HTTPS is enabled
+- `ZEN_ROUTER_OBSERVE_WORKERS` for bounded automatic-reconciler read-side planning concurrency (`4` by default, clamped to `1`–`8`)
 
 Generate application secrets with a cryptographically secure generator, for example:
 
@@ -40,6 +41,8 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
 Keep `OTP_ENCRYPTION_KEY` stable after authenticators are enrolled.
+
+`ZEN_ROUTER_OBSERVE_WORKERS` controls only parallel observation/planning in the automatic reconciler. Increasing it does not parallelize RouterOS mutation: all app-owned writes still pass through the single serialized mutation lane and are preceded by fresh authority/security proof.
 
 ## 3. RouterOS preparation
 

@@ -61,7 +61,7 @@ from app.help_content import get_help_topic, help_for_context, help_catalog, hel
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.1")
+app = FastAPI(title="ZEN Control", version="0.54.2")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -252,6 +252,24 @@ def coherent_router_request(func):
     def wrapped(*args, **kwargs):
         with router.coherent_session():
             return func(*args, **kwargs)
+    return wrapped
+
+
+def coherent_router_mutation(func):
+    """Own one serialized RouterOS mutation lane for a complete user action.
+
+    Individual adapter mutators also own the same re-entrant lane, so this
+    outer boundary prevents a second manual/automatic writer from interleaving
+    between the several RouterOS writes and validations that form one action.
+    """
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        try:
+            with router.mutation_session(owner=f"route:{func.__name__}"):
+                with router.coherent_session():
+                    return func(*args, **kwargs)
+        except RouterError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     return wrapped
 
 
@@ -3343,7 +3361,7 @@ def activity_device_page(
 
 
 @app.post("/mode/{mode}")
-@coherent_router_request
+@coherent_router_mutation
 def set_mode(
     mode: Literal["normal", "slow", "blocked"],
     request: Request,
@@ -3365,7 +3383,7 @@ def set_mode(
 
 
 @app.post("/temporary")
-@coherent_router_request
+@coherent_router_mutation
 def temporary(
     request: Request,
     minutes: int = Form(...),
@@ -3396,7 +3414,7 @@ def temporary(
 
 
 @app.post("/schedules/add")
-@coherent_router_request
+@coherent_router_mutation
 def add_schedule(
     request: Request,
     label: str = Form(...),
@@ -3423,7 +3441,7 @@ def add_schedule(
 
 
 @app.post("/schedules/remove")
-@coherent_router_request
+@coherent_router_mutation
 def remove_schedule(
     request: Request,
     schedule_id: str = Form(...),
@@ -3690,7 +3708,7 @@ def local_service_add(
 
 
 @app.post("/local/services/provision")
-@coherent_router_request
+@coherent_router_mutation
 def local_service_provision(
     request: Request,
     key: str = Form(...),
@@ -3741,7 +3759,7 @@ def local_service_provision(
 
 
 @app.post("/local/services/unprovision")
-@coherent_router_request
+@coherent_router_mutation
 def local_service_unprovision(
     request: Request,
     key: str = Form(...),
@@ -4969,7 +4987,7 @@ def api_security_bypass(
 
 
 @app.post("/local/security/cleanup-stale")
-@coherent_router_request
+@coherent_router_mutation
 def local_security_cleanup_stale(
     request: Request,
     csrf: str = Form(...),
@@ -5712,7 +5730,7 @@ def local_policy_summary(
 
 
 @app.post("/devices/policy/apply")
-@coherent_router_request
+@coherent_router_mutation
 def apply_device_policy(
     request: Request,
     ip: str = Form(...),
@@ -5845,7 +5863,7 @@ def apply_device_policy(
 
 
 @app.post("/devices/policy/apply-all")
-@coherent_router_request
+@coherent_router_mutation
 def apply_all_device_policies(
     request: Request,
     csrf: str = Form(...),
@@ -6042,7 +6060,7 @@ def adjust_device_rewards(
 
 
 @app.post("/devices/rewards/redeem")
-@coherent_router_request
+@coherent_router_mutation
 def redeem_device_rewards(
     request: Request,
     ip: str = Form(...),
@@ -6252,7 +6270,7 @@ def get_device_temporary_status(
 
 
 @app.post("/devices/temporary/start")
-@coherent_router_request
+@coherent_router_mutation
 def start_device_temporary_access(
     request: Request,
     ip: str = Form(...),
@@ -6312,7 +6330,7 @@ def start_device_temporary_access(
 
 
 @app.post("/devices/temporary/cancel")
-@coherent_router_request
+@coherent_router_mutation
 def cancel_device_temporary_access(
     request: Request,
     ip: str = Form(...),
@@ -6350,7 +6368,7 @@ def cancel_device_temporary_access(
 
 
 @app.post("/devices/enforcement")
-@coherent_router_request
+@coherent_router_mutation
 def set_device_enforcement(
     request: Request,
     ip: str = Form(...),
@@ -6407,7 +6425,7 @@ def set_device_enforcement(
 
 
 @app.post("/devices/add")
-@coherent_router_request
+@coherent_router_mutation
 def add_device(
     request: Request,
     ip: str = Form(...),
@@ -6431,7 +6449,7 @@ def add_device(
 
 
 @app.post("/devices/remove")
-@coherent_router_request
+@coherent_router_mutation
 def remove_device(
     request: Request,
     ip: str = Form(...),
@@ -6464,7 +6482,7 @@ def remove_device(
 
 
 @app.post("/web-policy")
-@coherent_router_request
+@coherent_router_mutation
 def set_web_policy(
     request: Request,
     action: Literal["enable", "disable"] = Form(...),

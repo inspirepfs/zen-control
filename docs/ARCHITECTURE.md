@@ -71,3 +71,9 @@ v0.54.1 uses:
 Prepared views are not authority and are not trusted merely because a row exists. Consumers require the current configuration revision and a bounded freshness window; stale, expired or mismatched rows fall back to the live read path. Periodic jobs prepare Dashboard/Activity/Classification/Services/History telemetry and per-device Device 360 activity evidence. Device 360 still reads RouterOS authority synchronously and only reuses prepared telemetry evidence.
 
 The background worker receives no RouterOS adapter. RouterOS mutation remains serialized through the existing reconciliation/authority paths. Terminal background-job/outbox bookkeeping is pruned only under bounded retention rules that preserve active work and a recent evidence floor.
+
+### Parallel observation and serialized mutation
+
+v0.54.2 separates observation concurrency from mutation authority. The automatic reconciler may fan out independent per-device read/plan work through a bounded thread pool, but those results are advisory evidence only. Before ENFORCE writes, the reconciler owns the single RouterOS mutation lane, re-proves the security posture and performs a fresh serial plan read for each candidate. A plan that became stale can therefore cause a skipped/delayed write, never an unauthorized write.
+
+All public app-owned RouterOS mutators are guarded at the adapter boundary by the same re-entrant mutation lane. Multi-step manual routes hold that lane across the complete action, while nested adapter methods reuse the same ownership. Kid Control authority transfer keeps a strict lock order of reconciler cycle lock then RouterOS mutation lane so automatic enforcement and cutover/rollback cannot deadlock or interleave. Read-only RouterOS methods and the durable background analytics worker do not acquire mutation authority.

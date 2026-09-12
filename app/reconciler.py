@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import Callable, Any
 
+from app.parallel_observation import ParallelObserver
 from app.performance import timed
 
 
@@ -46,6 +48,19 @@ def reconcile_device(
         return {
             "address": address,
             "status": "partial" if plan.get("status") == "partial" else "synced",
+            "changes": [],
+            "plan": plan,
+            "verified": plan,
+        }
+
+    if not (
+        plan.get("mode_drift")
+        or plan.get("bandwidth_drift")
+        or plan.get("service_drift")
+    ):
+        return {
+            "address": address,
+            "status": "synced",
             "changes": [],
             "plan": plan,
             "verified": plan,
@@ -147,6 +162,15 @@ class AutoReconciler:
         self._state_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
+        try:
+            observation_workers = int(os.getenv("ZEN_ROUTER_OBSERVE_WORKERS", "4"))
+        except (TypeError, ValueError):
+            observation_workers = 4
+        self._observer = ParallelObserver(
+            max_workers=max(1, min(8, observation_workers)),
+            name="router-plan",
+        )
+
         self._consecutive_failures = 0
         self._hold_until_epoch = 0.0
         self._last: dict = {
@@ -159,6 +183,8 @@ class AutoReconciler:
             "summary": "Automatic reconciliation has not run yet.",
             "counts": {
                 "devices": 0,
+                "observed": 0,
+                "plan_failed": 0,
                 "drift": 0,
                 "applied": 0,
                 "synced": 0,
@@ -167,6 +193,14 @@ class AutoReconciler:
                 "failed": 0,
             },
             "failures": [],
+            "observation": {
+                "schema": "zen_parallel_observation_v1",
+                "items": 0,
+                "workers": 0,
+                "max_active": 0,
+                "duration_ms": 0.0,
+                "failed": 0,
+            },
         }
 
     @staticmethod
@@ -249,7 +283,8 @@ class AutoReconciler:
                 "Automatic reconciliation is busy; retry authority transfer after the current cycle completes"
             )
         try:
-            yield
+            with self._mutation_context("authority-transfer"):
+                yield
         finally:
             self._cycle_lock.release()
             self._wake.set()
@@ -273,6 +308,11 @@ class AutoReconciler:
                 hold_until, tz=timezone.utc
             ).astimezone().isoformat(timespec="seconds")
 
+        try:
+            mutation = self.router.mutation_status()
+        except Exception:
+            mutation = {"schema": "zen_router_mutation_lane_v1", "busy": False, "available": False}
+
         return {
             **settings,
             "worker_alive": bool(self._thread and self._thread.is_alive()),
@@ -281,7 +321,45 @@ class AutoReconciler:
             "hold_active": hold_active,
             "hold_until": hold_until_iso,
             "last": last,
+            "router_mutation": mutation,
         }
+
+    def _mutation_context(self, owner: str):
+        router = getattr(self, "router", None)
+        factory = getattr(router, "mutation_session", None) if router is not None else None
+        if factory is None:
+            return nullcontext()
+        return factory(owner=owner)
+
+    @staticmethod
+    def _failed_security_names(posture: dict) -> list[str]:
+        if posture.get("enforcement_ready"):
+            return []
+        return [
+            item.get("name", item.get("key", "unknown"))
+            for item in posture.get("checks", [])
+            if item.get("severity") == "critical" and item.get("status") == "fail"
+        ]
+
+    def _security_posture(self) -> tuple[dict, list[str]]:
+        posture_getter = getattr(self.router, "get_security_posture", None)
+        if not posture_getter:
+            return {"enforcement_ready": True, "checks": []}, []
+        posture = posture_getter()
+        return posture, self._failed_security_names(posture)
+
+    def _observe_plans(self, devices: list[dict]) -> dict:
+        usable = [
+            device for device in devices
+            if str(device.get("ip") or device.get("address") or "").strip()
+        ]
+        return self._observer.observe(
+            usable,
+            key=lambda device: str(device.get("ip") or device.get("address")),
+            reader=lambda device: self.plan_loader(
+                str(device.get("ip") or device.get("address"))
+            ),
+        )
 
     @timed("worker.reconciler.cycle")
     def run_cycle(
@@ -305,6 +383,8 @@ class AutoReconciler:
 
         counts = {
             "devices": 0,
+            "observed": 0,
+            "plan_failed": 0,
             "drift": 0,
             "applied": 0,
             "synced": 0,
@@ -313,6 +393,14 @@ class AutoReconciler:
             "failed": 0,
         }
         failures: list[str] = []
+        observation = {
+            "schema": "zen_parallel_observation_v1",
+            "items": 0,
+            "workers": 0,
+            "max_active": 0,
+            "duration_ms": 0.0,
+            "failed": 0,
+        }
         result = "ok"
         summary = ""
 
@@ -324,109 +412,114 @@ class AutoReconciler:
                 result = "disabled"
                 summary = "Automatic reconciliation is OFF. No RouterOS reads or writes were performed."
                 return self._finish_cycle(
-                    started,
-                    started_at,
-                    trigger,
-                    mode,
-                    result,
-                    summary,
-                    counts,
-                    failures,
+                    started, started_at, trigger, mode, result, summary, counts, failures,
+                    observation=observation,
                 )
 
             if mode == "enforce" and hold_active and not ignore_hold:
                 result = "hold"
                 summary = "Automatic enforcement is in cooldown hold after repeated failed cycles. Observe-only checks remain available."
                 return self._finish_cycle(
-                    started,
-                    started_at,
-                    trigger,
-                    mode,
-                    result,
-                    summary,
-                    counts,
-                    failures,
+                    started, started_at, trigger, mode, result, summary, counts, failures,
+                    observation=observation,
                 )
 
-            # Security gate: automatic writes are permitted only while the
-            # RouterOS authority/hardening contract can be proven intact.
-            # OBSERVE deliberately remains available to diagnose drift even
-            # when the write gate is closed.
+            # Preserve the pre-existing fail-closed gate before spending time on
+            # planning. ENFORCE repeats this proof while owning the mutation lane
+            # immediately before the first possible write.
             if mode == "enforce":
-                posture_getter = getattr(self.router, "get_security_posture", None)
-                if posture_getter:
-                    posture = posture_getter()
-                    if not posture.get("enforcement_ready"):
-                        failed_names = [
-                            item.get("name", item.get("key", "unknown"))
-                            for item in posture.get("checks", [])
-                            if item.get("severity") == "critical"
-                            and item.get("status") == "fail"
-                        ]
-                        result = "security_hold"
-                        failures = ["security: " + ", ".join(failed_names[:8])]
-                        summary = (
-                            "Automatic enforcement is SECURITY HELD because the "
-                            "RouterOS enforcement contract is degraded: "
-                            + (", ".join(failed_names[:6]) or "critical hardening check failed")
-                        )
-                        self.audit(
-                            "AUTO_RECONCILE_SECURITY_HOLD",
-                            actor,
-                            failures[0],
-                        )
-                        return self._finish_cycle(
-                            started, started_at, trigger, mode, result, summary, counts, failures
-                        )
+                _posture, failed_names = self._security_posture()
+                if failed_names:
+                    result = "security_hold"
+                    failures = ["security: " + ", ".join(failed_names[:8])]
+                    summary = (
+                        "Automatic enforcement is SECURITY HELD because the "
+                        "RouterOS enforcement contract is degraded: "
+                        + (", ".join(failed_names[:6]) or "critical hardening check failed")
+                    )
+                    self.audit("AUTO_RECONCILE_SECURITY_HOLD", actor, failures[0])
+                    return self._finish_cycle(
+                        started, started_at, trigger, mode, result, summary, counts, failures,
+                        observation=observation,
+                    )
 
             devices = self.device_loader()
             counts["devices"] = len(devices)
+            batch = self._observe_plans(devices)
+            observation = {
+                key: batch.get(key)
+                for key in ("schema", "items", "workers", "max_active", "duration_ms")
+            }
+            observation["failed"] = len(batch.get("errors") or {})
+            counts["observed"] = len(batch.get("results") or {})
+            counts["plan_failed"] = len(batch.get("errors") or {})
 
-            for device in devices:
-                address = device.get("ip") or device.get("address")
-                if not address:
+            for address, error in (batch.get("errors") or {}).items():
+                counts["failed"] += 1
+                failures.append(f"{address}: observation failed: {error}")
+
+            candidates: list[str] = []
+            for address in batch.get("order") or []:
+                plan = (batch.get("results") or {}).get(address)
+                if plan is None:
                     continue
-                try:
-                    plan = self.plan_loader(address)
-                    if plan.get("temporary_override"):
-                        counts["temporary"] += 1
-                        continue
-
-                    if not plan.get("policy_actionable"):
-                        counts["synced"] += 1
-                        if plan.get("status") == "partial":
-                            counts["partial"] += 1
-                        continue
-
-                    counts["drift"] += 1
-                    if mode == "observe":
-                        continue
-
-                    reconciliation = reconcile_device(
-                        address,
-                        plan_loader=self.plan_loader,
-                        router=self.router,
-                        description="auto:effective-policy",
-                    )
-                    if reconciliation["status"] == "applied":
-                        counts["applied"] += 1
-                        changes = "; ".join(reconciliation.get("changes") or [])
-                        self.audit(
-                            "AUTO_POLICY_APPLIED",
-                            actor,
-                            f"{address}: {changes or 'converged'}",
-                        )
-                    elif reconciliation["status"] == "temporary":
-                        counts["temporary"] += 1
-                    elif reconciliation["status"] == "partial":
+                if plan.get("temporary_override"):
+                    counts["temporary"] += 1
+                    continue
+                if not plan.get("policy_actionable"):
+                    counts["synced"] += 1
+                    if plan.get("status") == "partial":
                         counts["partial"] += 1
-                        counts["synced"] += 1
-                    else:
-                        counts["synced"] += 1
+                    continue
+                counts["drift"] += 1
+                candidates.append(address)
 
-                except Exception as exc:  # isolate one bad device from the cycle
-                    counts["failed"] += 1
-                    failures.append(f"{address}: {exc}")
+            if mode == "enforce" and candidates:
+                # Parallel observation never grants write authority. Once the
+                # mutation lane is owned, re-prove security and re-read each
+                # candidate serially inside reconcile_device before mutation.
+                with self._mutation_context(f"reconciler:{trigger}"):
+                    _posture, failed_names = self._security_posture()
+                    if failed_names:
+                        result = "security_hold"
+                        failures = ["security: " + ", ".join(failed_names[:8])]
+                        summary = (
+                            "Automatic enforcement is SECURITY HELD because authority "
+                            "changed after parallel observation: "
+                            + (", ".join(failed_names[:6]) or "critical hardening check failed")
+                        )
+                        self.audit("AUTO_RECONCILE_SECURITY_HOLD", actor, failures[0])
+                        return self._finish_cycle(
+                            started, started_at, trigger, mode, result, summary, counts, failures,
+                            observation=observation,
+                        )
+
+                    for address in candidates:
+                        try:
+                            reconciliation = reconcile_device(
+                                address,
+                                plan_loader=self.plan_loader,
+                                router=self.router,
+                                description="auto:effective-policy",
+                            )
+                            status = reconciliation["status"]
+                            if status == "applied":
+                                counts["applied"] += 1
+                                changes = "; ".join(reconciliation.get("changes") or [])
+                                self.audit(
+                                    "AUTO_POLICY_APPLIED", actor,
+                                    f"{address}: {changes or 'converged'}",
+                                )
+                            elif status == "temporary":
+                                counts["temporary"] += 1
+                            elif status == "partial":
+                                counts["partial"] += 1
+                                counts["synced"] += 1
+                            else:
+                                counts["synced"] += 1
+                        except Exception as exc:
+                            counts["failed"] += 1
+                            failures.append(f"{address}: {exc}")
 
             if failures:
                 result = "failed"
@@ -437,11 +530,7 @@ class AutoReconciler:
                 if mode == "enforce":
                     self._record_failed_cycle(settings, actor, failures)
                 else:
-                    self.audit(
-                        "AUTO_POLICY_OBSERVE_FAILED",
-                        actor,
-                        "; ".join(failures[:6]),
-                    )
+                    self.audit("AUTO_POLICY_OBSERVE_FAILED", actor, "; ".join(failures[:6]))
             else:
                 if mode == "enforce":
                     self._record_successful_cycle()
@@ -449,12 +538,12 @@ class AutoReconciler:
                     result = "drift" if counts["drift"] else "ok"
                     summary = (
                         f"Observe-only: {counts['drift']} drifted, "
-                        f"{counts['synced']} synced, {counts['temporary']} temporary."
+                        f"{counts['synced']} synced, {counts['temporary']} temporary; "
+                        f"planned with {observation['workers']} worker(s)."
                     )
                     if counts["drift"]:
                         self.audit(
-                            "AUTO_POLICY_OBSERVED_DRIFT",
-                            actor,
+                            "AUTO_POLICY_OBSERVED_DRIFT", actor,
                             f"drift={counts['drift']} devices={counts['devices']}",
                         )
                 else:
@@ -462,12 +551,11 @@ class AutoReconciler:
                     summary = (
                         f"Enforce: {counts['applied']} applied, "
                         f"{counts['synced']} synced, {counts['temporary']} temporary, "
-                        f"{counts['partial']} partial."
+                        f"{counts['partial']} partial; observation workers={observation['workers']}."
                     )
                     if counts["applied"]:
                         self.audit(
-                            "AUTO_RECONCILE_CYCLE",
-                            actor,
+                            "AUTO_RECONCILE_CYCLE", actor,
                             (
                                 f"applied={counts['applied']} synced={counts['synced']} "
                                 f"temporary={counts['temporary']} partial={counts['partial']}"
@@ -475,27 +563,15 @@ class AutoReconciler:
                         )
 
             return self._finish_cycle(
-                started,
-                started_at,
-                trigger,
-                mode,
-                result,
-                summary,
-                counts,
-                failures,
+                started, started_at, trigger, mode, result, summary, counts, failures,
+                observation=observation,
             )
 
         except Exception as exc:
-            # Only failed ENFORCE cycles feed the circuit breaker. OBSERVE is
-            # diagnostic and must never clear or extend an enforcement hold.
             if mode == "enforce":
                 self._record_failed_cycle(settings, actor, [f"cycle-level: {exc}"])
             else:
-                self.audit(
-                    "AUTO_POLICY_OBSERVE_FAILED",
-                    actor,
-                    f"cycle-level: {exc}",
-                )
+                self.audit("AUTO_POLICY_OBSERVE_FAILED", actor, f"cycle-level: {exc}")
             raise
         finally:
             self._cycle_lock.release()
@@ -537,6 +613,8 @@ class AutoReconciler:
         summary: str,
         counts: dict,
         failures: list[str],
+        *,
+        observation: dict | None = None,
     ) -> dict:
         finished_at = self._iso_now()
         duration_ms = int((time.monotonic() - started) * 1000)
@@ -550,6 +628,7 @@ class AutoReconciler:
             "summary": summary,
             "counts": dict(counts),
             "failures": list(failures[:12]),
+            "observation": dict(observation or {}),
         }
         with self._state_lock:
             self._last = payload

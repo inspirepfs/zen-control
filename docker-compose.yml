@@ -44,6 +44,10 @@ services:
       ZEN_PERF_SLOW_MS: "${ZEN_PERF_SLOW_MS:-1000}"
       ZEN_PERF_SQL_PREVIEW: "${ZEN_PERF_SQL_PREVIEW:-1}"
 
+      # v0.54.2 read-side automatic-reconciler observation concurrency.
+      # Writes remain serialized by the RouterOS mutation lane.
+      ZEN_ROUTER_OBSERVE_WORKERS: "${ZEN_ROUTER_OBSERVE_WORKERS:-4}"
+
       # v0.51 secure transport. Disabled by default so applying the release does
       # not alter existing LAN access before Cloudflare commissioning is ready.
       ZEN_REMOTE_ACCESS_ENABLED: "${ZEN_REMOTE_ACCESS_ENABLED:-0}"

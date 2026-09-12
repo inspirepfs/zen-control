@@ -86,16 +86,23 @@ class PerformanceImplementationContractTests(unittest.TestCase):
 
     def test_write_routes_use_coherent_router_transport(self):
         self.assertIn("def coherent_router_request(func):", self.main)
-        for route in (
+        self.assertIn("def coherent_router_mutation(func):", self.main)
+        mutation_routes = (
             "def apply_device_policy(",
             "def set_device_enforcement(",
             "def start_device_temporary_access(",
-            "def local_reconciler_run_now(",
             "def local_service_provision(",
-        ):
+        )
+        for route in mutation_routes:
             offset = self.main.index(route)
-            prefix = self.main[max(0, offset - 220):offset]
-            self.assertIn("@coherent_router_request", prefix, route)
+            prefix = self.main[max(0, offset - 260):offset]
+            self.assertIn("@coherent_router_mutation", prefix, route)
+        # The reconciler route may execute OBSERVE without mutation authority;
+        # ENFORCE acquires the mutation lane inside AutoReconciler after planning.
+        route = "def local_reconciler_run_now("
+        offset = self.main.index(route)
+        prefix = self.main[max(0, offset - 240):offset]
+        self.assertIn("@coherent_router_request", prefix, route)
 
     def test_router_session_explicitly_preserves_fresh_reads(self):
         self.assertIn("It does not cache RouterOS values", self.router)

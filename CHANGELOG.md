@@ -2,6 +2,20 @@
 
 All notable ZEN Control release slices are recorded here. ZEN is developed as evidence-led, bounded slices; historical entries describe the authority and evidence contracts that were current for that release.
 
+## v0.54.2 — Parallel observation / serialized enforcement
+
+- Adds a bounded `ParallelObserver` for deterministic concurrent read/plan fan-out. Automatic reconciliation can now overlap independent device policy observations without granting those observations write authority.
+- Adds `ZEN_ROUTER_OBSERVE_WORKERS` with a bounded 1–8 worker range; the default is four observation workers. Per-device observation failures remain isolated and visible in cycle evidence.
+- Makes parallel plans advisory only. ENFORCE re-proves RouterOS security posture after observation and re-reads each candidate serially before any mutation, so a stale parallel plan can never authorize a write.
+- Adds a process-wide re-entrant RouterOS mutation lane at the adapter boundary. All app-owned public RouterOS mutators pass through the same lane, including global/device mode, bandwidth, service contracts, schedules, temporary access, Kid Control authority and restricted-device membership.
+- Adds route-level mutation ownership around multi-step manual actions so several RouterOS changes and their validations form one non-interleavable logical mutation.
+- Preserves authority-transfer lock ordering: Kid Control cutover/rollback own the reconciler cycle lock first and then the mutation lane, avoiding cycle/mutation lock inversion.
+- Exposes observation worker utilization, plan failures, read-plan duration and mutation-lane state in Cycle diagnostics while keeping read-only background analytics free of RouterOS dependencies.
+- Wires `ZEN_ROUTER_OBSERVE_WORKERS` through the public `.env.example` and Compose runtime with a safe default of four workers; tuning affects observation only, never mutation concurrency.
+- Adds hostile race coverage for competing writers, nested mutation ownership, parallel observation overlap, stale-plan rejection and authority degradation between observation and mutation.
+
+Authority boundary: observation may run in parallel; RouterOS mutation does not. There remains one logical app-owned mutation lane, and fresh authority/read validation immediately precedes enforcement.
+
 ## v0.54.1 — Background analytics & prepared views
 
 - Adds durable `prepared_views` rows as bounded current read models rather than an unbounded cache/history table. Each row records source configuration revision, capture/expiry time, payload size and generation.

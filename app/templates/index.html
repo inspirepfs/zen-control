@@ -4,11 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.54.1">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.1">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.1">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.1">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.2">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.2">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.2">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.2">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.2">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -2892,13 +2892,22 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       <summary>Cycle diagnostics</summary>
       <div class="auto-reconcile-diagnostics">
         {% set c = reconciler_status.last.counts %}
+        {% set o = reconciler_status.last.observation or {} %}
+        {% set m = reconciler_status.router_mutation or {} %}
         <span>Devices <strong>{{ c.devices or 0 }}</strong></span>
+        <span>Observed <strong>{{ c.observed or 0 }}</strong></span>
+        <span>Plan failures <strong>{{ c.plan_failed or 0 }}</strong></span>
         <span>Drift <strong>{{ c.drift or 0 }}</strong></span>
         <span>Applied <strong>{{ c.applied or 0 }}</strong></span>
         <span>Synced <strong>{{ c.synced or 0 }}</strong></span>
         <span>Temporary <strong>{{ c.temporary or 0 }}</strong></span>
         <span>Partial <strong>{{ c.partial or 0 }}</strong></span>
         <span>Failed <strong>{{ c.failed or 0 }}</strong></span>
+        <span>Read workers <strong>{{ o.workers or 0 }}</strong></span>
+        <span>Max parallel reads <strong>{{ o.max_active or 0 }}</strong></span>
+        <span>Read-plan time <strong>{{ '%.1f'|format(o.duration_ms or 0) }} ms</strong></span>
+        <span>Mutation lane <strong>{{ 'BUSY' if m.busy else ('READY' if m.available is not sameas false else 'UNAVAILABLE') }}</strong></span>
+        {% if m.busy and m.owner %}<span>Mutation owner <strong>{{ m.owner }}</strong></span>{% endif %}
       </div>
       {% if reconciler_status.last.failures %}
         <div class="conflict-warning">{{ reconciler_status.last.failures|join(' · ') }}</div>
