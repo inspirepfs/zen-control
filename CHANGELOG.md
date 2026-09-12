@@ -2,6 +2,19 @@
 
 All notable ZEN Control release slices are recorded here. ZEN is developed as evidence-led, bounded slices; historical entries describe the authority and evidence contracts that were current for that release.
 
+## v0.54.4 — Formal performance acceptance
+
+- Promotes the existing v0.30/v0.30.1/v0.39 performance instrumentation into a fail-closed formal acceptance contract while preserving all RouterOS authority boundaries.
+- Adds valid/invalid sample accounting and min/p50/p95/p99/max latency evidence. Failed requests cannot count toward a healthy class and retained outliers are never discarded to manufacture a PASS.
+- Closes a RouterOS connection-budget defect: missing `routeros.connect` evidence is now PENDING rather than zero, and the gate fails if any valid RouterOS request opens more than one coherent transport.
+- Adds a recommended 20-sample deliberate acceptance run while retaining the documented absolute minimum of five valid samples per class.
+- Adds prepared-view hit/miss/live-fallback counters, in-memory background-worker cycle timing, parallel-observation utilisation and serialized mutation-lane wait/contention evidence to `/api/performance` and the Performance UI.
+- Keeps operational performance evidence observational only; it cannot grant mutation authority or bypass fresh RouterOS security/read/post-write validation.
+- Extends `scripts/perf_acceptance.py` with strict v0.54.4 contract validation, optional authenticated live fetch, sanitized JSON report output and distinct PASS/PENDING/FAIL/INVALID exit behaviour.
+- Wires all performance acceptance thresholds plus the recommended sample count through Compose; host `.env` values now actually reach the application container.
+
+Acceptance boundary: missing evidence remains missing, `PENDING != PASS`, and thresholds/outliers must not be manipulated to manufacture release readiness.
+
 ## v0.54.3 — Deployment topology & runtime-health closure
 
 - Makes the host release workflow topology-aware. It now derives affected Compose services from the actual release delta, including app/build-context changes and service-specific Compose block changes, instead of assuming only `mikrotik-control` changed.

@@ -102,6 +102,22 @@ class BackgroundWorker:
             "durable": durable,
         }
 
+    def performance_snapshot(self) -> dict:
+        """Return in-memory worker timing evidence without touching durable state."""
+        with self._state_lock:
+            last = dict(self._last)
+        return {
+            "schema": "zen_background_worker_performance_v1",
+            "worker_alive": bool(self._thread and self._thread.is_alive()),
+            "busy": self._cycle_lock.locked(),
+            "last_duration_ms": last.get("duration_ms"),
+            "last_result": last.get("result"),
+            "last_claimed": int(last.get("claimed") or 0),
+            "last_succeeded": int(last.get("succeeded") or 0),
+            "last_failed": int(last.get("failed") or 0),
+            "last_deferred": int(last.get("deferred") or 0),
+        }
+
     @timed("worker.background.cycle")
     def run_cycle(self, *, trigger: str = "manual") -> dict:
         if not self._cycle_lock.acquire(blocking=False):

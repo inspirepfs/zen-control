@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   {% include "_pwa_head.jinja" %}
   <title>Performance · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.54.3">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.3">
-  <link rel="stylesheet" href="/static/performance.css?v=0.54.3">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.4">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.4">
+  <link rel="stylesheet" href="/static/performance.css?v=0.54.4">
 </head>
 <body class="standalone-page">
 <main class="standalone-shell performance-shell">
@@ -15,9 +15,9 @@
 {% include "_context_help.jinja" %}
   <header class="standalone-header compact-header">
     <div>
-      <div class="eyebrow">ZEN CONTROL · PERFORMANCE CLOSURE</div>
+      <div class="eyebrow">ZEN CONTROL · FORMAL PERFORMANCE ACCEPTANCE</div>
       <h1>Performance evidence</h1>
-      <p class="muted">v0.39 measures responsiveness against explicit acceptance budgets after the v0.30.1 optimization work.</p>
+      <p class="muted">v0.54.4 turns retained live performance evidence into a fail-closed release gate with runtime observability proof, building on the v0.30.1 coherent-session optimization.</p>
     </div>
     <div class="header-actions">
       <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
@@ -42,13 +42,13 @@
     <div class="perf-stat"><span>Process</span><strong>{{ snapshot.process.threads }} threads</strong><small>uptime {{ snapshot.process.uptime_seconds|int }}s</small></div>
   </section>
 
-  <section class="card perf-acceptance state-{{ snapshot.acceptance.state }}">
+  <section class="card perf-acceptance state-{{ snapshot.formal_acceptance.state }}">
     <div class="card-heading">
       <div>
-        <h2>Responsiveness acceptance</h2>
-        <p class="muted">Closure gate based on retained live requests. A target remains PENDING until it has at least {{ snapshot.acceptance.min_samples }} representative samples.</p>
+        <h2>Responsiveness acceptance — formal gate</h2>
+        <p class="muted">Latency classes require at least {{ snapshot.acceptance.min_samples }} valid samples; {{ snapshot.acceptance.recommended_samples }} measured samples per class is the recommended acceptance run. Runtime evidence is also required before the formal gate can PASS.</p>
       </div>
-      <span class="perf-acceptance-state">{{ snapshot.acceptance.state|upper }}</span>
+      <span class="perf-acceptance-state">{{ snapshot.formal_acceptance.state|upper }}</span>
     </div>
     <div class="table-scroll">
       <table class="dense-table">
@@ -57,7 +57,7 @@
         {% for row in snapshot.acceptance.targets %}
           <tr>
             <td><strong>{{ row.label }}</strong><div class="muted small">{{ row.description }}</div></td>
-            <td>{{ row.samples }} / {{ row.min_samples }}</td>
+            <td>{{ row.valid_samples }} valid / {{ row.min_samples }} min{% if row.invalid_samples %}<div class="status-bad">{{ row.invalid_samples }} invalid</div>{% endif %}</td>
             {% if row.key == 'router_connections' %}
               <td>p95 {{ '%.2f'|format(row.p95_calls) }} · max {{ row.max_calls }}</td>
               <td>≤ {{ '%.1f'|format(row.budget_p95_calls) }} connection/request</td>
@@ -71,7 +71,28 @@
         </tbody>
       </table>
     </div>
-    <p class="muted small">PASS means the current retained live sample set meets the agreed current-scope budgets; it does not waive RouterOS fresh-read or post-write validation requirements.</p>
+    <p class="muted small">Request PASS means every class meets its current p95 budget using valid retained samples. Formal PASS additionally requires the operational evidence below. No result waives RouterOS fresh-read or post-write validation requirements.</p>
+    <div class="table-scroll">
+      <table class="dense-table">
+        <thead><tr><th>Operational evidence</th><th>Observed</th><th>State</th></tr></thead>
+        <tbody>
+        {% for row in snapshot.formal_acceptance.evidence_targets %}
+          <tr>
+            <td><strong>{{ row.label }}</strong><div class="muted small">{{ row.description }}</div></td>
+            <td>
+              {% if row.key == 'threshold_profile' %}min samples {{ row.configured_min_samples }} · relaxed {% if row.relaxed %}{{ row.relaxed|join(', ') }}{% else %}none{% endif %}
+              {% elif row.key == 'prepared_views' %}hits {{ row.hits }} · misses {{ row.misses }} · fallbacks {{ row.fallbacks }}
+              {% elif row.key == 'background_worker' %}alive {{ row.worker_alive }} · last {{ row.last_duration_ms if row.last_duration_ms is not none else 'n/a' }} ms
+              {% elif row.key == 'parallel_observation' %}items {{ row.items }} · workers {{ row.workers }} · max active {{ row.max_active }} · utilisation {{ row.utilisation_percent if row.utilisation_percent is not none else 'n/a' }}%
+              {% elif row.key == 'mutation_lane' %}acquisitions {{ row.acquisitions if row.acquisitions is not none else 'n/a' }} · contentions {{ row.contentions if row.contentions is not none else 'n/a' }} · wait {{ row.last_wait_ms if row.last_wait_ms is not none else 'n/a' }} / {{ row.max_wait_ms if row.max_wait_ms is not none else 'n/a' }} ms
+              {% endif %}
+            </td>
+            <td><span class="perf-target-state state-{{ row.state }}">{{ row.state|upper }}</span></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section class="card">
@@ -93,7 +114,7 @@
 /policy/simulate</textarea>
       </label>
       <label>Measured rounds
-        <input id="perfRounds" type="number" min="1" max="20" value="5">
+        <input id="perfRounds" type="number" min="1" max="50" value="20">
       </label>
       <button id="runPerfProbe" type="button">Run baseline probe</button>
     </div>
@@ -110,24 +131,24 @@
     <div class="card-heading"><div><h2>Route latency</h2><p class="muted">Server-side duration grouped by FastAPI route. Highest p95 first.</p></div></div>
     <div class="table-scroll">
       <table class="dense-table">
-        <thead><tr><th>Route</th><th>Count</th><th>Avg</th><th>p50</th><th>p95</th><th>p99</th><th>Max</th><th>Slow</th></tr></thead>
+        <thead><tr><th>Route</th><th>Count</th><th>Min</th><th>Avg</th><th>p50</th><th>p95</th><th>p99</th><th>Max</th><th>Slow</th></tr></thead>
         <tbody>
         {% for row in snapshot.routes %}
           <tr>
             <td><code>{{ row.route }}</code></td><td>{{ row.count }}</td>
-            <td>{{ '%.1f'|format(row.avg_ms) }} ms</td><td>{{ '%.1f'|format(row.p50_ms) }} ms</td>
+            <td>{{ '%.1f'|format(row.min_ms) }} ms</td><td>{{ '%.1f'|format(row.avg_ms) }} ms</td><td>{{ '%.1f'|format(row.p50_ms) }} ms</td>
             <td><strong>{{ '%.1f'|format(row.p95_ms) }} ms</strong></td><td>{{ '%.1f'|format(row.p99_ms) }} ms</td>
             <td>{{ '%.1f'|format(row.max_ms) }} ms</td><td>{{ row.slow_count }}</td>
           </tr>
           {% if row.top_components %}
-          <tr class="perf-detail-row"><td colspan="8">
+          <tr class="perf-detail-row"><td colspan="9">
             {% for component in row.top_components %}
               <span class="perf-chip"><code>{{ component.name }}</code> {{ '%.1f'|format(component.avg_ms_per_request) }}ms · {{ component.avg_calls_per_request }} calls/req</span>
             {% endfor %}
           </td></tr>
           {% endif %}
         {% else %}
-          <tr><td colspan="8" class="muted">No measured requests yet. Use ZEN normally or run the browser probe.</td></tr>
+          <tr><td colspan="9" class="muted">No measured requests yet. Use ZEN normally or run the browser probe.</td></tr>
         {% endfor %}
         </tbody>
       </table>
@@ -187,7 +208,7 @@
     <ul class="compact-list">
       {% for note in snapshot.notes %}<li>{{ note }}</li>{% endfor %}
       <li>The browser probe adds browser/network transfer time; <code>X-ZEN-Request-Ms</code> is the server-side measurement for the same request.</li>
-      <li>v0.39 adds a read-only managed-device observational snapshot for Dashboard/Managed Devices, route-specific main-view timings and explicit acceptance budgets. Write/pre-write/post-write validation still performs fresh RouterOS reads; there is no cross-request RouterOS value cache.</li>
+      <li>v0.54.4 formalizes the existing performance measurements: invalid samples cannot manufacture PASS, RouterOS connection evidence is exact per request, prepared-view outcomes are counted, and worker/observation/mutation-lane telemetry is surfaced. Write/pre-write/post-write validation still performs fresh RouterOS reads; there is no cross-request RouterOS value cache.</li>
     </ul>
     {% if user.role in ['admin', 'operator'] %}
     <form method="post" action="/local/performance/reset" class="inline-form" onsubmit="return confirm('Clear the in-memory performance sample set?');">
@@ -232,7 +253,7 @@
 
   button.addEventListener('click', async () => {
     const paths = document.getElementById('perfPaths').value.split(/\r?\n/).map(v => v.trim()).filter(v => v.startsWith('/'));
-    const rounds = Math.max(1, Math.min(20, Number(document.getElementById('perfRounds').value || 5)));
+    const rounds = Math.max(1, Math.min(50, Number(document.getElementById('perfRounds').value || 20)));
     if (!paths.length) return;
     button.disabled = true;
     tbody.innerHTML = '';

@@ -148,7 +148,7 @@ class HistoricalPolicyUxTests(unittest.TestCase):
         cls.css = Path("app/static/policy-history.css").read_text()
 
     def test_release_routes_and_stable_api_are_present(self):
-        self.assertIn('version="0.54.3"', self.main)
+        self.assertIn('version="0.54.4"', self.main)
         self.assertIn('@app.get("/activity/policy-history"', self.main)
         self.assertIn('@app.get("/api/activity/policy-history")', self.main)
         self.assertIn("zen_policy_correlation_v1", Path("app/policy_history.py").read_text())

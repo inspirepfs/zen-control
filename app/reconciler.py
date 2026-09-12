@@ -325,6 +325,26 @@ class AutoReconciler:
             "router_mutation": mutation,
         }
 
+    def performance_snapshot(self) -> dict:
+        """Return the last read-side fan-out evidence without probing RouterOS."""
+        with self._state_lock:
+            observation = dict((self._last.get("observation") or {}))
+        workers = int(observation.get("workers") or 0)
+        max_active = int(observation.get("max_active") or 0)
+        utilisation = None
+        if workers > 0:
+            utilisation = round(min(1.0, max_active / workers) * 100.0, 1)
+        return {
+            "schema": "zen_parallel_observation_performance_v1",
+            "workers_configured": self._observer.max_workers,
+            "items": int(observation.get("items") or 0),
+            "workers": workers,
+            "max_active": max_active,
+            "utilisation_percent": utilisation,
+            "duration_ms": observation.get("duration_ms"),
+            "failed": int(observation.get("failed") or 0),
+        }
+
     def _mutation_context(self, owner: str):
         router = getattr(self, "router", None)
         factory = getattr(router, "mutation_session", None) if router is not None else None

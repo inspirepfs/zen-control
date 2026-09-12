@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.54.3** — topology-aware release deployment and embedded-worker health closure.
+> Current release: **v0.54.4** — formal performance acceptance with fail-closed latency and runtime observability evidence.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -219,6 +219,20 @@ Important endpoints include:
 - `/api/activity/policy-history` — desired-policy/history correlation
 - `/api/migration/kid-control` — Kid Control migration status
 
+## Formal performance acceptance
+
+v0.54.4 promotes the existing performance instrumentation into a formal release gate. `/api/performance` retains bounded in-memory request evidence and now distinguishes valid/invalid samples, records min/p50/p95/p99/max, enforces the RouterOS transport budget as **exactly one coherent connection per valid RouterOS request**, and keeps missing connection evidence PENDING rather than treating it as zero. Slow outliers remain in the percentile population.
+
+The same snapshot exposes non-authoritative operational evidence for prepared-view hits/misses/live fallbacks, durable background-worker cycle timing, parallel-observation worker utilisation and serialized RouterOS mutation-lane wait/contention. These measurements are observational only: they do not create a second RouterOS writer and do not relax fresh authority/read/post-write validation.
+
+The absolute acceptance floor remains five valid samples per latency class; the recommended deliberate run is 20 samples per class. Capture a live authenticated snapshot from `/api/performance`, then evaluate it with:
+
+```bash
+python3 scripts/perf_acceptance.py zen-performance.json --json-out zen-performance-acceptance.json
+```
+
+The JSON report is intentionally sanitized to acceptance/configuration/runtime aggregates rather than retaining individual slow-request paths. The CLI returns non-zero for FAIL, PENDING or an invalid/inconsistent contract unless `--allow-pending` is explicitly used.
+
 ## Development and testing
 
 Use an isolated Python environment and install `requirements.txt`:
@@ -263,6 +277,6 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## License
 
-A final open-source license is intentionally **not selected in v0.54.3**. The repository may be reviewed privately while the choice between a strong network copyleft license (AGPL-3.0) and a permissive license (Apache-2.0) is made. **Choose and add the root `LICENSE` file before changing the GitHub repository to public.**
+A final open-source license is intentionally **not selected in v0.54.4**. The repository may be reviewed privately while the choice between a strong network copyleft license (AGPL-3.0) and a permissive license (Apache-2.0) is made. **Choose and add the root `LICENSE` file before changing the GitHub repository to public.**
 
 That is an explicit public-release gate, not an accidental omission. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).

@@ -48,11 +48,21 @@ PERF_SAMPLE_LIMIT = _bounded_int("ZEN_PERF_SAMPLE_LIMIT", 500, 50, 5000)
 PERF_COMPONENT_LIMIT = _bounded_int("ZEN_PERF_COMPONENT_LIMIT", 2000, 100, 10000)
 PERF_SLOW_MS = _bounded_float("ZEN_PERF_SLOW_MS", 1000.0, 50.0, 120000.0)
 PERF_SQL_PREVIEW = _env_bool("ZEN_PERF_SQL_PREVIEW", True)
-PERF_ACCEPTANCE_MIN_SAMPLES = _bounded_int("ZEN_PERF_ACCEPTANCE_MIN_SAMPLES", 5, 3, 100)
+PERF_ACCEPTANCE_MIN_SAMPLES = _bounded_int("ZEN_PERF_ACCEPTANCE_MIN_SAMPLES", 5, 5, 100)
+PERF_ACCEPTANCE_RECOMMENDED_SAMPLES = _bounded_int("ZEN_PERF_ACCEPTANCE_RECOMMENDED_SAMPLES", 20, 5, 200)
 PERF_BUDGET_NAVIGATION_MS = _bounded_float("ZEN_PERF_BUDGET_NAVIGATION_MS", 1000.0, 100.0, 10000.0)
 PERF_BUDGET_LOCAL_WRITE_MS = _bounded_float("ZEN_PERF_BUDGET_LOCAL_WRITE_MS", 750.0, 100.0, 10000.0)
 PERF_BUDGET_ROUTER_ACTION_MS = _bounded_float("ZEN_PERF_BUDGET_ROUTER_ACTION_MS", 2000.0, 250.0, 20000.0)
 PERF_BUDGET_ROUTER_READ_MS = _bounded_float("ZEN_PERF_BUDGET_ROUTER_READ_MS", 1500.0, 250.0, 20000.0)
+LEGACY_PERFORMANCE_ACCEPTANCE_SCHEMA = "zen_performance_acceptance_v1"
+FORMAL_REQUEST_ACCEPTANCE_SCHEMA = "zen_performance_acceptance_v2"
+FORMAL_BUDGETS = {
+    "acceptance_min_samples": 5,
+    "budget_navigation_p95_ms": 1000.0,
+    "budget_local_write_p95_ms": 750.0,
+    "budget_router_action_p95_ms": 2000.0,
+    "budget_router_read_p95_ms": 1500.0,
+}
 
 _START_MONO = time.monotonic()
 _START_WALL = datetime.now(timezone.utc).astimezone()
@@ -128,6 +138,7 @@ class PerformanceCollector:
             lambda: deque(maxlen=PERF_COMPONENT_LIMIT)
         )
         self._sql_previews: dict[str, str] = {}
+        self._evidence_counters: dict[str, int] = defaultdict(int)
         self._reset_at = self._now_iso()
         self._request_total = 0
 
@@ -195,6 +206,23 @@ class PerformanceCollector:
                 self._component_errors[f"postgres.sql.{fingerprint}"] += 1
         return fingerprint
 
+    def record_evidence(self, name: str, count: int = 1) -> None:
+        """Record a bounded, non-authoritative operational evidence counter.
+
+        These counters make cache/prepared-view behaviour visible without
+        persisting household data or granting background work any control-plane
+        authority. They are reset with the rest of the in-memory performance
+        evidence.
+        """
+        if not PERF_ENABLED:
+            return
+        label = str(name or "unknown").strip().lower()[:180]
+        increment = max(0, int(count or 0))
+        if not label or not increment:
+            return
+        with self._lock:
+            self._evidence_counters[label] += increment
+
     def reset(self) -> dict:
         with self._lock:
             self._samples.clear()
@@ -203,6 +231,7 @@ class PerformanceCollector:
             self._component_scopes.clear()
             self._sql_calls.clear()
             self._sql_previews.clear()
+            self._evidence_counters.clear()
             self._request_total = 0
             self._reset_at = self._now_iso()
         return {"ok": True, "reset_at": self._reset_at}
@@ -225,6 +254,7 @@ class PerformanceCollector:
         if not values:
             return {
                 "count": 0,
+                "min_ms": 0.0,
                 "avg_ms": 0.0,
                 "p50_ms": 0.0,
                 "p95_ms": 0.0,
@@ -233,6 +263,7 @@ class PerformanceCollector:
             }
         return {
             "count": len(values),
+            "min_ms": round(min(values), 3),
             "avg_ms": round(statistics.fmean(values), 3),
             "p50_ms": cls._percentile(values, 0.50),
             "p95_ms": cls._percentile(values, 0.95),
@@ -284,11 +315,11 @@ class PerformanceCollector:
         }
 
     def _acceptance_report(self, samples: list[RequestSample]) -> dict:
-        """Evaluate the current live sample set against explicit UX budgets.
+        """Evaluate retained live evidence against the formal responsiveness gate.
 
-        This is an acceptance aid, not an optimizer.  A class stays PENDING
-        until enough real requests have been observed; ZEN never declares a
-        performance area healthy from one lucky request.
+        The gate is deliberately fail-closed around evidence quality. Failed
+        requests never count as healthy latency samples, and missing RouterOS
+        connection instrumentation can never be interpreted as zero connections.
         """
         classes: dict[str, list[RequestSample]] = {
             "navigation": [],
@@ -329,63 +360,119 @@ class PerformanceCollector:
                 "Read-only pages such as Device 360/explainability that require RouterOS evidence.",
             ),
         )
+
+        def valid(sample: RequestSample) -> bool:
+            return not sample.error and 200 <= int(sample.status or 0) < 400
+
         rows = []
+        invalid_total = 0
         for key, label, budget, description in specs:
             group = classes[key]
-            stats = self._stats([sample.duration_ms for sample in group])
-            if len(group) < PERF_ACCEPTANCE_MIN_SAMPLES:
+            valid_group = [sample for sample in group if valid(sample)]
+            invalid = len(group) - len(valid_group)
+            invalid_total += invalid
+            stats = self._stats([sample.duration_ms for sample in valid_group])
+            if len(valid_group) < PERF_ACCEPTANCE_MIN_SAMPLES:
                 state = "pending"
+                reason = "insufficient-valid-samples"
+            elif invalid:
+                state = "fail"
+                reason = "request-errors-present"
+            elif stats["p95_ms"] <= budget:
+                state = "pass"
+                reason = "within-budget"
             else:
-                state = "pass" if stats["p95_ms"] <= budget else "fail"
+                state = "fail"
+                reason = "p95-budget-exceeded"
             rows.append({
                 "key": key,
                 "label": label,
                 "description": description,
                 "state": state,
+                "reason": reason,
                 "samples": len(group),
+                "valid_samples": len(valid_group),
+                "invalid_samples": invalid,
                 "min_samples": PERF_ACCEPTANCE_MIN_SAMPLES,
+                "recommended_samples": max(
+                    PERF_ACCEPTANCE_MIN_SAMPLES, PERF_ACCEPTANCE_RECOMMENDED_SAMPLES
+                ),
                 "budget_p95_ms": round(float(budget), 1),
                 **stats,
             })
 
+        valid_router_requests = [sample for sample in router_requests if valid(sample)]
+        invalid_router_requests = len(router_requests) - len(valid_router_requests)
         connect_counts = [
             int(sample.components.get("routeros.connect", {}).get("calls", 0))
-            for sample in router_requests
+            for sample in valid_router_requests
         ]
+        missing_connect = sum(1 for value in connect_counts if value <= 0)
+        multiple_connect = sum(1 for value in connect_counts if value > 1)
         connect_p95 = self._percentile([float(v) for v in connect_counts], 0.95)
-        if len(router_requests) < PERF_ACCEPTANCE_MIN_SAMPLES:
+        max_connect = max(connect_counts) if connect_counts else 0
+        if len(valid_router_requests) < PERF_ACCEPTANCE_MIN_SAMPLES:
             connect_state = "pending"
+            connect_reason = "insufficient-valid-samples"
+        elif invalid_router_requests:
+            connect_state = "fail"
+            connect_reason = "request-errors-present"
+        elif missing_connect:
+            connect_state = "pending"
+            connect_reason = "missing-connection-evidence"
+        elif multiple_connect or max_connect > 1:
+            connect_state = "fail"
+            connect_reason = "connection-budget-exceeded"
         else:
-            connect_state = "pass" if connect_p95 <= 1.0 else "fail"
+            connect_state = "pass"
+            connect_reason = "within-budget"
         rows.append({
             "key": "router_connections",
             "label": "RouterOS connections / request",
-            "description": "RouterOS-requiring requests should normally reuse one coherent transport.",
+            "description": "Every valid RouterOS-requiring request must expose exactly one coherent transport connection.",
             "state": connect_state,
+            "reason": connect_reason,
             "samples": len(router_requests),
+            "valid_samples": len(valid_router_requests),
+            "invalid_samples": invalid_router_requests,
             "min_samples": PERF_ACCEPTANCE_MIN_SAMPLES,
+            "recommended_samples": max(
+                PERF_ACCEPTANCE_MIN_SAMPLES, PERF_ACCEPTANCE_RECOMMENDED_SAMPLES
+            ),
             "budget_p95_calls": 1.0,
             "p50_calls": self._percentile([float(v) for v in connect_counts], 0.50),
             "p95_calls": connect_p95,
-            "max_calls": max(connect_counts) if connect_counts else 0,
+            "max_calls": max_connect,
+            "missing_evidence": missing_connect,
+            "multiple_connections": multiple_connect,
         })
 
         states = [row["state"] for row in rows]
         overall = "fail" if "fail" in states else ("pending" if "pending" in states else "pass")
         return {
-            "schema": "zen_performance_acceptance_v1",
+            "schema": FORMAL_REQUEST_ACCEPTANCE_SCHEMA,
             "state": overall,
             "min_samples": PERF_ACCEPTANCE_MIN_SAMPLES,
+            "recommended_samples": max(
+                PERF_ACCEPTANCE_MIN_SAMPLES, PERF_ACCEPTANCE_RECOMMENDED_SAMPLES
+            ),
             "targets": rows,
+            "evidence_integrity": {
+                "invalid_class_samples": invalid_total,
+                "router_missing_connection_evidence": missing_connect,
+                "router_multiple_connection_requests": multiple_connect,
+            },
             "meaning": {
-                "pass": "All measured acceptance classes meet their configured p95 budget.",
-                "pending": "One or more acceptance classes need more live samples.",
-                "fail": "At least one measured class exceeds its configured p95 budget.",
+                "pass": "Every class has enough valid samples, meets its p95 budget and satisfies applicable RouterOS connection evidence.",
+                "pending": "Evidence is incomplete: a class needs valid samples or required instrumentation is missing.",
+                "fail": "A measured class exceeds budget, contains failed requests after the sample floor, or violates the RouterOS connection budget.",
             },
             "notes": [
-                "Acceptance is based on real retained request timings, not synthetic unit-test wall time.",
-                "RouterOS action budgets retain fresh post-write validation; the target does not authorize skipping safety reads.",
-                "Budgets are configurable by ZEN_PERF_BUDGET_* environment variables.",
+                "Acceptance is based on real retained request timings; failed requests are never converted into healthy latency samples.",
+                "RouterOS connection evidence is exact-per-request: missing evidence is PENDING and more than one connection is FAIL.",
+                "RouterOS action budgets retain fresh post-write validation; performance targets never authorize skipping safety reads.",
+                "Percentiles include every valid retained sample; slow outliers are not discarded.",
+                "Budgets are configurable by ZEN_PERF_BUDGET_* environment variables; changing them changes the gate and must be deliberate.",
             ],
         }
 
@@ -399,6 +486,7 @@ class PerformanceCollector:
             }
             sql_calls = {key: list(values) for key, values in self._sql_calls.items()}
             sql_previews = dict(self._sql_previews)
+            evidence_counters = dict(self._evidence_counters)
             reset_at = self._reset_at
             request_total = self._request_total
 
@@ -504,6 +592,9 @@ class PerformanceCollector:
                 "sql_preview": PERF_SQL_PREVIEW,
                 "storage": "memory-only",
                 "acceptance_min_samples": PERF_ACCEPTANCE_MIN_SAMPLES,
+                "acceptance_recommended_samples": max(
+                    PERF_ACCEPTANCE_MIN_SAMPLES, PERF_ACCEPTANCE_RECOMMENDED_SAMPLES
+                ),
                 "budget_navigation_p95_ms": PERF_BUDGET_NAVIGATION_MS,
                 "budget_local_write_p95_ms": PERF_BUDGET_LOCAL_WRITE_MS,
                 "budget_router_action_p95_ms": PERF_BUDGET_ROUTER_ACTION_MS,
@@ -516,6 +607,7 @@ class PerformanceCollector:
                 "slow_count": sum(1 for value in request_values if value >= PERF_SLOW_MS),
             },
             "acceptance": acceptance,
+            "evidence_counters": evidence_counters,
             "routes": route_rows,
             "components": components,
             "sql": sql_rows,
@@ -527,9 +619,139 @@ class PerformanceCollector:
                 "Component timings are inclusive wall-clock timings and can overlap when one measured component calls another.",
                 "RouterOS method timings include network round trips; routeros.connect isolates connection establishment time.",
                 "PostgreSQL SQL timings identify the exact static query fingerprint used by ActivityStore.",
-                "Use the v0.39 acceptance classes and multiple warm requests before declaring responsiveness closed.",
+                "Use the v0.54.4 formal acceptance classes and multiple warm requests in a deliberate measured run before declaring responsiveness closed.",
             ],
         }
+
+
+def build_formal_acceptance(snapshot: dict, operational_evidence: dict) -> dict:
+    """Compose the v0.54.4 gate from latency and runtime observability evidence.
+
+    Runtime evidence is observational only. It proves that the prepared-view,
+    background-worker, parallel-observation and mutation-lane measurements are
+    present; it never grants or changes RouterOS write authority.
+    """
+    request_acceptance = dict(snapshot.get("acceptance") or {})
+    request_state = str(request_acceptance.get("state") or "pending").lower()
+    counters = dict(snapshot.get("evidence_counters") or {})
+
+    prepared_hits = int(counters.get("prepared_view.hit", 0) or 0)
+    prepared_misses = int(counters.get("prepared_view.miss", 0) or 0)
+    prepared_fallbacks = int(counters.get("prepared_view.fallback", 0) or 0)
+    prepared_observed = prepared_hits + prepared_misses
+    prepared_state = "pass" if prepared_observed > 0 else "pending"
+
+    background = dict(operational_evidence.get("background_worker") or {})
+    background_alive = background.get("worker_alive")
+    background_duration = background.get("last_duration_ms")
+    if background_alive is False:
+        background_state = "fail"
+    elif background_alive is True and background_duration is not None:
+        background_state = "pass"
+    else:
+        background_state = "pending"
+
+    observation = dict(operational_evidence.get("parallel_observation") or {})
+    observation_items = int(observation.get("items") or 0)
+    observation_workers = int(observation.get("workers") or 0)
+    observation_failed = int(observation.get("failed") or 0)
+    if observation_failed > 0:
+        observation_state = "fail"
+    elif observation_items > 0 and observation_workers > 0:
+        observation_state = "pass"
+    else:
+        observation_state = "pending"
+
+    mutation = dict(operational_evidence.get("mutation_lane") or {})
+    acquisitions = mutation.get("acquisitions")
+    if acquisitions is None:
+        mutation_state = "pending"
+    elif int(acquisitions or 0) > 0:
+        mutation_state = "pass"
+    else:
+        mutation_state = "pending"
+
+    configuration = dict(snapshot.get("configuration") or {})
+    relaxed_thresholds: list[str] = []
+    configured_min = int(configuration.get("acceptance_min_samples") or 0)
+    if configured_min < int(FORMAL_BUDGETS["acceptance_min_samples"]):
+        relaxed_thresholds.append("acceptance_min_samples")
+    for key in (
+        "budget_navigation_p95_ms",
+        "budget_local_write_p95_ms",
+        "budget_router_action_p95_ms",
+        "budget_router_read_p95_ms",
+    ):
+        configured = float(configuration.get(key) or 0.0)
+        canonical = float(FORMAL_BUDGETS[key])
+        if configured <= 0.0 or configured > canonical:
+            relaxed_thresholds.append(key)
+    threshold_state = "fail" if relaxed_thresholds else "pass"
+
+    evidence_targets = [
+        {
+            "key": "threshold_profile",
+            "label": "Canonical acceptance thresholds",
+            "state": threshold_state,
+            "relaxed": relaxed_thresholds,
+            "configured_min_samples": configured_min,
+            "canonical": dict(FORMAL_BUDGETS),
+            "description": "Formal PASS permits equal or stricter settings only; relaxed budgets or sample floors cannot manufacture PASS.",
+        },
+        {
+            "key": "prepared_views",
+            "label": "Prepared-view effectiveness",
+            "state": prepared_state,
+            "hits": prepared_hits,
+            "misses": prepared_misses,
+            "fallbacks": prepared_fallbacks,
+            "description": "At least one prepared-view lookup must be observed; hits and live fallbacks remain distinct.",
+        },
+        {
+            "key": "background_worker",
+            "label": "Background worker timing",
+            "state": background_state,
+            "worker_alive": background_alive,
+            "last_duration_ms": background_duration,
+            "description": "The non-authoritative durable read worker must be alive and expose a completed-cycle duration.",
+        },
+        {
+            "key": "parallel_observation",
+            "label": "Parallel observation utilisation",
+            "state": observation_state,
+            "items": observation_items,
+            "workers": observation_workers,
+            "max_active": int(observation.get("max_active") or 0),
+            "utilisation_percent": observation.get("utilisation_percent"),
+            "failed": observation_failed,
+            "description": "A real observation batch must expose worker fan-out/utilisation without creating write authority.",
+        },
+        {
+            "key": "mutation_lane",
+            "label": "Serialized mutation-lane contention",
+            "state": mutation_state,
+            "acquisitions": int(acquisitions or 0) if acquisitions is not None else None,
+            "contentions": mutation.get("contentions"),
+            "last_wait_ms": mutation.get("last_wait_ms"),
+            "max_wait_ms": mutation.get("max_wait_ms"),
+            "description": "At least one real mutation-lane acquisition must expose wait/contention evidence; authority remains serialized.",
+        },
+    ]
+
+    states = [request_state] + [row["state"] for row in evidence_targets]
+    overall = "fail" if "fail" in states else ("pending" if "pending" in states else "pass")
+    return {
+        "schema": "zen_formal_performance_acceptance_v1",
+        "state": overall,
+        "request_state": request_state,
+        "request_acceptance_schema": request_acceptance.get("schema"),
+        "evidence_targets": evidence_targets,
+        "notes": [
+            "Formal acceptance combines retained request budgets with runtime observability evidence.",
+            "PENDING is never converted to PASS because evidence is missing or a counter is zero.",
+            "Operational evidence is read-only and cannot authorize RouterOS mutations.",
+        ],
+    }
 
 
 collector = PerformanceCollector()

@@ -50,7 +50,8 @@ from app.auth import AuthManager, AuthError, fresh_auth_valid, shared_display_pr
 from app.auth import shared_display_extension_allowed, extend_shared_display_deadline
 from app.ux import build_connected_overview, audit_destination, incident_destination
 from app.performance import (
-    PERF_ENABLED, collector as performance_collector, instrument, perf_span, timed,
+    PERF_ENABLED, build_formal_acceptance, collector as performance_collector,
+    instrument, perf_span, timed,
 )
 from app.pwa import icon_png, status_contract
 from app.secure_transport import SecureTransportConfig, security_headers
@@ -62,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.3")
+app = FastAPI(title="ZEN Control", version="0.54.4")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -125,6 +126,7 @@ async def performance_request_metrics(request: Request, call_next):
         or path.startswith("/static/")
         or path.startswith("/api/performance")
         or path == "/performance"
+        or path.startswith("/local/performance/")
         or path.startswith("/api/operations/diagnostics")
         or path == "/diagnostics"
         or path.startswith("/local/operations/diagnostics")
@@ -757,8 +759,14 @@ def _prepared_view(view_key: str, *, max_age_seconds: int | None = None):
 
 def _prepared_payload(view_key: str, *, max_age_seconds: int | None = None):
     prepared = _prepared_view(view_key, max_age_seconds=max_age_seconds)
+    performance_collector.record_evidence("prepared_view.lookup")
     if not prepared:
+        performance_collector.record_evidence("prepared_view.miss")
+        performance_collector.record_evidence("prepared_view.fallback")
+        performance_collector.record_evidence(f"prepared_view.fallback:{view_key}")
         return None, None
+    performance_collector.record_evidence("prepared_view.hit")
+    performance_collector.record_evidence(f"prepared_view.hit:{view_key}")
     payload = dict(prepared.get("payload") or {})
     meta = {
         "view_key": prepared.get("view_key"),
@@ -1387,11 +1395,43 @@ def health():
     return report
 
 
+def current_performance_snapshot() -> dict:
+    """Compose formal performance evidence without adding measured workload."""
+    snapshot = performance_collector.snapshot()
+    background = background_worker.performance_snapshot()
+    observation = auto_reconciler.performance_snapshot()
+    try:
+        raw_router = getattr(router, "__wrapped__", router)
+        mutation = raw_router.mutation_status()
+    except Exception as exc:
+        mutation = {
+            "schema": "zen_router_mutation_lane_v1",
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}"[:240],
+        }
+    counters = dict(snapshot.get("evidence_counters") or {})
+    operational = {
+        "schema": "zen_performance_operational_evidence_v1",
+        "prepared_views": {
+            "lookups": int(counters.get("prepared_view.lookup", 0) or 0),
+            "hits": int(counters.get("prepared_view.hit", 0) or 0),
+            "misses": int(counters.get("prepared_view.miss", 0) or 0),
+            "fallbacks": int(counters.get("prepared_view.fallback", 0) or 0),
+        },
+        "background_worker": background,
+        "parallel_observation": observation,
+        "mutation_lane": mutation,
+    }
+    snapshot["operational_evidence"] = operational
+    snapshot["formal_acceptance"] = build_formal_acceptance(snapshot, operational)
+    return snapshot
+
+
 @app.get("/api/performance")
 def api_performance(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
-    return performance_collector.snapshot()
+    return current_performance_snapshot()
 
 
 @app.get("/performance", response_class=HTMLResponse)
@@ -1405,7 +1445,7 @@ def performance_page(
             "request": request,
             "user": user,
             "csrf": request.session.get("csrf", ""),
-            "snapshot": performance_collector.snapshot(),
+            "snapshot": current_performance_snapshot(),
         },
     )
 
