@@ -57,14 +57,17 @@ Examples:
 
 ## Current persistence and background-work model
 
-v0.54.0 uses:
+v0.54.1 uses:
 
-- SQLite for policy/configuration and durable control-plane state.
+- SQLite for policy/configuration and durable control-plane state;
 - a monotonic configuration revision journal for revision-aware writes;
 - a transactional SQLite outbox for `config.changed` events;
 - durable background jobs with idempotency keys, bounded attempts, leases and scope locks;
 - durable worker metrics for operational evidence;
+- bounded `prepared_views` rows for current derived read models;
 - PostgreSQL 17 for retained telemetry/history;
 - named Docker volumes for Pi-hole, Caddy and telemetry state.
 
-The first background handler is deliberately read-only: `analytics.config-summary` reads local configuration and stores only job/result bookkeeping. The background worker receives no RouterOS adapter. RouterOS mutation remains serialized through the existing reconciliation/authority paths. v0.54.1 can build prepared read models on this foundation without creating another enforcement writer.
+Prepared views are not authority and are not trusted merely because a row exists. Consumers require the current configuration revision and a bounded freshness window; stale, expired or mismatched rows fall back to the live read path. Periodic jobs prepare Dashboard/Activity/Classification/Services/History telemetry and per-device Device 360 activity evidence. Device 360 still reads RouterOS authority synchronously and only reuses prepared telemetry evidence.
+
+The background worker receives no RouterOS adapter. RouterOS mutation remains serialized through the existing reconciliation/authority paths. Terminal background-job/outbox bookkeeping is pruned only under bounded retention rules that preserve active work and a recent evidence floor.

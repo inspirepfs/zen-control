@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
   <title>Historical Activity · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.1">
 </head>
 <body class="standalone-page">
 <header class="analytics-header standalone-header">
@@ -23,6 +23,7 @@
 <main class="analytics-main">
 {% set page_help = zen_help('activity_history') %}
 {% include "_context_help.jinja" %}
+  {% if prepared_view %}<div class="local-only-note">Prepared 7-day read model · {{prepared_view.age_seconds|round(1)}}s old · config revision {{prepared_view.source_revision}} · generation {{prepared_view.generation}}</div>{% endif %}
   <section class="card analytics-filter-card">
     <div class="analytics-filter-row">
       <nav class="analytics-periods" aria-label="Activity period">

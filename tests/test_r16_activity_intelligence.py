@@ -85,8 +85,8 @@ class ActivityUxTests(unittest.TestCase):
         self.main = (ROOT / "app/main.py").read_text()
 
     def test_version_and_activity_stylesheet(self):
-        self.assertIn('version="0.54.0"', self.main)
-        self.assertIn('/static/activity.css?v=0.54.0', self.index)
+        self.assertIn('version="0.54.1"', self.main)
+        self.assertIn('/static/activity.css?v=0.54.1', self.index)
 
     def test_managed_activity_uses_name_and_ip(self):
         self.assertIn('{{d.display_name}}', self.index)

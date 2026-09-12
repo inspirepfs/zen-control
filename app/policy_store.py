@@ -473,6 +473,24 @@ class PolicyStore:
                     last_result TEXT NOT NULL DEFAULT '',
                     last_error TEXT NOT NULL DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS prepared_views (
+                    view_key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'global',
+                    source_revision INTEGER NOT NULL DEFAULT 0,
+                    captured_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    payload_bytes INTEGER NOT NULL DEFAULT 0,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'ready',
+                    error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_prepared_views_kind_scope
+                    ON prepared_views(kind, scope);
                 """
             )
             db.execute(
@@ -824,7 +842,7 @@ class PolicyStore:
         now = self._operations_now_iso()
         available_at = str(available_at or now)
         with self._db() as db:
-            db.execute(
+            cur = db.execute(
                 """INSERT OR IGNORE INTO background_jobs
                    (kind, scope, idempotency_key, payload_json, status, attempts,
                     max_attempts, available_at, created_at, updated_at)
@@ -844,7 +862,10 @@ class PolicyStore:
                 "SELECT * FROM background_jobs WHERE idempotency_key=?",
                 (idempotency_key,),
             ).fetchone()
-        return self._background_job_dict(row)
+        item = self._background_job_dict(row)
+        if item is not None:
+            item["created"] = bool(cur.rowcount)
+        return item
 
     @staticmethod
     def _background_job_dict(row):
@@ -1103,6 +1124,164 @@ class PolicyStore:
                 ),
             )
 
+    def save_prepared_view(
+        self,
+        *,
+        view_key,
+        kind,
+        scope='global',
+        payload=None,
+        source_revision=None,
+        ttl_seconds=300,
+        status='ready',
+        error='',
+    ):
+        """Publish one bounded read-side prepared view.
+
+        Prepared views are derived evidence only. They never carry write callbacks
+        or RouterOS authority and are rejected by consumers when their configuration
+        revision is stale. The row is replaced in place, so periodic refresh cannot
+        create unbounded retained household data.
+        """
+        view_key = str(view_key or '').strip()[:240]
+        kind = str(kind or '').strip()[:100]
+        scope = str(scope or 'global').strip()[:160]
+        if not view_key or not kind:
+            raise ValueError('Prepared view key and kind are required')
+        payload_json = self._bounded_json(payload)
+        payload_bytes = len(payload_json.encode('utf-8'))
+        if payload_bytes > 2_000_000:
+            raise ValueError('Prepared view payload exceeds 2 MB safety limit')
+        if source_revision is None:
+            source_revision = int(self.current_config_revision().get('revision') or 0)
+        ttl_seconds = max(15, min(86400, int(ttl_seconds)))
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec='seconds')
+        expires = (now_dt + timedelta(seconds=ttl_seconds)).isoformat(timespec='seconds')
+        with self._db() as db:
+            db.execute(
+                """INSERT INTO prepared_views
+                   (view_key, kind, scope, source_revision, captured_at, expires_at,
+                    payload_json, payload_bytes, generation, status, error, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                   ON CONFLICT(view_key) DO UPDATE SET
+                     kind=excluded.kind, scope=excluded.scope,
+                     source_revision=excluded.source_revision,
+                     captured_at=excluded.captured_at, expires_at=excluded.expires_at,
+                     payload_json=excluded.payload_json, payload_bytes=excluded.payload_bytes,
+                     generation=prepared_views.generation+1,
+                     status=excluded.status, error=excluded.error, updated_at=excluded.updated_at""",
+                (
+                    view_key, kind, scope, int(source_revision), now, expires,
+                    payload_json, payload_bytes, str(status or 'ready')[:40],
+                    str(error or '')[:500], now,
+                ),
+            )
+        return self.get_prepared_view(view_key, include_stale=True)
+
+    def get_prepared_view(
+        self,
+        view_key,
+        *,
+        required_revision=None,
+        max_age_seconds=None,
+        include_stale=False,
+    ):
+        """Return a prepared view only when its evidence is still eligible.
+
+        Staleness is explicit. A configuration revision mismatch never silently
+        serves old policy/service semantics, and expired evidence is withheld unless
+        a diagnostics caller explicitly requests ``include_stale``.
+        """
+        with self._db() as db:
+            row = db.execute(
+                'SELECT * FROM prepared_views WHERE view_key=?',
+                (str(view_key),),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item['payload'] = json.loads(item.pop('payload_json'))
+        except (json.JSONDecodeError, TypeError):
+            item['payload'] = {}
+            item['status'] = 'invalid'
+        now = datetime.now(timezone.utc)
+        try:
+            captured = datetime.fromisoformat(str(item.get('captured_at') or ''))
+            if captured.tzinfo is None:
+                captured = captured.replace(tzinfo=timezone.utc)
+            age_seconds = max(0.0, (now - captured.astimezone(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            age_seconds = None
+        item['age_seconds'] = round(age_seconds, 3) if age_seconds is not None else None
+        revision_stale = (
+            required_revision is not None
+            and int(item.get('source_revision') or 0) != int(required_revision)
+        )
+        expired = str(item.get('expires_at') or '') <= now.isoformat(timespec='seconds')
+        too_old = (
+            max_age_seconds is not None
+            and age_seconds is not None
+            and age_seconds > max(1, int(max_age_seconds))
+        )
+        item['eligible'] = bool(
+            str(item.get('status') or '') == 'ready'
+            and not revision_stale
+            and not expired
+            and not too_old
+        )
+        item['revision_stale'] = revision_stale
+        item['expired'] = expired
+        item['too_old'] = too_old
+        if not item['eligible'] and not include_stale:
+            return None
+        return item
+
+    def list_prepared_views(self, limit=100):
+        limit = max(1, min(500, int(limit)))
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT view_key, kind, scope, source_revision, captured_at,
+                          expires_at, payload_bytes, generation, status, error, updated_at
+                   FROM prepared_views ORDER BY updated_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_background_history(self, *, retention_days=14, keep_jobs=200, keep_outbox=200):
+        """Bound durable worker bookkeeping without touching active work.
+
+        Only terminal jobs and already-dispatched/ignored outbox rows are eligible,
+        and the newest bounded floor is always retained even if older than the age
+        threshold. Prepared views are single-row upserts and therefore need no
+        destructive data-retention pass.
+        """
+        retention_days = max(1, min(365, int(retention_days)))
+        keep_jobs = max(20, min(5000, int(keep_jobs)))
+        keep_outbox = max(20, min(5000, int(keep_outbox)))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(timespec='seconds')
+        with self._db() as db:
+            cur_jobs = db.execute(
+                """DELETE FROM background_jobs
+                   WHERE status IN ('succeeded','failed') AND updated_at<?
+                     AND id NOT IN (SELECT id FROM background_jobs WHERE status IN ('succeeded','failed') ORDER BY id DESC LIMIT ?)""",
+                (cutoff, keep_jobs),
+            )
+            cur_outbox = db.execute(
+                """DELETE FROM outbox_events
+                   WHERE status IN ('dispatched','ignored') AND created_at<?
+                     AND id NOT IN (SELECT id FROM outbox_events WHERE status IN ('dispatched','ignored') ORDER BY id DESC LIMIT ?)""",
+                (cutoff, keep_outbox),
+            )
+        return {
+            'jobs_deleted': int(cur_jobs.rowcount or 0),
+            'outbox_deleted': int(cur_outbox.rowcount or 0),
+            'retention_days': retention_days,
+            'keep_jobs': keep_jobs,
+            'keep_outbox': keep_outbox,
+        }
+
     def background_work_stats(self):
         with self._db() as db:
             jobs = {
@@ -1121,6 +1300,9 @@ class PolicyStore:
             metrics = [dict(row) for row in db.execute(
                 "SELECT * FROM background_worker_metrics ORDER BY worker_name"
             ).fetchall()]
+            prepared = db.execute(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(payload_bytes),0) AS bytes FROM prepared_views"
+            ).fetchone()
         return {
             "available": True,
             "revision": self.current_config_revision(),
@@ -1128,6 +1310,10 @@ class PolicyStore:
             "outbox": outbox,
             "scope_locks": locks,
             "workers": metrics,
+            "prepared_views": {
+                "count": int(prepared["count"] or 0),
+                "payload_bytes": int(prepared["bytes"] or 0),
+            },
         }
 
     def build_config_analytics_snapshot(self):
@@ -1926,6 +2112,7 @@ class PolicyStore:
             "summary_deliveries", "policy_state_history", "managed_device_identity",
             "config_revision_state", "config_revisions", "outbox_events",
             "background_jobs", "background_scope_locks", "background_worker_metrics",
+            "prepared_views",
         }
         try:
             with sqlite3.connect(self.path, timeout=5.0) as db:

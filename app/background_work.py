@@ -26,6 +26,7 @@ class BackgroundWorker:
         policy_store: Any,
         handlers: dict[str, Callable[[dict], dict]],
         audit: Callable[[str, str, str], None],
+        producer: Callable[[], int] | None = None,
         worker_name: str = "background-read-worker",
         interval_seconds: float = 2.0,
         lease_seconds: int = 30,
@@ -34,6 +35,7 @@ class BackgroundWorker:
         self.policy_store = policy_store
         self.handlers = dict(handlers)
         self.audit = audit
+        self.producer = producer
         self.worker_name = str(worker_name or "background-read-worker")[:80]
         self.interval_seconds = max(0.25, float(interval_seconds))
         self.lease_seconds = max(5, int(lease_seconds))
@@ -49,6 +51,7 @@ class BackgroundWorker:
             "finished_at": None,
             "duration_ms": None,
             "result": "never",
+            "scheduled": 0,
             "dispatched": 0,
             "claimed": 0,
             "succeeded": 0,
@@ -112,6 +115,7 @@ class BackgroundWorker:
             "duration_ms": None,
             "trigger": str(trigger or "manual"),
             "result": "ok",
+            "scheduled": 0,
             "dispatched": 0,
             "claimed": 0,
             "succeeded": 0,
@@ -122,6 +126,8 @@ class BackgroundWorker:
         try:
             recovered = self.policy_store.recover_expired_background_work()
             result["recovered"] = int(recovered or 0)
+            if self.producer is not None:
+                result["scheduled"] = int(self.producer() or 0)
             result["dispatched"] = int(
                 self.policy_store.dispatch_outbox_to_background_jobs(limit=50) or 0
             )

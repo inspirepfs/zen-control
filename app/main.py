@@ -61,7 +61,7 @@ from app.help_content import get_help_topic, help_for_context, help_catalog, hel
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.0")
+app = FastAPI(title="ZEN Control", version="0.54.1")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -717,28 +717,191 @@ def get_policy_explanation(address: str, focus_service: str | None = None) -> di
     )
 
 
-@timed("device360.compose")
-def get_device_360(address: str) -> dict:
-    """Compose one read-only device operational view from existing evidence."""
-    explanation = get_policy_explanation(address)
-    device = explanation.get("device") or {}
-    device_name = str(device.get("name") or address)
+PREPARED_VIEW_MAX_AGE = {
+    "dashboard:24h": 240,
+    "activity:24h": 240,
+    "services:24h": 240,
+    "classification:24h": 360,
+    "history:7d": 360,
+}
 
-    try:
-        reward_account = policy_store.get_reward_account(address, ledger_limit=6)
-    except ValueError as exc:
-        reward_account = {
-            "ip": address,
-            "enabled": False,
-            "balance_minutes": 0,
-            "ledger": [],
-            "error": str(exc),
+
+def _prepared_view(view_key: str, *, max_age_seconds: int | None = None):
+    """Return current-revision prepared evidence or None for live fallback."""
+    revision = int(policy_store.current_config_revision().get("revision") or 0)
+    return policy_store.get_prepared_view(
+        view_key,
+        required_revision=revision,
+        max_age_seconds=max_age_seconds or PREPARED_VIEW_MAX_AGE.get(view_key, 300),
+    )
+
+
+def _prepared_payload(view_key: str, *, max_age_seconds: int | None = None):
+    prepared = _prepared_view(view_key, max_age_seconds=max_age_seconds)
+    if not prepared:
+        return None, None
+    payload = dict(prepared.get("payload") or {})
+    meta = {
+        "view_key": prepared.get("view_key"),
+        "captured_at": prepared.get("captured_at"),
+        "age_seconds": prepared.get("age_seconds"),
+        "source_revision": prepared.get("source_revision"),
+        "generation": prepared.get("generation"),
+        "payload_bytes": prepared.get("payload_bytes"),
+    }
+    return payload, meta
+
+
+def _prepare_dashboard_payload() -> dict:
+    local = policy_store.list_device_policy()
+    managed_ips = sorted(str(ip) for ip in local if str(ip))
+    if not activity_store.health():
+        return {
+            "schema": "zen_prepared_dashboard_v1",
+            "telemetry_available": False,
+            "activity_insights": {},
+            "security_bypass_attempts": [],
+            "security_bypass_evidence": [],
+            "security_bypass_summary": summarize_bypass_evidence([]),
         }
+    coverage = activity_store.classification_coverage(24)
+    evidence = activity_store.bypass_evidence(managed_ips, 24, 120)
+    return {
+        "schema": "zen_prepared_dashboard_v1",
+        "telemetry_available": True,
+        "activity_insights": {
+            "managed_devices": len(managed_ips),
+            "managed_devices_seen": activity_store.managed_activity_count(managed_ips, 24),
+            "traffic_classified_percent": coverage.get("traffic_percent"),
+            "dns_classified_percent": coverage.get("dns_percent"),
+            "traffic_classification_status": coverage.get("traffic_evidence_status", "no_evidence"),
+            "dns_classification_status": coverage.get("dns_evidence_status", "no_evidence"),
+            "unknown_domains": int(coverage.get("unknown_domains", 0)),
+        },
+        "activity_coverage": coverage,
+        "security_bypass_attempts": activity_store.bypass_attempts(managed_ips, 24, 30),
+        "security_bypass_evidence": evidence,
+        "security_bypass_summary": summarize_bypass_evidence(evidence),
+    }
 
+
+def _prepare_activity_payload() -> dict:
+    local = policy_store.list_device_policy()
+    managed_names = {
+        str(ip): str((cfg or {}).get("alias") or ip)
+        for ip, cfg in local.items() if str(ip)
+    }
+    if not activity_store.health():
+        return {
+            "schema": "zen_prepared_activity_v1",
+            "telemetry_available": False,
+            "overview": {}, "devices": [], "observed_services": [],
+            "domains": [], "device_summaries": {}, "dns_service_rows": [],
+            "coverage": {}, "unknown_domains": [], "activity_insights": {},
+        }
+    overview = activity_store.overview(24)
+    devices = activity_store.top_devices(24, 12)
+    summaries = activity_store.device_activity_summaries(
+        [row.get("client_ip") for row in devices], 24, 5, 6
+    )
+    for row in devices:
+        ip = str(row.get("client_ip") or "")
+        row["managed"] = ip in managed_names
+        row["display_name"] = managed_names.get(ip, ip)
+        row["detail"] = summaries.get(ip, {})
+    observed = activity_store.top_services(24, 100)
+    coverage = activity_store.classification_coverage(24)
+    return {
+        "schema": "zen_prepared_activity_v1",
+        "telemetry_available": True,
+        "overview": overview,
+        "devices": devices,
+        "observed_services": observed,
+        "domains": activity_store.dns_top_domains(24, 30),
+        "device_summaries": summaries,
+        "dns_service_rows": activity_store.dns_top_services(24, 100),
+        "coverage": coverage,
+        "unknown_domains": activity_store.unknown_domains(24, 30),
+        "activity_insights": {
+            "observed_services": int(overview.get("observed_services", 0)),
+            "attributed_percent": float(overview.get("attributed_percent", 0.0)),
+            "dns_block_percent": float(overview.get("dns_block_percent", 0.0)),
+            "managed_devices": len(managed_names),
+            "managed_devices_seen": activity_store.managed_activity_count(list(managed_names), 24),
+            "unique_domains": int(overview.get("unique_domains", 0)),
+            "latest_flow": overview.get("latest_flow"),
+            "latest_dns": overview.get("latest_dns"),
+            "traffic_classified_percent": coverage.get("traffic_percent"),
+            "dns_classified_percent": coverage.get("dns_percent"),
+            "traffic_classification_status": coverage.get("traffic_evidence_status", "no_evidence"),
+            "dns_classification_status": coverage.get("dns_evidence_status", "no_evidence"),
+            "unknown_domains": int(coverage.get("unknown_domains", 0)),
+        },
+    }
+
+
+def _prepare_services_payload() -> dict:
+    if not activity_store.health():
+        return {
+            "schema": "zen_prepared_services_v1", "telemetry_available": False,
+            "traffic": [], "dns": [], "coverage": {}, "unknown_domains": [],
+        }
+    return {
+        "schema": "zen_prepared_services_v1",
+        "telemetry_available": True,
+        "traffic": activity_store.top_services(24, 100),
+        "dns": activity_store.dns_top_services(24, 100),
+        "coverage": activity_store.classification_coverage(24),
+        "unknown_domains": activity_store.unknown_domains(24, 50),
+    }
+
+
+def _prepare_history_payload() -> dict:
+    settings = policy_store.get_settings()
+    timezone_name = settings.get("policy_timezone", "Europe/London")
+    window = resolve_activity_window("7d", timezone_name)
+    names = _activity_managed_names()
+    current = activity_store.overview_range(window["start"], window["end"], None)
+    previous = activity_store.overview_range(window["previous_start"], window["previous_end"], None)
+    top_devices = activity_store.top_devices_range(window["start"], window["end"], 24)
+    _decorate_activity_identity(top_devices, names)
+    services = activity_store.top_services_range(window["start"], window["end"], 30, None)
+    service_defs = policy_store.list_services()
+    keys_by_name = {
+        str(item.get("name") or "").lower(): str(item.get("key") or "")
+        for item in service_defs
+    }
+    for item in services:
+        item["service_key"] = keys_by_name.get(str(item.get("service_name") or "").lower(), "")
+    new_domains = activity_store.new_domains_range(window["start"], window["end"], 30, 60, None)
+    for item in new_domains:
+        item["local_first_seen"] = _activity_local_timestamp(item.get("first_seen"), timezone_name)
+    timeline = activity_store.evidence_timeline(window["start"], window["end"], None, 180)
+    _decorate_activity_identity(timeline, names)
+    for item in timeline:
+        item["local_time"] = _activity_local_timestamp(item.get("event_time"), timezone_name)
+    return {
+        "schema": "zen_prepared_history_v1",
+        "window": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in window.items()},
+        "current": current,
+        "previous": previous,
+        "comparison": compare_activity_totals(current, previous),
+        "daily": activity_store.daily_history(window["start"], window["end"], timezone_name, None),
+        "top_devices": top_devices,
+        "services": services,
+        "domains": activity_store.top_domains_range(window["start"], window["end"], 60, None),
+        "new_domains": new_domains,
+        "timeline": timeline,
+        "active_periods": [],
+        "timezone_name": timezone_name,
+    }
+
+
+def _build_device360_activity(address: str, timezone_name: str | None = None):
     activity = {}
     activity_error = None
     try:
-        timezone_name = explanation.get("timezone") or policy_store.get_settings().get(
+        timezone_name = timezone_name or policy_store.get_settings().get(
             "policy_timezone", "Europe/London"
         )
         window = resolve_activity_window("today", timezone_name)
@@ -775,6 +938,37 @@ def get_device_360(address: str) -> dict:
         }
     except (ActivityError, ValueError) as exc:
         activity_error = str(exc)
+    return activity, activity_error
+
+
+@timed("device360.compose")
+def get_device_360(address: str) -> dict:
+    """Compose one read-only device operational view from existing evidence."""
+    explanation = get_policy_explanation(address)
+    device = explanation.get("device") or {}
+    device_name = str(device.get("name") or address)
+
+    try:
+        reward_account = policy_store.get_reward_account(address, ledger_limit=6)
+    except ValueError as exc:
+        reward_account = {
+            "ip": address,
+            "enabled": False,
+            "balance_minutes": 0,
+            "ledger": [],
+            "error": str(exc),
+        }
+
+    prepared, prepared_meta = _prepared_payload(
+        f"device360:{address}", max_age_seconds=180
+    )
+    if prepared:
+        activity = dict(prepared.get("activity") or {})
+        activity_error = prepared.get("activity_error") or None
+    else:
+        activity, activity_error = _build_device360_activity(
+            address, explanation.get("timezone") or None
+        )
 
     try:
         incidents = filter_related_records(
@@ -793,7 +987,7 @@ def get_device_360(address: str) -> dict:
     except Exception:
         audit_events = []
 
-    return build_device_360_snapshot(
+    snapshot = build_device_360_snapshot(
         explanation=explanation,
         reward_account=reward_account,
         activity=activity,
@@ -801,6 +995,8 @@ def get_device_360(address: str) -> dict:
         incidents=incidents,
         audit_events=audit_events,
     )
+    snapshot["prepared_view"] = prepared_meta
+    return snapshot
 
 
 def _background_config_analytics(_payload: dict) -> dict:
@@ -809,10 +1005,112 @@ def _background_config_analytics(_payload: dict) -> dict:
     return policy_store.build_config_analytics_snapshot()
 
 
+def _background_prepared_view(payload: dict) -> dict:
+    view = str((payload or {}).get("view") or "").strip()
+    ttl_seconds = int((payload or {}).get("ttl_seconds") or 300)
+    if view == "dashboard:24h":
+        output = _prepare_dashboard_payload()
+    elif view == "activity:24h":
+        output = _prepare_activity_payload()
+    elif view == "services:24h":
+        output = _prepare_services_payload()
+    elif view == "classification:24h":
+        output = _classification_workbench_payload(24)
+    elif view == "history:7d":
+        output = _prepare_history_payload()
+    elif view.startswith("device360:"):
+        address = view.split(":", 1)[1]
+        activity, activity_error = _build_device360_activity(address)
+        output = {
+            "schema": "zen_prepared_device360_activity_v1",
+            "address": address,
+            "activity": activity,
+            "activity_error": activity_error,
+        }
+    else:
+        raise ValueError(f"Unknown prepared view: {view}")
+    saved = policy_store.save_prepared_view(
+        view_key=view,
+        kind="analytics.prepared-view",
+        scope=str((payload or {}).get("scope") or "analytics:global"),
+        payload=output,
+        source_revision=int(policy_store.current_config_revision().get("revision") or 0),
+        ttl_seconds=ttl_seconds,
+    )
+    return {
+        "schema": "zen_prepared_view_result_v1",
+        "view_key": view,
+        "generation": int(saved.get("generation") or 0),
+        "payload_bytes": int(saved.get("payload_bytes") or 0),
+        "authority": "read-only-derived",
+    }
+
+
+def _background_retention(_payload: dict) -> dict:
+    return {
+        "schema": "zen_background_retention_v1",
+        **policy_store.prune_background_history(
+            retention_days=14, keep_jobs=250, keep_outbox=250
+        ),
+        "authority": "local-bookkeeping-only",
+    }
+
+
+def _schedule_background_analytics() -> int:
+    """Idempotently publish periodic read-side refresh work.
+
+    Two-minute buckets avoid queue floods while refreshing before the shortest
+    prepared-view TTL expires. Configuration revision is part of each
+    identity so stale service/policy semantics are never republished after a write.
+    Device 360 jobs carry only telemetry/activity preparation; RouterOS evidence is
+    still fresh-read synchronously by the request path.
+    """
+    now = datetime.now(timezone.utc)
+    bucket = int(now.timestamp()) // 120
+    revision = int(policy_store.current_config_revision().get("revision") or 0)
+    specs = [
+        ("dashboard:24h", "analytics:dashboard", 180),
+        ("activity:24h", "analytics:activity", 180),
+        ("services:24h", "analytics:services", 180),
+        ("classification:24h", "analytics:classification", 300),
+        ("history:7d", "analytics:history", 300),
+    ]
+    for address in sorted(policy_store.list_device_policy()):
+        if address:
+            specs.append((f"device360:{address}", f"analytics:device:{address}", 150))
+    scheduled = 0
+    for view, scope, ttl in specs:
+        key = f"prepared:{view}:r{revision}:b{bucket}"
+        queued = policy_store.enqueue_background_job(
+            kind="analytics.prepared-view",
+            scope=scope,
+            idempotency_key=key,
+            payload={"view": view, "scope": scope, "ttl_seconds": ttl},
+            max_attempts=3,
+        )
+        if queued and queued.get("created"):
+            scheduled += 1
+    hour_bucket = int(now.timestamp()) // 3600
+    maintenance = policy_store.enqueue_background_job(
+        kind="maintenance.background-retention",
+        scope="maintenance:background",
+        idempotency_key=f"background-retention:h{hour_bucket}",
+        payload={},
+        max_attempts=2,
+    )
+    return scheduled + (1 if maintenance and maintenance.get("created") else 0)
+
+
 background_worker = BackgroundWorker(
     policy_store=policy_store,
-    handlers={"analytics.config-summary": _background_config_analytics},
+    handlers={
+        "analytics.config-summary": _background_config_analytics,
+        "analytics.prepared-view": _background_prepared_view,
+        "maintenance.background-retention": _background_retention,
+    },
+    producer=_schedule_background_analytics,
     audit=audit,
+    max_jobs_per_cycle=12,
 )
 
 
@@ -1690,6 +1988,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     activity_insights = {}
     activity_coverage = {}
     activity_unknown_domains = []
+    prepared_view_evidence = {}
     service_prefill_dns = (
         str(request.query_params.get("prefill_dns") or "").strip().lower().rstrip(".")[:253]
         if active_view == "policies" and active_section == "services" else ""
@@ -1937,74 +2236,103 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         or (active_view == "settings" and active_section == "security")
     ):
         try:
+            managed_ips = [device.get("ip") for device in devices if device.get("ip")]
             telemetry_available = activity_store.health()
-            if telemetry_available:
-                managed_ips = [device.get("ip") for device in devices if device.get("ip")]
-                if active_view == "activity":
-                    activity_overview = activity_store.overview(24)
-                    activity_devices = activity_store.top_devices(24, 12)
-                    observed_services = activity_store.top_services(24, 100)
+            if active_view == "activity":
+                prepared, prepared_meta = _prepared_payload("activity:24h")
+                if prepared and telemetry_available:
+                    prepared_view_evidence["activity"] = prepared_meta
+                    activity_overview = dict(prepared.get("overview") or {})
+                    activity_devices = [dict(row) for row in (prepared.get("devices") or [])]
+                    observed_services = [dict(row) for row in (prepared.get("observed_services") or [])]
                     activity_services = observed_services[:12]
-                    activity_domains = activity_store.dns_top_domains(24, 30)
+                    activity_domains = list(prepared.get("domains") or [])
+                    activity_device_summaries = dict(prepared.get("device_summaries") or {})
+                    dns_service_rows = [dict(row) for row in (prepared.get("dns_service_rows") or [])]
+                    activity_coverage = dict(prepared.get("coverage") or {})
+                    activity_unknown_domains = list(prepared.get("unknown_domains") or [])
+                    activity_insights = dict(prepared.get("activity_insights") or {})
+                else:
+                    if telemetry_available:
+                        activity_overview = activity_store.overview(24)
+                        activity_devices = activity_store.top_devices(24, 12)
+                        observed_services = activity_store.top_services(24, 100)
+                        activity_services = observed_services[:12]
+                        activity_domains = activity_store.dns_top_domains(24, 30)
+                        activity_device_summaries = activity_store.device_activity_summaries(
+                            [row.get("client_ip") for row in activity_devices], 24, 5, 6
+                        )
+                        dns_service_rows = activity_store.dns_top_services(24, 100)
+                        activity_coverage = activity_store.classification_coverage(24)
+                        activity_unknown_domains = activity_store.unknown_domains(24, 30)
+                        activity_insights = {
+                            "observed_services": int(activity_overview.get("observed_services", 0)),
+                            "attributed_percent": float(activity_overview.get("attributed_percent", 0.0)),
+                            "dns_block_percent": float(activity_overview.get("dns_block_percent", 0.0)),
+                            "managed_devices_seen": activity_store.managed_activity_count(managed_ips, 24),
+                            "unique_domains": int(activity_overview.get("unique_domains", 0)),
+                            "latest_flow": activity_overview.get("latest_flow"),
+                            "latest_dns": activity_overview.get("latest_dns"),
+                            "traffic_classified_percent": activity_coverage.get("traffic_percent"),
+                            "dns_classified_percent": activity_coverage.get("dns_percent"),
+                            "traffic_classification_status": activity_coverage.get("traffic_evidence_status", "no_evidence"),
+                            "dns_classification_status": activity_coverage.get("dns_evidence_status", "no_evidence"),
+                            "unknown_domains": int(activity_coverage.get("unknown_domains", 0)),
+                        }
+                if telemetry_available:
                     managed_names = {}
                     for device in devices:
                         ip = str(device.get("ip") or "")
                         if ip:
                             cfg = local_device_policy.get(ip, {})
                             managed_names[ip] = str(cfg.get("alias") or device.get("name") or ip)
-                    activity_device_summaries = activity_store.device_activity_summaries(
-                        [row.get("client_ip") for row in activity_devices], 24, 5, 6
-                    )
                     for row in activity_devices:
                         ip = str(row.get("client_ip") or "")
                         row["managed"] = ip in managed_names
-                        row["display_name"] = managed_names.get(ip, ip)
-                        row["detail"] = activity_device_summaries.get(ip, {})
-                    dns_service_rows = activity_store.dns_top_services(24, 100)
+                        row["display_name"] = managed_names.get(ip, row.get("display_name") or ip)
+                        row["detail"] = activity_device_summaries.get(ip, row.get("detail") or {})
                     activity_policy_services = build_service_intelligence(
                         services, observed_services, dns_service_rows,
                         service_contract_health, policy_group_catalog, local_profiles
                     )
-                    activity_coverage = activity_store.classification_coverage(24)
-                    activity_unknown_domains = activity_store.unknown_domains(24, 30)
-                    activity_insights = {
+                    activity_insights.update({
                         "policy_services": len(services),
                         "policy_services_observed": sum(
                             1 for row in activity_policy_services
                             if row.get("policy_tracked") and row.get("observed")
                         ),
-                        "observed_services": int(activity_overview.get("observed_services", 0)),
-                        "attributed_percent": float(activity_overview.get("attributed_percent", 0.0)),
-                        "dns_block_percent": float(activity_overview.get("dns_block_percent", 0.0)),
                         "managed_devices": len(managed_ips),
-                        "managed_devices_seen": activity_store.managed_activity_count(managed_ips, 24),
-                        "unique_domains": int(activity_overview.get("unique_domains", 0)),
-                        "latest_flow": activity_overview.get("latest_flow"),
-                        "latest_dns": activity_overview.get("latest_dns"),
                         "tls_contracts_healthy": int(service_contract_health.get("healthy", 0)),
                         "tls_contracts_total": int(service_contract_health.get("total", 0)),
                         "detector_addresses": int(service_contract_health.get("detector_addresses", 0)),
-                        "traffic_classified_percent": activity_coverage.get("traffic_percent"),
-                        "dns_classified_percent": activity_coverage.get("dns_percent"),
-                        "traffic_classification_status": activity_coverage.get("traffic_evidence_status", "no_evidence"),
-                        "dns_classification_status": activity_coverage.get("dns_evidence_status", "no_evidence"),
-                        "unknown_domains": int(activity_coverage.get("unknown_domains", 0)),
-                    }
-                if active_view == "dashboard":
-                    activity_coverage = activity_store.classification_coverage(24)
-                    activity_insights = {
-                        "managed_devices": len(managed_ips),
-                        "managed_devices_seen": activity_store.managed_activity_count(managed_ips, 24),
-                        "traffic_classified_percent": activity_coverage.get("traffic_percent"),
-                        "dns_classified_percent": activity_coverage.get("dns_percent"),
-                        "traffic_classification_status": activity_coverage.get("traffic_evidence_status", "no_evidence"),
-                        "dns_classification_status": activity_coverage.get("dns_evidence_status", "no_evidence"),
-                        "unknown_domains": int(activity_coverage.get("unknown_domains", 0)),
-                    }
-                if active_view == "dashboard" or (active_view == "settings" and active_section == "security"):
-                    security_bypass_attempts = activity_store.bypass_attempts(managed_ips, 24, 30)
-                    security_bypass_evidence = activity_store.bypass_evidence(managed_ips, 24, 120)
-                    security_bypass_summary = summarize_bypass_evidence(security_bypass_evidence)
+                    })
+            else:
+                prepared, prepared_meta = _prepared_payload("dashboard:24h")
+                if prepared and telemetry_available:
+                    prepared_view_evidence["dashboard"] = prepared_meta
+                    activity_insights = dict(prepared.get("activity_insights") or {})
+                    activity_coverage = dict(prepared.get("activity_coverage") or {})
+                    security_bypass_attempts = list(prepared.get("security_bypass_attempts") or [])
+                    security_bypass_evidence = list(prepared.get("security_bypass_evidence") or [])
+                    security_bypass_summary = dict(
+                        prepared.get("security_bypass_summary") or summarize_bypass_evidence([])
+                    )
+                    activity_insights["managed_devices"] = len(managed_ips)
+                else:
+                    if telemetry_available:
+                        activity_coverage = activity_store.classification_coverage(24)
+                        activity_insights = {
+                            "managed_devices": len(managed_ips),
+                            "managed_devices_seen": activity_store.managed_activity_count(managed_ips, 24),
+                            "traffic_classified_percent": activity_coverage.get("traffic_percent"),
+                            "dns_classified_percent": activity_coverage.get("dns_percent"),
+                            "traffic_classification_status": activity_coverage.get("traffic_evidence_status", "no_evidence"),
+                            "dns_classification_status": activity_coverage.get("dns_evidence_status", "no_evidence"),
+                            "unknown_domains": int(activity_coverage.get("unknown_domains", 0)),
+                        }
+                        security_bypass_attempts = activity_store.bypass_attempts(managed_ips, 24, 30)
+                        security_bypass_evidence = activity_store.bypass_evidence(managed_ips, 24, 120)
+                        security_bypass_summary = summarize_bypass_evidence(security_bypass_evidence)
         except ActivityError as exc:
             activity_error = str(exc)
 
@@ -2140,6 +2468,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "activity_insights": activity_insights,
             "activity_coverage": activity_coverage,
             "activity_unknown_domains": activity_unknown_domains,
+            "prepared_view_evidence": prepared_view_evidence,
             "service_prefill_dns": service_prefill_dns,
             "activity_error": activity_error,
             "flash_error": request.query_params.get("error"),
@@ -2167,11 +2496,22 @@ def api_activity_overview(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     try:
+        if int(hours) == 24:
+            prepared, meta = _prepared_payload("activity:24h")
+            if prepared and prepared.get("telemetry_available"):
+                return {
+                    "overview": prepared.get("overview") or {},
+                    "devices": list(prepared.get("devices") or [])[:20],
+                    "services": list(prepared.get("observed_services") or [])[:20],
+                    "domains": list(prepared.get("domains") or [])[:20],
+                    "prepared_view": meta,
+                }
         return {
             "overview": activity_store.overview(hours),
             "devices": activity_store.top_devices(hours, 20),
             "services": activity_store.top_services(hours, 20),
             "domains": activity_store.dns_top_domains(hours, 20),
+            "prepared_view": None,
         }
     except ActivityError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -2202,8 +2542,19 @@ def api_activity_services(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     try:
-        observed = activity_store.top_services(hours, 100)
-        dns_rows = activity_store.dns_top_services(hours, 100)
+        prepared = meta = None
+        if int(hours) == 24:
+            prepared, meta = _prepared_payload("services:24h")
+        if prepared and prepared.get("telemetry_available"):
+            observed = [dict(row) for row in (prepared.get("traffic") or [])]
+            dns_rows = [dict(row) for row in (prepared.get("dns") or [])]
+            coverage = dict(prepared.get("coverage") or {})
+            unknown = list(prepared.get("unknown_domains") or [])
+        else:
+            observed = activity_store.top_services(hours, 100)
+            dns_rows = activity_store.dns_top_services(hours, 100)
+            coverage = activity_store.classification_coverage(hours)
+            unknown = activity_store.unknown_domains(hours, 50)
         try:
             health = router.get_service_contract_health()
         except RouterError:
@@ -2215,9 +2566,10 @@ def api_activity_services(
                 policy_store.policy_group_catalog(), policy_store.list_profiles()
             ),
             "dns": dns_rows,
-            "coverage": activity_store.classification_coverage(hours),
-            "unknown_domains": activity_store.unknown_domains(hours, 50),
+            "coverage": coverage,
+            "unknown_domains": unknown,
             "routeros": health,
+            "prepared_view": meta,
         }
     except ActivityError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -2468,10 +2820,26 @@ def api_activity_analytics(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     try:
+        selected = str(client_ip or "").strip() or None
+        if (str(period or "7d").lower() == "7d" and not selected and not start and not end):
+            prepared, meta = _prepared_payload("history:7d")
+            if prepared:
+                return {
+                    "window": prepared.get("window") or {},
+                    "current": prepared.get("current") or {},
+                    "previous": prepared.get("previous") or {},
+                    "comparison": prepared.get("comparison") or {},
+                    "daily": prepared.get("daily") or [],
+                    "services": prepared.get("services") or [],
+                    "domains": prepared.get("domains") or [],
+                    "new_domains": prepared.get("new_domains") or [],
+                    "timeline": prepared.get("timeline") or [],
+                    "active_periods": [],
+                    "prepared_view": meta,
+                }
         settings = policy_store.get_settings()
         timezone_name = settings.get("policy_timezone", "Europe/London")
         window = resolve_activity_window(period, timezone_name, start, end)
-        selected = str(client_ip or "").strip() or None
         if selected:
             import ipaddress as _ipaddress
             _ipaddress.ip_address(selected)
@@ -2488,6 +2856,7 @@ def api_activity_analytics(
             "new_domains": activity_store.new_domains_range(window["start"], window["end"], 30, 50, selected),
             "timeline": activity_store.evidence_timeline(window["start"], window["end"], selected, 160),
             "active_periods": activity_store.active_periods(selected, window["start"], window["end"], 30, 50) if selected else [],
+            "prepared_view": None,
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2509,35 +2878,54 @@ def activity_analytics_page(
     names = _activity_managed_names()
     error = None
     selected = str(client_ip or "").strip()
+    prepared_meta = None
     try:
-        if selected:
-            import ipaddress as _ipaddress
-            _ipaddress.ip_address(selected)
-        window = resolve_activity_window(period, timezone_name, start, end)
-        current = activity_store.overview_range(window["start"], window["end"], selected or None)
-        previous = activity_store.overview_range(window["previous_start"], window["previous_end"], selected or None)
-        comparison = compare_activity_totals(current, previous)
-        daily = activity_store.daily_history(window["start"], window["end"], timezone_name, selected or None)
-        top_devices = activity_store.top_devices_range(window["start"], window["end"], 24)
-        _decorate_activity_identity(top_devices, names)
-        services = activity_store.top_services_range(window["start"], window["end"], 30, selected or None)
-        service_defs = policy_store.list_services()
-        keys_by_name = {str(item.get("name") or "").lower(): str(item.get("key") or "") for item in service_defs}
-        for item in services:
-            item["service_key"] = keys_by_name.get(str(item.get("service_name") or "").lower(), "")
-        domains = activity_store.top_domains_range(window["start"], window["end"], 60, selected or None)
-        new_domains = activity_store.new_domains_range(window["start"], window["end"], 30, 60, selected or None)
-        timeline = activity_store.evidence_timeline(window["start"], window["end"], selected or None, 180)
-        _decorate_activity_identity(timeline, names)
-        for item in timeline:
-            item["local_time"] = _activity_local_timestamp(item.get("event_time"), timezone_name)
-        active_periods = activity_store.active_periods(selected, window["start"], window["end"], 30, 60) if selected else []
-        for item in active_periods:
-            item["local_start"] = _activity_local_timestamp(item.get("start"), timezone_name)
-            item["local_end"] = _activity_local_timestamp(item.get("end"), timezone_name)
-        for item in new_domains:
-            item["local_first_seen"] = _activity_local_timestamp(item.get("first_seen"), timezone_name)
-        selected_name = names.get(selected, selected) if selected else "All devices"
+        prepared = None
+        if (str(period or "7d").lower() == "7d" and not selected and not start and not end):
+            prepared, prepared_meta = _prepared_payload("history:7d")
+        if prepared:
+            window = dict(prepared.get("window") or {})
+            current = dict(prepared.get("current") or {})
+            previous = dict(prepared.get("previous") or {})
+            comparison = dict(prepared.get("comparison") or {})
+            daily = list(prepared.get("daily") or [])
+            top_devices = [dict(row) for row in (prepared.get("top_devices") or [])]
+            services = [dict(row) for row in (prepared.get("services") or [])]
+            domains = list(prepared.get("domains") or [])
+            new_domains = [dict(row) for row in (prepared.get("new_domains") or [])]
+            timeline = [dict(row) for row in (prepared.get("timeline") or [])]
+            active_periods = []
+            timezone_name = str(prepared.get("timezone_name") or timezone_name)
+            selected_name = "All devices"
+        else:
+            if selected:
+                import ipaddress as _ipaddress
+                _ipaddress.ip_address(selected)
+            window = resolve_activity_window(period, timezone_name, start, end)
+            current = activity_store.overview_range(window["start"], window["end"], selected or None)
+            previous = activity_store.overview_range(window["previous_start"], window["previous_end"], selected or None)
+            comparison = compare_activity_totals(current, previous)
+            daily = activity_store.daily_history(window["start"], window["end"], timezone_name, selected or None)
+            top_devices = activity_store.top_devices_range(window["start"], window["end"], 24)
+            _decorate_activity_identity(top_devices, names)
+            services = activity_store.top_services_range(window["start"], window["end"], 30, selected or None)
+            service_defs = policy_store.list_services()
+            keys_by_name = {str(item.get("name") or "").lower(): str(item.get("key") or "") for item in service_defs}
+            for item in services:
+                item["service_key"] = keys_by_name.get(str(item.get("service_name") or "").lower(), "")
+            domains = activity_store.top_domains_range(window["start"], window["end"], 60, selected or None)
+            new_domains = activity_store.new_domains_range(window["start"], window["end"], 30, 60, selected or None)
+            timeline = activity_store.evidence_timeline(window["start"], window["end"], selected or None, 180)
+            _decorate_activity_identity(timeline, names)
+            for item in timeline:
+                item["local_time"] = _activity_local_timestamp(item.get("event_time"), timezone_name)
+            active_periods = activity_store.active_periods(selected, window["start"], window["end"], 30, 60) if selected else []
+            for item in active_periods:
+                item["local_start"] = _activity_local_timestamp(item.get("start"), timezone_name)
+                item["local_end"] = _activity_local_timestamp(item.get("end"), timezone_name)
+            for item in new_domains:
+                item["local_first_seen"] = _activity_local_timestamp(item.get("first_seen"), timezone_name)
+            selected_name = names.get(selected, selected) if selected else "All devices"
     except (ActivityError, ValueError) as exc:
         error = str(exc)
         try:
@@ -2548,6 +2936,7 @@ def activity_analytics_page(
         comparison = {}
         daily = top_devices = services = domains = new_domains = timeline = active_periods = []
         selected_name = names.get(selected, selected) if selected else "All devices"
+        prepared_meta = None
 
     return templates.TemplateResponse(
         "activity_analytics.html",
@@ -2572,6 +2961,7 @@ def activity_analytics_page(
             "timeline": timeline,
             "active_periods": active_periods,
             "timezone_name": timezone_name,
+            "prepared_view": prepared_meta,
             "error": error,
         },
         status_code=503 if error else 200,
@@ -2771,7 +3161,11 @@ def api_activity_classification(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     try:
-        return _classification_workbench_payload(hours)
+        if int(hours) == 24:
+            prepared, meta = _prepared_payload("classification:24h")
+            if prepared:
+                return {**prepared, "prepared_view": meta}
+        return {**_classification_workbench_payload(hours), "prepared_view": None}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except ActivityError as exc:
@@ -2786,7 +3180,11 @@ def activity_classification_page(
 ):
     error = None
     try:
-        payload = _classification_workbench_payload(hours)
+        prepared = meta = None
+        if int(hours) == 24:
+            prepared, meta = _prepared_payload("classification:24h")
+        payload = dict(prepared) if prepared else _classification_workbench_payload(hours)
+        payload["prepared_view"] = meta
     except (ValueError, ActivityError) as exc:
         error = str(exc)
         payload = {
@@ -2802,6 +3200,7 @@ def activity_classification_page(
             "evidence_note": (
                 "Classification evidence is unavailable. ZEN does not convert missing telemetry into zero activity."
             ),
+            "prepared_view": None,
         }
     return templates.TemplateResponse(
         "classification.html",
@@ -4616,7 +5015,19 @@ def api_config_revision(
 def api_background_status(
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
-    return background_worker.snapshot()
+    snapshot = background_worker.snapshot()
+    snapshot["prepared_views"] = policy_store.list_prepared_views(50)
+    return snapshot
+
+
+@app.get("/api/background/prepared-views")
+def api_background_prepared_views(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return {
+        "revision": policy_store.current_config_revision(),
+        "views": policy_store.list_prepared_views(100),
+    }
 
 
 @app.get("/api/reconciler/status")

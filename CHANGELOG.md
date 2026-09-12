@@ -2,6 +2,19 @@
 
 All notable ZEN Control release slices are recorded here. ZEN is developed as evidence-led, bounded slices; historical entries describe the authority and evidence contracts that were current for that release.
 
+## v0.54.1 — Background analytics & prepared views
+
+- Adds durable `prepared_views` rows as bounded current read models rather than an unbounded cache/history table. Each row records source configuration revision, capture/expiry time, payload size and generation.
+- Adds revision-aware and age-aware prepared-view reads. A view derived from an older configuration revision is never silently served after policy/service configuration changes.
+- Adds periodic idempotent background refresh jobs for Dashboard telemetry, Activity overview, service intelligence inputs, Classification Intelligence, default 7-day history and per-device Device 360 activity evidence.
+- Keeps RouterOS out of the background analytics worker. Device 360 prepares only telemetry/activity evidence; live policy/enforcement evidence continues to use the synchronous fresh RouterOS read path.
+- Uses prepared views on the main Dashboard/Activity paths and the common Activity, Services, Classification, 7-day History and Device 360 read surfaces, with live-query fallback when prepared evidence is missing, expired or stale.
+- Adds bounded terminal job/outbox maintenance. Active/running work is never pruned and a floor of recent durable bookkeeping is retained.
+- Extends background status with prepared-view inventory and adds the read-only `/api/background/prepared-views` endpoint.
+- Surfaces prepared-view age/revision evidence in the UI so faster reads do not hide evidence freshness.
+
+Authority boundary: v0.54.1 adds no RouterOS write path. Prepared views are derived read-side evidence only; the reconciler remains the normal enforcement writer and authority-changing operations remain serialized.
+
 ## v0.54.0 — Revisioned state & background-work foundation
 
 - Adds a durable configuration revision journal with a singleton monotonic revision, actor/reason/scope evidence and a read-only revision API.

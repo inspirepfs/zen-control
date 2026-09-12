@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
   <title>Device 360 · {{snapshot.device.name}} · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/device360.css?v=0.54.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/device360.css?v=0.54.1">
 </head>
 <body class="standalone-page">
 <header class="standalone-header">
@@ -28,6 +28,7 @@
 <main>
 {% set page_help = zen_help('device_360') %}
 {% include "_context_help.jinja" %}
+{% if snapshot.prepared_view %}<div class="local-only-note">Activity evidence prepared {{snapshot.prepared_view.age_seconds|round(1)}}s ago · config revision {{snapshot.prepared_view.source_revision}}. RouterOS authority evidence below is still read fresh.</div>{% endif %}
 <section class="card device360-hero">
   <div class="card-heading">
     <div>

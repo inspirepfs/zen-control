@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
   <title>Classification Intelligence · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.0">
-  <link rel="stylesheet" href="/static/classification-intelligence.css?v=0.54.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/activity.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.1">
+  <link rel="stylesheet" href="/static/classification-intelligence.css?v=0.54.1">
 </head>
 <body class="standalone-page">
 <main class="page-shell classification-page">
@@ -20,6 +20,7 @@
     <div class="activity-page-actions"><a class="button-link secondary back-link" href="/?view=activity&amp;section=classification#activity/classification">Back to Activity</a><a class="button-link secondary" href="/?view=policies&amp;section=services#policies/services">Service definitions</a><a class="button-link secondary" href="/activity/analytics?period=7d">Historical analytics</a></div>
   </header>
 
+  {% if prepared_view %}<div class="local-only-note">Prepared read model · {{prepared_view.age_seconds|round(1)}}s old · config revision {{prepared_view.source_revision}} · generation {{prepared_view.generation}}</div>{% endif %}
   {% if error %}<section class="card"><div class="conflict-warning">{{error}}</div><p class="muted small">No zero-activity inference is made while telemetry is unavailable.</p></section>{% endif %}
   {% if degraded_evidence %}<section class="card"><div class="conflict-warning">DEGRADED EVIDENCE · one or more classification evidence or consumer components are unavailable, stale, fallback or inconsistent. Healthy evidence remains visible and ZEN never converts a degraded source into zero.</div>{% for item in evidence_errors %}<p class="muted small">{{item.source or item.component or 'telemetry'}} · {{item.error}}</p>{% endfor %}</section>{% endif %}
 

@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.54.0** — revisioned state and durable background-work foundation.
+> Current release: **v0.54.1** — revisioned state and durable background-work foundation.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -41,6 +41,7 @@ ZEN currently provides:
 - Cloudflare Access/Tunnel remote access and split-DNS local HTTPS.
 - Controlled migration from MikroTik Kid Control with guarded cutover and rollback.
 - Revisioned configuration state, optimistic concurrency, a transactional outbox and durable read-side background jobs.
+- Prepared read models for Dashboard, Activity, Classification, Services, 7-day history and Device 360 activity evidence, with revision/age gating and bounded maintenance.
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
@@ -257,6 +258,6 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## License
 
-A final open-source license is intentionally **not selected in v0.54.0**. The repository may be reviewed privately while the choice between a strong network copyleft license (AGPL-3.0) and a permissive license (Apache-2.0) is made. **Choose and add the root `LICENSE` file before changing the GitHub repository to public.**
+A final open-source license is intentionally **not selected in v0.54.1**. The repository may be reviewed privately while the choice between a strong network copyleft license (AGPL-3.0) and a permissive license (Apache-2.0) is made. **Choose and add the root `LICENSE` file before changing the GitHub repository to public.**
 
 That is an explicit public-release gate, not an accidental omission. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
