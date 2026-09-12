@@ -28,18 +28,18 @@ Add focused hostile/regression tests for changes to authentication, authority, m
 
 ## Release patch workflow
 
-`python3 scripts/release_patch.py` automates the qualified host release path: exact `-p0` patch dry-run/application, validation, bounded Compose rebuild, health proof, Git stage/commit/push, GitHub Actions watch, and optional annotated tag push.
+`python3 scripts/release_patch.py` automates the qualified host release path: exact `-p0` patch dry-run/application, validation, affected-service Compose rebuild, app/runtime/topology health proof, Git stage/commit/push, GitHub Actions watch, and optional annotated tag push.
 
-The safe default rebuild target is `mikrotik-control`; use repeated `--rebuild-service` options or `--rebuild-all` only when a release actually changes other services. Relative patch names are resolved from the repository and then `../`, matching the normal host layout. Tagging is fail-closed behind a successful watched GitHub Actions run unless an explicit `--allow-tag-without-ci` exception is supplied.
+The safe default is automatic affected-service detection from the release delta; repeated `--rebuild-service` options add explicit services and `--rebuild-all` deliberately expands the deployment to the whole Compose project. Relative patch names are resolved from the repository and then `../`, matching the normal host layout. Tagging is fail-closed behind a successful watched GitHub Actions run unless an explicit `--allow-tag-without-ci` exception is supplied.
 
 Typical release:
 
 ```bash
 python3 scripts/release_patch.py \
-  --patch zen-control-v0.54.2-example.patch \
-  --message "Release v0.54.2 example" \
-  --expect-version 0.54.2 \
-  --tag v0.54.2
+  --patch zen-control-v0.54.3-example.patch \
+  --message "Release v0.54.3 example" \
+  --expect-version 0.54.3 \
+  --tag v0.54.3
 ```
 
 When a patch has already been applied intentionally, resume from the dirty release tree instead of applying it again:
@@ -47,7 +47,7 @@ When a patch has already been applied intentionally, resume from the dirty relea
 ```bash
 python3 scripts/release_patch.py \
   --resume \
-  --message "Fix v0.54.2 clean-runner CI qualification"
+  --message "Fix v0.54.3 clean-runner CI qualification"
 ```
 
 Use `--dry-run` to print the planned commands without modifying source, Git or containers. Run `python3 scripts/release_patch.py --help` for all workflow switches.

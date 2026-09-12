@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.54.2** — parallel observation with serialized RouterOS enforcement.
+> Current release: **v0.54.3** — topology-aware release deployment and embedded-worker health closure.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -44,6 +44,7 @@ ZEN currently provides:
 - Prepared read models for Dashboard, Activity, Classification, Services, 7-day history and Device 360 activity evidence, with revision/age gating and bounded maintenance.
 - Bounded parallel device observation/planning in the automatic reconciler, with deterministic results and per-device failure isolation.
 - A process-wide re-entrant RouterOS mutation lane that serializes app-owned writes while leaving read-only observation parallel-capable.
+- Topology-aware release deployment that rebuilds affected Compose services and proves the pre-release service topology plus embedded workers recovered before publication/tagging.
 
 Automatic-reconciler observation concurrency is controlled by `ZEN_ROUTER_OBSERVE_WORKERS` (default `4`, bounded to `1`–`8`). It changes only read-side planning fan-out; it does not create additional RouterOS write authority and does not bypass the fresh serial proof performed before mutation.
 
@@ -262,6 +263,6 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## License
 
-A final open-source license is intentionally **not selected in v0.54.2**. The repository may be reviewed privately while the choice between a strong network copyleft license (AGPL-3.0) and a permissive license (Apache-2.0) is made. **Choose and add the root `LICENSE` file before changing the GitHub repository to public.**
+A final open-source license is intentionally **not selected in v0.54.3**. The repository may be reviewed privately while the choice between a strong network copyleft license (AGPL-3.0) and a permissive license (Apache-2.0) is made. **Choose and add the root `LICENSE` file before changing the GitHub repository to public.**
 
 That is an explicit public-release gate, not an accidental omission. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).

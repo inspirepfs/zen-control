@@ -5,7 +5,7 @@ The workflow is intentionally fail-closed around source state and CI:
 
 1. exact dry-run + apply of a -p0 patch;
 2. source/host validation;
-3. bounded container rebuild + health check;
+3. topology-aware affected-service rebuild + app/runtime/topology health proof;
 4. Git stage/check/commit/push;
 5. wait for the GitHub Actions workflow attached to the pushed commit;
 6. create and push an annotated tag only after CI succeeds.
@@ -31,6 +31,15 @@ from typing import Iterable, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH_BAD_OUTPUT = re.compile(r"\b(?:offset|fuzz|reversed|previously applied|failed)\b", re.IGNORECASE)
+
+SERVICE_PATH_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("mikrotik-control", ("app/", "Dockerfile", "requirements.txt")),
+    ("traffic-ingest", ("telemetry/ingest/",)),
+    ("goflow2", ("telemetry/goflow2/",)),
+    ("zen-local-https", ("deploy/caddy/",)),
+)
+ONE_SHOT_SERVICES = {"flow-pipe-init"}
+
 
 
 class WorkflowError(RuntimeError):
@@ -134,6 +143,297 @@ def tag_target(tag: str | None, *, dry_run: bool = False) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
 
 
+def _git_text(ref: str, path: str) -> str | None:
+    proc = run(["git", "show", f"{ref}:{path}"], capture=True, quiet=True, check=False)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _compose_blocks(text: str) -> tuple[dict[str, str], str]:
+    """Split Compose service blocks without evaluating secrets or interpolation."""
+    lines = text.splitlines(keepends=True)
+    services_index = next((idx for idx, line in enumerate(lines) if line.rstrip() == "services:"), None)
+    if services_index is None:
+        return {}, text
+
+    blocks: dict[str, list[str]] = {}
+    prefix = lines[: services_index + 1]
+    suffix: list[str] = []
+    current: str | None = None
+    service_section = True
+    for line in lines[services_index + 1 :]:
+        if service_section and line and not line.startswith((" ", "\t", "\r", "\n")):
+            service_section = False
+            current = None
+        if service_section:
+            match = re.match(r"^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$", line.rstrip("\n"))
+            if match:
+                current = match.group(1)
+                blocks[current] = [line]
+                continue
+            if current is not None:
+                blocks[current].append(line)
+        else:
+            suffix.append(line)
+    rendered = {name: "".join(rows) for name, rows in blocks.items()}
+    return rendered, "".join(prefix + suffix)
+
+
+def changed_compose_services(before: str | None, after: str) -> set[str]:
+    after_blocks, after_outer = _compose_blocks(after)
+    if before is None:
+        return set(after_blocks)
+    before_blocks, before_outer = _compose_blocks(before)
+    changed = {
+        name
+        for name in set(before_blocks) | set(after_blocks)
+        if before_blocks.get(name) != after_blocks.get(name)
+    }
+    # Top-level resource changes can alter any service even when its inline
+    # block is textually stable. Be conservative rather than missing a recreate.
+    if before_outer != after_outer:
+        changed.update(after_blocks)
+    return changed
+
+
+def service_path_matches(path: str, pattern: str) -> bool:
+    path = str(path).lstrip("./")
+    if pattern.endswith("/"):
+        return path.startswith(pattern)
+    return path == pattern
+
+
+def affected_services(changed_paths: Iterable[str], *, baseline_ref: str | None = None) -> list[str]:
+    paths = sorted({str(path).strip() for path in changed_paths if str(path).strip()})
+    affected: set[str] = set()
+    for service, patterns in SERVICE_PATH_RULES:
+        if any(service_path_matches(path, pattern) for path in paths for pattern in patterns):
+            affected.add(service)
+
+    if "docker-compose.yml" in paths:
+        before = _git_text(baseline_ref, "docker-compose.yml") if baseline_ref else None
+        after = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        affected.update(changed_compose_services(before, after))
+
+    # SQL init scripts do not migrate an existing PostgreSQL volume. Recreating
+    # telemetry-db would falsely imply the schema change had been applied.
+    if any(path.startswith("telemetry/postgres/") for path in paths):
+        raise WorkflowError(
+            "telemetry/postgres changed; existing PostgreSQL volumes require an explicit migration plan "
+            "rather than an automatic container recreate"
+        )
+    return sorted(affected)
+
+
+def changed_paths_since(base_ref: str, *, include_worktree: bool) -> list[str]:
+    cmd = ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB"]
+    cmd.append(base_ref if include_worktree else f"{base_ref}..HEAD")
+    proc = run(cmd, capture=True, quiet=True)
+    paths = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    if include_worktree:
+        untracked = run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            capture=True,
+            quiet=True,
+        )
+        paths.update(line.strip() for line in untracked.stdout.splitlines() if line.strip())
+    return sorted(paths)
+
+
+def parse_compose_ps(text: str) -> dict[str, dict]:
+    payload = (text or "").strip()
+    if not payload:
+        return {}
+    rows: list[dict] = []
+    try:
+        parsed = json.loads(payload)
+        if isinstance(parsed, dict):
+            rows = [parsed]
+        elif isinstance(parsed, list):
+            rows = [row for row in parsed if isinstance(row, dict)]
+    except json.JSONDecodeError:
+        for line in payload.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise WorkflowError(f"unable to parse docker compose ps JSON: {exc}") from exc
+            if isinstance(row, dict):
+                rows.append(row)
+    result: dict[str, dict] = {}
+    for row in rows:
+        service = str(row.get("Service") or row.get("service") or "").strip()
+        if service:
+            result[service] = row
+    return result
+
+
+def compose_ps(*, dry_run: bool = False) -> dict[str, dict]:
+    if dry_run:
+        return {}
+    proc = run(
+        ["docker", "compose", "--profile", "*", "ps", "--all", "--format", "json"],
+        capture=True,
+        quiet=True,
+    )
+    return parse_compose_ps(proc.stdout)
+
+
+def configured_compose_services(*, dry_run: bool = False) -> list[str]:
+    if dry_run:
+        return []
+    proc = run(["docker", "compose", "config", "--services"], capture=True, quiet=True)
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _row_state(row: dict) -> str:
+    return str(row.get("State") or row.get("state") or "").strip().lower()
+
+
+def _row_health(row: dict) -> str:
+    return str(row.get("Health") or row.get("health") or "").strip().lower()
+
+
+def _row_exit_code(row: dict) -> int | None:
+    value = row.get("ExitCode", row.get("exitCode", row.get("exit_code")))
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def topology_requirements(
+    before: dict[str, dict],
+    targets: Iterable[str],
+    *,
+    rebuild_all: bool,
+    configured_services: Iterable[str],
+) -> dict[str, str]:
+    required: dict[str, str] = {}
+    for service, row in before.items():
+        state = _row_state(row)
+        if state == "running":
+            required[service] = "running"
+        elif state == "exited" and _row_exit_code(row) == 0:
+            required[service] = "completed"
+
+    desired = set(configured_services) if rebuild_all else set(targets)
+    for service in desired:
+        required[service] = "completed" if service in ONE_SHOT_SERVICES else "running"
+    return required
+
+
+def topology_failures(after: dict[str, dict], requirements: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    for service, expectation in sorted(requirements.items()):
+        row = after.get(service)
+        if row is None:
+            failures.append(f"{service}=missing")
+            continue
+        state = _row_state(row)
+        health = _row_health(row)
+        if expectation == "running":
+            if state != "running":
+                failures.append(f"{service}=state:{state or 'unknown'}")
+                continue
+            if health and health != "healthy":
+                failures.append(f"{service}=health:{health}")
+        elif expectation == "completed":
+            if state != "exited" or _row_exit_code(row) != 0:
+                failures.append(
+                    f"{service}=state:{state or 'unknown'}/exit:{_row_exit_code(row)}"
+                )
+    return failures
+
+
+def wait_for_topology(
+    requirements: dict[str, str],
+    timeout: int,
+    *,
+    dry_run: bool = False,
+) -> None:
+    if dry_run:
+        print(f"Topology health: DRY-RUN · required={','.join(sorted(requirements)) or '-'}", flush=True)
+        return
+    deadline = time.monotonic() + timeout
+    last_failures: list[str] = ["not checked"]
+    while time.monotonic() < deadline:
+        rows = compose_ps()
+        last_failures = topology_failures(rows, requirements)
+        if not last_failures:
+            running = sum(1 for state in requirements.values() if state == "running")
+            completed = sum(1 for state in requirements.values() if state == "completed")
+            print(
+                f"Topology health: PASS · running={running} completed={completed} "
+                f"services={len(requirements)}",
+                flush=True,
+            )
+            return
+        time.sleep(2)
+    raise WorkflowError(
+        f"deployment topology did not recover within {timeout}s: {', '.join(last_failures)}"
+    )
+
+
+def wait_for_runtime_health(
+    url: str,
+    timeout: int,
+    expected_version: str | None,
+    *,
+    dry_run: bool = False,
+) -> None:
+    print(f"Runtime health: {url}", flush=True)
+    if dry_run:
+        print("Runtime health: DRY-RUN", flush=True)
+        return
+    deadline = time.monotonic() + timeout
+    last_error = "no response"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                body = response.read(16384).decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    last_error = f"non-JSON response: {exc}"
+                    time.sleep(2)
+                    continue
+                if response.status >= 400 or not payload.get("ok"):
+                    last_error = f"HTTP {response.status} status={payload.get('status')!r}"
+                    time.sleep(2)
+                    continue
+                if expected_version and str(payload.get("version") or "") != expected_version:
+                    last_error = (
+                        f"version={payload.get('version')!r}, expected={expected_version!r}"
+                    )
+                    time.sleep(2)
+                    continue
+                workers = payload.get("workers") or {}
+                alive = sum(1 for row in workers.values() if isinstance(row, dict) and row.get("alive"))
+                observers = (payload.get("parallel_observation") or {}).get("configured_workers", "?")
+                print(
+                    f"Runtime health: PASS · workers={alive}/{len(workers)} observers={observers}",
+                    flush=True,
+                )
+                return
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read(8192).decode("utf-8", errors="replace")
+                payload = json.loads(body)
+                last_error = f"HTTP {exc.code} status={payload.get('status')!r}"
+            except Exception:
+                last_error = f"HTTP {exc.code}"
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = str(exc)
+        time.sleep(2)
+    raise WorkflowError(f"runtime health did not pass within {timeout}s: {last_error}")
+
+
 def apply_patch(path: Path, *, dry_run: bool = False) -> None:
     base = ["patch", "--batch", "--forward", "--fuzz=0", "-p0", "-i", str(path)]
     probe = run(["patch", "--dry-run", *base[1:]], capture=True, check=False, dry_run=dry_run)
@@ -163,7 +463,10 @@ def validate(*, dry_run: bool = False) -> None:
 
 
 def rebuild(services: list[str], *, all_services: bool, no_deps: bool, dry_run: bool = False) -> None:
-    cmd = ["docker", "compose", "up", "-d", "--build"]
+    if not all_services and not services:
+        print("Rebuild: no deployment-impacting services detected", flush=True)
+        return
+    cmd = ["docker", "compose", "up", "-d", "--build", "--force-recreate"]
     if no_deps:
         cmd.append("--no-deps")
     if not all_services:
@@ -319,16 +622,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--branch", help="Branch to push; defaults to the current branch.")
     parser.add_argument("--workflow", default="Quality", help="GitHub Actions workflow name to watch (default: Quality).")
     parser.add_argument("--run-discovery-timeout", type=int, default=120, help="Seconds to wait for the pushed CI run.")
-    parser.add_argument("--rebuild-service", action="append", default=[], metavar="SERVICE", help="Compose service to rebuild; repeatable. Default: mikrotik-control.")
-    parser.add_argument("--rebuild-all", action="store_true", help="Rebuild/start every Compose service instead of selected services.")
+    parser.add_argument("--rebuild-service", action="append", default=[], metavar="SERVICE", help="Additional Compose service to rebuild; repeatable. Auto-detected affected services are included by default.")
+    parser.add_argument("--rebuild-all", action="store_true", help="Rebuild/start every Compose service instead of the affected-service plan.")
+    parser.add_argument("--no-auto-services", action="store_true", help="Disable affected-service detection and use only --rebuild-service targets.")
     parser.add_argument("--no-deps", action="store_true", help="Pass --no-deps to docker compose up.")
     parser.add_argument("--health-url", default="http://127.0.0.1:8080/health/live", help="Post-rebuild health URL.")
-    parser.add_argument("--health-timeout", type=int, default=60, help="Seconds to wait for health after rebuild.")
-    parser.add_argument("--expect-version", help="Require this version in the JSON health response.")
+    parser.add_argument("--health-timeout", type=int, default=60, help="Seconds to wait for app/runtime health after rebuild.")
+    parser.add_argument("--runtime-health-url", default="http://127.0.0.1:8080/health/runtime", help="Post-rebuild embedded-worker health URL.")
+    parser.add_argument("--topology-timeout", type=int, default=90, help="Seconds to wait for the pre-existing Compose topology to recover.")
+    parser.add_argument("--expect-version", help="Require this version in the JSON health responses.")
     parser.add_argument("--stage", action="append", default=[], metavar="PATH", help="Stage only this path; repeatable. Default: git add -A.")
     parser.add_argument("--skip-validate", action="store_true")
     parser.add_argument("--skip-rebuild", action="store_true")
     parser.add_argument("--skip-health", action="store_true")
+    parser.add_argument("--skip-runtime-health", action="store_true")
+    parser.add_argument("--skip-topology-health", action="store_true")
     parser.add_argument("--skip-push", action="store_true")
     parser.add_argument("--skip-watch", action="store_true")
     parser.add_argument("--allow-tag-without-ci", action="store_true", help="Permit --tag with --skip-watch. Use only for an intentional exception.")
@@ -350,7 +658,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise WorkflowError("--tag requires pushing the commit first")
     if args.tag and args.skip_watch and not args.allow_tag_without_ci:
         raise WorkflowError("refusing --tag with --skip-watch; add --allow-tag-without-ci for an intentional exception")
-    if args.health_timeout < 1 or args.run_discovery_timeout < 1:
+    if args.health_timeout < 1 or args.topology_timeout < 1 or args.run_discovery_timeout < 1:
         raise WorkflowError("timeouts must be positive")
 
 
@@ -370,7 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         patch = None if args.resume else resolve_patch(args.patch)
         branch = args.branch or current_branch(dry_run=args.dry_run)
-        services = args.rebuild_service or ["mikrotik-control"]
+        services = list(args.rebuild_service)
         message = load_message(args, patch)
         tag_message = args.tag_message or message.splitlines()[0]
 
@@ -397,7 +705,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if patch:
             print(f"patch={patch}")
         print(f"branch={branch} remote={args.remote}")
-        print(f"rebuild={'ALL' if args.rebuild_all else ','.join(services)}")
+        print(f"rebuild={'ALL' if args.rebuild_all else ('auto+' + ','.join(services) if services else 'auto')}")
         print(f"workflow={args.workflow} tag={args.tag or '-'}")
         if args.resume:
             state = "dirty-tree"
@@ -415,6 +723,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         if patch:
             apply_patch(patch, dry_run=args.dry_run)
 
+        # Build an affected-service plan from the actual release delta. A dirty
+        # tree is compared with the pre-release HEAD; a clean unpublished resume
+        # is compared with the remote branch it will replace.
+        change_base = head_before
+        include_worktree = True
+        if args.resume and resume_clean and remote_before and remote_before != head_before:
+            change_base = remote_before
+            include_worktree = False
+        release_paths = (
+            []
+            if already_published or args.dry_run
+            else changed_paths_since(change_base, include_worktree=include_worktree)
+        )
+        auto_services: list[str] = []
+        if not args.no_auto_services and release_paths:
+            auto_services = affected_services(release_paths, baseline_ref=change_base)
+        if not args.rebuild_all:
+            services = sorted(set(auto_services) | set(services))
+        print(f"changed_paths={len(release_paths)}")
+        print(f"affected_services={'ALL' if args.rebuild_all else (','.join(services) or '-')}")
+
         # A clean --resume at a commit already present on origin is a publish/tag
         # continuation, not a reason to rerun the entire host qualification and
         # certainly not a reason to manufacture an empty commit.
@@ -422,9 +751,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.skip_validate:
                 validate(dry_run=args.dry_run)
             if not args.skip_rebuild:
+                topology_before = compose_ps(dry_run=args.dry_run)
+                configured = configured_compose_services(dry_run=args.dry_run)
+                requirements = topology_requirements(
+                    topology_before,
+                    services,
+                    rebuild_all=args.rebuild_all,
+                    configured_services=configured,
+                )
                 rebuild(services, all_services=args.rebuild_all, no_deps=args.no_deps, dry_run=args.dry_run)
                 if not args.skip_health:
                     wait_for_health(args.health_url, args.health_timeout, args.expect_version, dry_run=args.dry_run)
+                if not args.skip_runtime_health:
+                    wait_for_runtime_health(
+                        args.runtime_health_url,
+                        args.health_timeout,
+                        args.expect_version,
+                        dry_run=args.dry_run,
+                    )
+                if not args.skip_topology_health:
+                    wait_for_topology(requirements, args.topology_timeout, dry_run=args.dry_run)
 
         commit_sha = head_before
         if not resume_clean or patch:

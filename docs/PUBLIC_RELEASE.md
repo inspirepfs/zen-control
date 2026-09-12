@@ -19,14 +19,16 @@ This checklist is deliberately conservative because ZEN can control a real house
 
 ## Automated host release path
 
-The supported host-side orchestration helper is `scripts/release_patch.py`. It preserves the manual gates rather than hiding them: patch application rejects fuzz/offset/reversed evidence, source validation must pass, the selected containers must rebuild and become healthy, Git staging must be clean, the pushed commit must pass the selected GitHub Actions workflow, and only then may an annotated release tag be pushed.
+The supported host-side orchestration helper is `scripts/release_patch.py`. It preserves the manual gates rather than hiding them: patch application rejects fuzz/offset/reversed evidence, source validation must pass, affected containers must rebuild, the pre-release Compose topology and embedded workers must recover, Git staging must be clean, the pushed commit must pass the selected GitHub Actions workflow, and only then may an annotated release tag be pushed.
 
 Important switches include:
 
 - `--patch NAME.patch` — apply a patch; a relative name also searches `../`.
 - `--resume` — continue from an already-applied release tree or an already-committed HEAD; clean committed states do not manufacture an empty commit.
-- `--rebuild-service SERVICE` — repeat for additional services; default is `mikrotik-control`.
+- `--rebuild-service SERVICE` — repeat to add an explicit service to the automatically detected affected-service plan.
 - `--rebuild-all` — explicitly rebuild/start all Compose services.
+- `--no-auto-services` — disable affected-service detection for an intentional manually-scoped release.
+- `--skip-runtime-health` / `--skip-topology-health` — explicit exceptions for the corresponding post-rebuild gates; neither is the default.
 - `--expect-version VERSION` — require the live health JSON to expose the expected release.
 - `--stage PATH` — repeat to restrict staging; otherwise the intentionally changed tree is staged with `git add -A`.
 - `--workflow NAME` — GitHub Actions workflow to wait for; default is `Quality`.

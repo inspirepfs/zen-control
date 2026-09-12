@@ -211,9 +211,9 @@ class Device360UxTests(unittest.TestCase):
         self.assertIn('/devices/{{explanation.device.ip}}', self.explain)
 
     def test_release_is_v028_and_new_asset_is_cache_busted(self):
-        self.assertIn('version="0.54.2"', self.main)
-        self.assertIn('/static/device360.css?v=0.54.2', self.template)
-        self.assertIn('/static/app.css?v=0.54.2', self.index)
+        self.assertIn('version="0.54.3"', self.main)
+        self.assertIn('/static/device360.css?v=0.54.3', self.template)
+        self.assertIn('/static/app.css?v=0.54.3', self.index)
         self.assertNotIn('v=0.27.0', self.template)
 
     def test_device_360_css_has_compact_responsive_breakpoints(self):

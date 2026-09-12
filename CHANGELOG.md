@@ -2,6 +2,18 @@
 
 All notable ZEN Control release slices are recorded here. ZEN is developed as evidence-led, bounded slices; historical entries describe the authority and evidence contracts that were current for that release.
 
+## v0.54.3 — Deployment topology & runtime-health closure
+
+- Makes the host release workflow topology-aware. It now derives affected Compose services from the actual release delta, including app/build-context changes and service-specific Compose block changes, instead of assuming only `mikrotik-control` changed.
+- Preserves the pre-release live Compose topology across targeted rebuilds. Any service that was running before the release must return to running state; successful one-shot services remain successful; explicitly affected/new services are required to reach their expected state.
+- Adds fail-closed handling for `telemetry/postgres` source changes. PostgreSQL init scripts are not treated as live migrations, so the release workflow refuses to imply a schema update by merely recreating a container.
+- Recreates affected services with `--force-recreate` so bind-mounted configuration changes (for example GoFlow2 mappings or Caddy configuration) cannot be missed by an otherwise unchanged container definition.
+- Adds `/health/runtime` with the minimal `zen_runtime_health_v1` contract. It exposes only non-secret process health: the background worker, reconciler, incident monitor and summary-delivery worker must all be alive; configured ephemeral observation concurrency and mutation-lane availability are reported without exposing device/configuration data.
+- Extends release qualification so app liveness, embedded-worker runtime health and preserved Compose topology must all pass before staging, commit, push, CI watch or tag creation.
+- Keeps command-line overrides for explicit service additions, full-stack rebuilds and intentional health-gate skips, while auto-detection is the default.
+
+Deployment boundary: container `UP` alone is not release success. ZEN now proves the application, its embedded workers and the live service topology survived the deployment before source publication can continue.
+
 ## v0.54.2 — Parallel observation / serialized enforcement
 
 - Adds a bounded `ParallelObserver` for deterministic concurrent read/plan fan-out. Automatic reconciliation can now overlap independent device policy observations without granting those observations write authority.

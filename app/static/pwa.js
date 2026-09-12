@@ -1,6 +1,6 @@
 (() => {
   'use strict';
-  const RELEASE = '0.54.2';
+  const RELEASE = '0.54.3';
   let deferredInstallPrompt = null;
 
   const standalone = () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;

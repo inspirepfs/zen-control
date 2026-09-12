@@ -57,11 +57,12 @@ from app.secure_transport import SecureTransportConfig, security_headers
 from app.kid_control_migration import translate_kid_control_snapshot
 from app.kid_control_cutover import build_kid_control_cutover_readiness, failed_cutover_cleanup_complete
 from app.help_content import get_help_topic, help_for_context, help_catalog, help_api_payload, help_owner
+from app.runtime_health import build_runtime_health
 
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.2")
+app = FastAPI(title="ZEN Control", version="0.54.3")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -1353,6 +1354,20 @@ def help_page(
 @app.get("/health/live")
 def health_live():
     return {"ok": True, "status": "alive", "version": app.version}
+
+
+@app.get("/health/runtime")
+def health_runtime():
+    report = build_runtime_health(
+        version=app.version,
+        background_worker=background_worker,
+        reconciler=auto_reconciler,
+        incident_monitor=incident_monitor,
+        summary_delivery=summary_delivery,
+    )
+    if not report.get("ok"):
+        return JSONResponse(status_code=503, content=report)
+    return report
 
 
 @app.get("/health/ready")

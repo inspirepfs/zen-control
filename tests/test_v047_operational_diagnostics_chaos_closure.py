@@ -132,7 +132,7 @@ def build_service(
     policy_store=None,
 ):
     return OperationalDiagnostics(
-        app_version="0.54.2",
+        app_version="0.54.3",
         policy_store=policy_store or PolicyStore(),
         router=router or Router(),
         activity_store=activity or ActivityStore(),
@@ -409,8 +409,8 @@ class OperationalDiagnosticsV047IntegrationTests(unittest.TestCase):
         cls.help = (ROOT / "app/help_content.py").read_text()
 
     def test_release_and_diagnostics_assets_are_v047(self):
-        self.assertIn('version="0.54.2"', self.main)
-        self.assertIn('/static/diagnostics.css?v=0.54.2', self.template)
+        self.assertIn('version="0.54.3"', self.main)
+        self.assertIn('/static/diagnostics.css?v=0.54.3', self.template)
 
     def test_ingest_publishes_sanitized_independent_dependency_status(self):
         self.assertIn("zen_telemetry_ingest_status_v1", self.ingest)

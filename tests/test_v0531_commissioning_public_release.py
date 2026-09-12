@@ -89,8 +89,8 @@ class PublicRepositoryContractTests(unittest.TestCase):
     def test_release_version_is_0531(self):
         main = (ROOT / "app/main.py").read_text()
         pwa = (ROOT / "app/pwa.py").read_text()
-        self.assertIn('version="0.54.2"', main)
-        self.assertIn('PWA_RELEASE = "0.54.2"', pwa)
+        self.assertIn('version="0.54.3"', main)
+        self.assertIn('PWA_RELEASE = "0.54.3"', pwa)
 
     def test_readme_is_product_first_and_changelog_owns_release_history(self):
         readme = (ROOT / "README.md").read_text()
@@ -99,7 +99,7 @@ class PublicRepositoryContractTests(unittest.TestCase):
         self.assertIn("## Why ZEN exists", readme)
         self.assertIn("## Safety model", readme)
         self.assertIn("## Quick start", readme)
-        self.assertIn("## v0.54.2", changelog)
+        self.assertIn("## v0.54.3", changelog)
         self.assertIn("## v0.53.0", changelog)
 
     def test_public_docs_and_security_guidance_exist(self):

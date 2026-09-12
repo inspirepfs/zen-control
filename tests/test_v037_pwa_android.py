@@ -21,13 +21,13 @@ class ProgressiveWebAppContractTests(unittest.TestCase):
         cls.templates = list((ROOT / "app" / "templates").glob("*.html"))
 
     def test_release_and_shared_pwa_head_are_current(self):
-        self.assertIn('version="0.54.2"', self.main)
+        self.assertIn('version="0.54.3"', self.main)
         for template in self.templates:
             self.assertIn('{% include "_pwa_head.jinja" %}', template.read_text(), template.name)
         for token in (
-            '/static/manifest.webmanifest?v=0.54.2',
-            '/static/pwa.css?v=0.54.2',
-            '/static/pwa.js?v=0.54.2',
+            '/static/manifest.webmanifest?v=0.54.3',
+            '/static/pwa.css?v=0.54.3',
+            '/static/pwa.js?v=0.54.3',
             'apple-mobile-web-app-capable',
             'theme-color',
         ):

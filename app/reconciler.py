@@ -317,6 +317,7 @@ class AutoReconciler:
             **settings,
             "worker_alive": bool(self._thread and self._thread.is_alive()),
             "busy": self._cycle_lock.locked(),
+            "observation_workers_configured": self._observer.max_workers,
             "consecutive_failures": failures,
             "hold_active": hold_active,
             "hold_until": hold_until_iso,
