@@ -118,12 +118,21 @@ class CutoverReadinessTests(unittest.TestCase):
         }])
         self.assertTrue(result["ready"])
 
-    def test_prepared_authoritative_or_failed_state_blocks_second_cutover(self):
-        for state in ("prepared", "authoritative", "failed"):
+    def test_prepared_or_failed_state_blocks_second_cutover(self):
+        for state in ("prepared", "failed"):
             with self.subTest(state=state):
                 result = self.ready(current_cutover={"state": state})
                 self.assertFalse(result["ready"])
+                self.assertFalse(result["checks"][0]["ok"])
                 self.assertIn(state.upper(), result["checks"][0]["detail"])
+
+    def test_authoritative_state_is_active_not_a_false_failed_gate(self):
+        result = self.ready(current_cutover={"state": "authoritative"})
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["authority_state"], "authoritative")
+        self.assertTrue(result["checks"][0]["ok"])
+        self.assertFalse(result["checks"][0]["blocking"])
+        self.assertIn("ZEN authority is active", result["checks"][0]["detail"])
 
     def test_failed_cleanup_complete_requires_positive_proof_and_zero_errors(self):
         self.assertTrue(failed_cutover_cleanup_complete({

@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
   <title>MikroTik Kid Control Migration · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.53.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.1">
 </head>
 <body class="standalone-page">
 <header class="standalone-header">
@@ -89,6 +89,7 @@
     </table>
   </div>
   {% for warning in profile.warnings %}<div class="conflict-warning">{{ warning }}</div>{% endfor %}
+  {% for notice in profile.notices or [] %}<div class="local-only-note">{{ notice }}</div>{% endfor %}
 </section>
 {% endfor %}
 
@@ -115,13 +116,20 @@
 
 <section class="card">
   <div class="card-heading">
-    <div><h2>Stage replacement</h2><p class="muted">Staging persists this translated proposal in ZEN for later review/cutover work. It does not create active profiles, schedules or device assignments.</p></div>
-    {% if staged %}<span class="policy-badge enabled">STAGED</span>{% else %}<span class="policy-badge staging">NOT STAGED</span>{% endif %}
+    <div>
+      <h2>Stage replacement</h2>
+      {% if cutover and cutover.state == 'authoritative' %}
+        <p class="muted">The staged proposal is retained as migration provenance. The materialised ZEN policy is active; the staging record itself is not enforcement authority.</p>
+      {% else %}
+        <p class="muted">Staging persists this translated proposal in ZEN for later review/cutover work. It does not create active profiles, schedules or device assignments.</p>
+      {% endif %}
+    </div>
+    {% if cutover and cutover.state == 'authoritative' %}<span class="policy-badge enabled">PROVENANCE RETAINED</span>{% elif staged %}<span class="policy-badge enabled">STAGED</span>{% else %}<span class="policy-badge staging">NOT STAGED</span>{% endif %}
   </div>
   {% if staged %}
-    <div class="local-only-note">Current staged copy: {{ staged.staged_at }} by {{ staged.actor or 'unknown' }} · <code>{{ staged.source_fingerprint[:12] }}</code>. A fresh Stage action safely replaces the staged copy for this source.</div>
+    <div class="local-only-note">Current staged copy: {{ staged.staged_at }} by {{ staged.actor or 'unknown' }} · <code>{{ staged.source_fingerprint[:12] }}</code>{% if not cutover or cutover.state not in ['prepared', 'authoritative', 'failed'] %}. A fresh Stage action safely replaces the staged copy for this source{% endif %}.</div>
   {% endif %}
-  {% if user.role == 'admin' %}
+  {% if user.role == 'admin' and (not cutover or cutover.state not in ['prepared', 'authoritative', 'failed']) %}
   <div class="row-actions kid-control-stage-actions">
     <form method="post" action="/local/migration/kid-control/stage">
       <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -135,7 +143,7 @@
     </form>
     {% endif %}
   </div>
-  {% else %}
+  {% elif user.role != 'admin' %}
     <div class="muted">Viewer/operator roles can inspect the translation; only an admin can stage it.</div>
   {% endif %}
 </section>
@@ -162,6 +170,16 @@
 
   {% if cutover %}
   <div class="local-only-note">Latest authority event #{{ cutover.id }} · {{ cutover.state|upper }} · {{ cutover.recorded_at }} · actor {{ cutover.actor or 'unknown' }}.</div>
+  {% endif %}
+
+  {% if cutover and cutover.state == 'authoritative' %}
+  <div class="security-summary-grid authority-state-summary">
+    <div><span class="muted small">ZEN policy</span><strong>ACTIVE</strong></div>
+    <div><span class="muted small">Legacy Kid Control</span><strong>DISABLED · RETAINED</strong></div>
+    <div><span class="muted small">Verified devices</span><strong>{{ (cutover.evidence.reconciliations or [])|length }}</strong></div>
+    <div><span class="muted small">Rollback</span><strong>AVAILABLE</strong></div>
+  </div>
+  <div class="local-only-note"><strong>Authority state:</strong> ZEN is enforcing the migrated policy. The retained legacy profile is disabled as the rollback safety copy; its disabled state is expected and is not a translation warning.</div>
   {% endif %}
 
   {% if readiness %}

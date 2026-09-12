@@ -144,16 +144,16 @@ class ClassificationUxTests(unittest.TestCase):
         self.template = (ROOT / "app/templates/classification.html").read_text()
         self.css = (ROOT / "app/static/classification-intelligence.css").read_text()
         self.module = (ROOT / "app/classification_intelligence.py").read_text()
-        self.readme = (ROOT / "README.md").read_text()
+        self.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_release_version_routes_and_activity_subnav(self):
-        self.assertIn('version="0.53.0"', self.main)
+        self.assertIn('version="0.53.1"', self.main)
         self.assertIn('@app.get("/activity/classification"', self.main)
         self.assertIn('@app.get("/api/activity/classification")', self.main)
         self.assertIn('"classification", "dns"', self.main)
         self.assertIn("key: 'classification', label: 'Classification'", self.index)
         self.assertIn("window.location.href = '/activity/classification'", self.index)
-        self.assertIn('/static/classification-intelligence.css?v=0.53.0', self.template)
+        self.assertIn('/static/classification-intelligence.css?v=0.53.1', self.template)
 
     def test_workbench_is_read_only_and_states_evidence_boundary(self):
         self.assertNotIn('method="post"', self.template.lower())

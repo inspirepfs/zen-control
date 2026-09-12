@@ -309,13 +309,13 @@ class KidControlMigrationSourceContractTests(unittest.TestCase):
         cls.main = (ROOT / "app/main.py").read_text()
         cls.router = (ROOT / "app/router.py").read_text()
         cls.template = (ROOT / "app/templates/kid_control_migration.html").read_text() if (ROOT / "app/templates/kid_control_migration.html").exists() else ""
-        cls.readme = (ROOT / "README.md").read_text()
+        cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
         cls.release = (ROOT / "app/release_readiness.py").read_text()
         cls.env = (ROOT / ".env.example").read_text()
 
     def test_release_and_ui_contract_moves_forward_from_staging(self):
-        self.assertIn('version="0.53.0"', self.main)
-        self.assertIn("v0.53.0", self.readme)
+        self.assertIn('version="0.53.1"', self.main)
+        self.assertIn("v0.53.1", self.readme)
         self.assertIn('("kid_control_migration", "MikroTik Kid Control staged migration", "0.52.0")', self.release)
         self.assertIn('("kid_control_authority", "MikroTik Kid Control controlled authority transfer", "0.53.0")', self.release)
 

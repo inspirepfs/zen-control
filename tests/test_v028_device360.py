@@ -183,7 +183,7 @@ class Device360UxTests(unittest.TestCase):
         cls.activity_summary = (ROOT / "app/templates/activity_summary.html").read_text()
         cls.policy_summary = (ROOT / "app/templates/policy_summary.html").read_text()
         cls.explain = (ROOT / "app/templates/policy_explain.html").read_text()
-        cls.readme = (ROOT / "README.md").read_text()
+        cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_page_and_api_share_one_device_360_builder(self):
         self.assertIn('def get_device_360(address: str)', self.main)
@@ -211,9 +211,9 @@ class Device360UxTests(unittest.TestCase):
         self.assertIn('/devices/{{explanation.device.ip}}', self.explain)
 
     def test_release_is_v028_and_new_asset_is_cache_busted(self):
-        self.assertIn('version="0.53.0"', self.main)
-        self.assertIn('/static/device360.css?v=0.53.0', self.template)
-        self.assertIn('/static/app.css?v=0.53.0', self.index)
+        self.assertIn('version="0.53.1"', self.main)
+        self.assertIn('/static/device360.css?v=0.53.1', self.template)
+        self.assertIn('/static/app.css?v=0.53.1', self.index)
         self.assertNotIn('v=0.27.0', self.template)
 
     def test_device_360_css_has_compact_responsive_breakpoints(self):

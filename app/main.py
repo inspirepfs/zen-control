@@ -60,7 +60,7 @@ from app.help_content import get_help_topic, help_for_context, help_catalog, hel
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.53.0")
+app = FastAPI(title="ZEN Control", version="0.53.1")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET

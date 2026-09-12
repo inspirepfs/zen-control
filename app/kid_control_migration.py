@@ -208,6 +208,7 @@ def _identity_evidence(mac: str, configured_ips: list[str], snapshot: dict) -> d
 
 def _translate_profile(raw: dict) -> dict:
     warnings: list[str] = []
+    notices: list[str] = []
     schedule_slots: dict[tuple[str, str], list[str]] = {}
     for day in DAYS:
         try:
@@ -241,7 +242,9 @@ def _translate_profile(raw: dict) -> dict:
         )
 
     if bool(raw.get("disabled")):
-        warnings.append("Legacy Kid Control profile is disabled; staged replacement remains non-active.")
+        notices.append(
+            "Legacy Kid Control profile is currently disabled. Its retained configuration may be the expected rollback copy after authority transfer."
+        )
 
     return {
         "legacy_name": raw["name"],
@@ -249,6 +252,7 @@ def _translate_profile(raw: dict) -> dict:
         "legacy_rate_limit": rate_limit,
         "legacy_unlimited_windows": unlimited_windows,
         "warnings": warnings,
+        "notices": notices,
         "proposed": {
             "name": raw["name"],
             # Default BLOCKED plus explicit opening/closing events is equivalent

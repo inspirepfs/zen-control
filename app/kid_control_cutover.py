@@ -103,11 +103,24 @@ def build_kid_control_cutover_readiness(
         checks.append({"key": key, "ok": bool(ok), "blocking": bool(blocking), "detail": detail})
 
     if current_cutover and current_cutover.get("state") in {"prepared", "authoritative", "failed"}:
-        state = str(current_cutover.get("state") or "").upper()
-        add("authority_state", False, f"Authority transfer is already {state}; roll it back before starting another cutover")
+        state = str(current_cutover.get("state") or "").lower()
+        if state == "authoritative":
+            add(
+                "authority_state",
+                True,
+                "ZEN authority is active; a second cutover is not applicable while the retained rollback state exists",
+                blocking=False,
+            )
+        else:
+            add(
+                "authority_state",
+                False,
+                f"Authority transfer is already {state.upper()}; complete rollback/recovery before starting another cutover",
+            )
         return {
             "schema": "zen_kid_control_cutover_readiness_v1",
             "ready": False,
+            "authority_state": state,
             "checks": checks,
             "blocking": [item for item in checks if item["blocking"] and not item["ok"]],
             "devices": [],

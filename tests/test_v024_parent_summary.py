@@ -133,10 +133,10 @@ class ParentSummaryUxTests(unittest.TestCase):
         self.summary = (ROOT / "app/templates/activity_summary.html").read_text()
         self.main = (ROOT / "app/main.py").read_text()
         self.css = (ROOT / "app/static/parent-summary.css").read_text()
-        self.readme = (ROOT / "README.md").read_text()
+        self.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_release_version_and_summary_subtab_are_present(self):
-        self.assertIn('version="0.53.0"', self.main)
+        self.assertIn('version="0.53.1"', self.main)
         self.assertIn("key: 'summaries', label: 'Summaries'", self.index)
         self.assertIn('data-ux-group="summaries"', self.index)
 

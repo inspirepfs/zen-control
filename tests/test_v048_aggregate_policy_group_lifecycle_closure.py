@@ -388,7 +388,7 @@ class AggregatePolicyGroupLifecycleSourceGuards(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         cls.store = (root / "app/policy_store.py").read_text()
         cls.router = (root / "app/router.py").read_text()
-        cls.readme = (root / "README.md").read_text()
+        cls.readme = (root / "README.md").read_text() + "\n" + (root / "CHANGELOG.md").read_text()
 
     def test_restore_preflight_runs_before_destructive_table_replacement(self):
         block = self.store.split("def import_config(self, payload):", 1)[1]
@@ -407,7 +407,7 @@ class AggregatePolicyGroupLifecycleSourceGuards(unittest.TestCase):
         self.assertIn("Unsupported live service key(s)", block)
 
     def test_release_notes_state_aggregate_groups_never_create_routeros_authority(self):
-        self.assertIn("v0.53.0", self.readme)
+        self.assertIn("v0.53.1", self.readme)
         self.assertIn("never become RouterOS authority", self.readme)
 
 

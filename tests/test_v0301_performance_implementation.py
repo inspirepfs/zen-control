@@ -82,7 +82,7 @@ class PerformanceImplementationContractTests(unittest.TestCase):
         cls.index = (ROOT / "app/templates/index.html").read_text()
         cls.performance_template = (ROOT / "app/templates/performance.html").read_text()
         cls.css = (ROOT / "app/static/app.css").read_text()
-        cls.readme = (ROOT / "README.md").read_text()
+        cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_write_routes_use_coherent_router_transport(self):
         self.assertIn("def coherent_router_request(func):", self.main)

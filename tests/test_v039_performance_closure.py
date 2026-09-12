@@ -168,7 +168,7 @@ class PerformanceClosureContractTests(unittest.TestCase):
         cls.performance = (ROOT / "app/performance.py").read_text()
         cls.template = (ROOT / "app/templates/performance.html").read_text()
         cls.script = (ROOT / "scripts/perf_acceptance.py").read_text()
-        cls.readme = (ROOT / "README.md").read_text()
+        cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_root_uses_bounded_snapshot_only_for_dashboard_and_managed_devices(self):
         self.assertIn("get_managed_device_observation_snapshot", self.main)

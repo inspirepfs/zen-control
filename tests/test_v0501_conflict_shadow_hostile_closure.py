@@ -299,7 +299,7 @@ class ConflictShadowReleaseIntegrationTests(unittest.TestCase):
         cls.root = Path(__file__).resolve().parents[1]
         cls.main = (cls.root / "app/main.py").read_text(encoding="utf-8")
         cls.quality = (cls.root / "app/policy_quality.py").read_text(encoding="utf-8")
-        cls.readme = (cls.root / "README.md").read_text(encoding="utf-8")
+        cls.readme = (cls.root / "README.md").read_text(encoding="utf-8") + "\n" + (cls.root / "CHANGELOG.md").read_text(encoding="utf-8")
 
     def test_quality_snapshot_includes_schedule_templates(self):
         helper = self.main.split("def _policy_quality_snapshot():", 1)[1].split('@app.get("/policy/quality"', 1)[0]

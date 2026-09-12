@@ -216,12 +216,12 @@ class PolicyExplanationUxTests(unittest.TestCase):
         cls.policy_summary = (ROOT / "app/templates/policy_summary.html").read_text()
         cls.activity_device = (ROOT / "app/templates/activity_device.html").read_text()
         cls.activity_service = (ROOT / "app/templates/activity_service.html").read_text()
-        cls.readme = (ROOT / "README.md").read_text()
+        cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_release_is_v027_and_assets_are_cache_busted(self):
-        self.assertIn('version="0.53.0"', self.main)
-        self.assertIn('/static/app.css?v=0.53.0', self.index)
-        self.assertIn('/static/app.css?v=0.53.0', self.explain)
+        self.assertIn('version="0.53.1"', self.main)
+        self.assertIn('/static/app.css?v=0.53.1', self.index)
+        self.assertIn('/static/app.css?v=0.53.1', self.explain)
         self.assertNotIn('v=0.26.0', self.explain)
 
     def test_page_and_json_routes_share_the_same_explanation_builder(self):

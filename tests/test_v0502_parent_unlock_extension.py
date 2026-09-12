@@ -103,7 +103,7 @@ class ParentUnlockExtensionIntegrationTests(unittest.TestCase):
         cls.main = (cls.root / "app/main.py").read_text(encoding="utf-8")
         cls.index = (cls.root / "app/templates/index.html").read_text(encoding="utf-8")
         cls.help = (cls.root / "app/help_content.py").read_text(encoding="utf-8")
-        cls.readme = (cls.root / "README.md").read_text(encoding="utf-8")
+        cls.readme = (cls.root / "README.md").read_text(encoding="utf-8") + "\n" + (cls.root / "CHANGELOG.md").read_text(encoding="utf-8")
 
     def test_more_time_route_requires_role_csrf_active_window_and_fresh_parent_code(self):
         block = self.main.split('@app.post("/auth/extend")', 1)[1].split('@app.post("/auth/lock")', 1)[0]
@@ -150,10 +150,10 @@ class ParentUnlockExtensionIntegrationTests(unittest.TestCase):
         self.assertIn('("parent_unlock", "Parent unlock & time-extension hardening", "0.50.2")', release)
 
     def test_release_version_and_pwa_assets_are_current(self):
-        self.assertIn('version="0.53.0"', self.main)
-        self.assertIn('/static/app.css?v=0.53.0', self.index)
-        self.assertIn("const RELEASE = '0.53.0'", (self.root / "app/static/pwa.js").read_text())
-        self.assertIn("PWA_RELEASE = \"0.53.0\"", (self.root / "app/pwa.py").read_text())
+        self.assertIn('version="0.53.1"', self.main)
+        self.assertIn('/static/app.css?v=0.53.1', self.index)
+        self.assertIn("const RELEASE = '0.53.1'", (self.root / "app/static/pwa.js").read_text())
+        self.assertIn("PWA_RELEASE = \"0.53.1\"", (self.root / "app/pwa.py").read_text())
 
 
 if __name__ == "__main__":

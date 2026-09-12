@@ -1,0 +1,30 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python
+        run: python3 -m py_compile app/*.py telemetry/ingest/*.py
+      - name: UX validation
+        run: python3 scripts/ux_validate.py
+      - name: Public-source audit
+        run: python3 scripts/public_release_audit.py
+      - name: Unit and hostile tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Compose parse
+        run: docker compose --env-file .env.example config >/dev/null

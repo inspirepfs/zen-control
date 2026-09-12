@@ -332,7 +332,7 @@ class ReleaseReadinessSurfaceTests(unittest.TestCase):
         cls.main = (root / "app" / "main.py").read_text(encoding="utf-8")
         cls.index = (root / "app" / "templates" / "index.html").read_text(encoding="utf-8")
         cls.template_path = root / "app" / "templates" / "release_readiness.html"
-        cls.readme = (root / "README.md").read_text(encoding="utf-8")
+        cls.readme = (root / "README.md").read_text(encoding="utf-8") + "\n" + (root / "CHANGELOG.md").read_text(encoding="utf-8")
 
     def test_observability_workbenches_do_not_pollute_live_performance_acceptance(self):
         for path in (

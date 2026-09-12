@@ -115,17 +115,17 @@ class PerformanceGatheringUxTests(unittest.TestCase):
         cls.css = (ROOT / "app/static/performance.css").read_text()
         cls.compose = (ROOT / "docker-compose.yml").read_text()
         cls.env = (ROOT / ".env.example").read_text()
-        cls.readme = (ROOT / "README.md").read_text()
+        cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
         cls.unit_script = (ROOT / "scripts/perf_unit_baseline.py").read_text()
         cls.analysis_script = (ROOT / "scripts/perf_analyse.py").read_text()
         cls.runtime_script = (ROOT / "scripts/perf_runtime_snapshot.sh").read_text()
 
     def test_release_version_and_performance_routes(self):
-        self.assertIn('version="0.53.0"', self.main)
+        self.assertIn('version="0.53.1"', self.main)
         self.assertIn('@app.get("/api/performance")', self.main)
         self.assertIn('@app.get("/performance"', self.main)
         self.assertIn('@app.post("/local/performance/reset")', self.main)
-        self.assertIn('/static/performance.css?v=0.53.0', self.template)
+        self.assertIn('/static/performance.css?v=0.53.1', self.template)
 
     def test_request_middleware_exports_server_timing_headers(self):
         self.assertIn('@app.middleware("http")', self.main)

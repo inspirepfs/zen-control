@@ -281,10 +281,10 @@ class DeliveryUxTests(unittest.TestCase):
         self.css = (ROOT / "app/static/app.css").read_text()
         self.compose = (ROOT / "docker-compose.yml").read_text()
         self.env = (ROOT / ".env.example").read_text()
-        self.readme = (ROOT / "README.md").read_text()
+        self.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_release_routes_and_automation_ui_are_present(self):
-        self.assertIn('version="0.53.0"', self.main)
+        self.assertIn('version="0.53.1"', self.main)
         self.assertIn('@app.get("/api/summary-delivery")', self.main)
         self.assertIn('@app.post("/local/summary-delivery/settings")', self.main)
         self.assertIn('@app.post("/local/summary-delivery/test")', self.main)
@@ -297,7 +297,7 @@ class DeliveryUxTests(unittest.TestCase):
         self.assertIn('background:#26345e;color:#eef2ff', self.css)
         self.assertIn('.button-link:visited{color:#eef2ff}', self.css)
         self.assertIn('.button-link.primary{background:#4f6bf5;color:#fff', self.css)
-        self.assertIn('/static/app.css?v=0.53.0', self.index)
+        self.assertIn('/static/app.css?v=0.53.1', self.index)
 
     def test_transport_secrets_are_environment_based_and_compose_wired(self):
         for key in [
