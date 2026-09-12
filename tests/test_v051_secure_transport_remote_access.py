@@ -25,7 +25,7 @@ class SecureTransportConfigTests(unittest.TestCase):
 
     def test_local_default_is_non_disruptive_and_not_falsely_remote_ready(self):
         cfg = self.config()
-        status = cfg.status("0.54.4")
+        status = cfg.status("0.54.5")
         self.assertFalse(cfg.remote_access_enabled)
         self.assertFalse(cfg.secure_cookies)
         self.assertEqual(status["state"], "disabled")
@@ -40,7 +40,7 @@ class SecureTransportConfigTests(unittest.TestCase):
             ZEN_ALLOWED_HOSTS="zen.example.net,localhost,127.0.0.1",
             ZEN_CLOUDFLARE_ACCESS_PROTECTED="1",
         )
-        status = cfg.status("0.54.4")
+        status = cfg.status("0.54.5")
         self.assertEqual(status["state"], "ready_for_live_validation")
         self.assertTrue(status["remote_ready"])
         self.assertEqual({item["state"] for item in status["checks"]}, {"pass"})
@@ -53,7 +53,7 @@ class SecureTransportConfigTests(unittest.TestCase):
             ZEN_ALLOWED_HOSTS="zen.example.net",
             ZEN_CLOUDFLARE_ACCESS_PROTECTED="1",
         )
-        status = cfg.status("0.54.4")
+        status = cfg.status("0.54.5")
         self.assertEqual(status["state"], "blocked")
         self.assertFalse(status["remote_ready"])
         failed = {item["key"] for item in status["checks"] if item["state"] == "fail"}
@@ -66,7 +66,7 @@ class SecureTransportConfigTests(unittest.TestCase):
             ZEN_PUBLIC_HOST="zen.example.net",
             ZEN_ALLOWED_HOSTS="zen.example.net",
         )
-        status = cfg.status("0.54.4")
+        status = cfg.status("0.54.5")
         failed = {item["key"] for item in status["checks"] if item["state"] == "fail"}
         self.assertIn("cloudflare_access", failed)
         self.assertFalse(status["remote_ready"])
@@ -88,7 +88,7 @@ class SecureTransportConfigTests(unittest.TestCase):
             ZEN_CLOUDFLARE_ACCESS_PROTECTED="1",
         )
         self.assertEqual(cfg.allowed_hosts, ("localhost", "*.internal.example.net"))
-        self.assertFalse(cfg.status("0.54.4")["remote_ready"])
+        self.assertFalse(cfg.status("0.54.5")["remote_ready"])
 
     def test_wildcard_all_hosts_is_not_accepted_for_remote_access(self):
         cfg = self.config(
@@ -98,7 +98,7 @@ class SecureTransportConfigTests(unittest.TestCase):
             ZEN_ALLOWED_HOSTS="*",
             ZEN_CLOUDFLARE_ACCESS_PROTECTED="1",
         )
-        status = cfg.status("0.54.4")
+        status = cfg.status("0.54.5")
         failed = {item["key"] for item in status["checks"] if item["state"] == "fail"}
         self.assertIn("host_allowlist", failed)
 
@@ -141,9 +141,9 @@ class SecureTransportSourceTests(unittest.TestCase):
         cls.script = (ROOT / "scripts/https_acceptance.py").read_text()
 
     def test_release_version_and_assets_are_current(self):
-        self.assertIn('version="0.54.4"', self.main)
-        self.assertIn('/static/app.css?v=0.54.4', self.index)
-        self.assertIn("v0.54.4", self.readme)
+        self.assertIn('version="0.54.5"', self.main)
+        self.assertIn('/static/app.css?v=0.54.5', self.index)
+        self.assertIn("v0.54.5", self.readme)
 
     def test_session_secure_flag_is_configuration_driven(self):
         self.assertIn("https_only=SECURE_TRANSPORT.secure_cookies", self.main)
@@ -228,7 +228,7 @@ class SecureTransportSourceTests(unittest.TestCase):
             "CLOUDFLARE_TUNNEL_TOKEN": "must-not-leak",
             "CLOUDFLARE_TUNNEL_TOKEN_FILE": "/secret/location",
         })
-        rendered = repr(cfg.status("0.54.4"))
+        rendered = repr(cfg.status("0.54.5"))
         self.assertNotIn("must-not-leak", rendered)
         self.assertNotIn("/secret/location", rendered)
 
@@ -268,15 +268,19 @@ class PostCoreReadinessSeparationTests(unittest.TestCase):
     def report(self, transport):
         from app.release_readiness import build_release_readiness
         return build_release_readiness(
-            version="0.54.4",
+            version="0.54.5",
             operations={"ok": True, "issues": []},
             startup={"status": "ready", "issues": []},
             diagnostics={"overall": "healthy", "counts": {"healthy": 15, "warning": 0, "critical": 0, "offline": 0}, "checks": []},
-            performance={"acceptance": {"state": "pass", "targets": [], "min_samples": 5}},
+            performance={
+                "acceptance": {"schema": "zen_performance_acceptance_v2", "state": "pass", "targets": [], "min_samples": 5},
+                "formal_acceptance": {"schema": "zen_formal_performance_acceptance_v1", "state": "pass", "request_state": "pass", "evidence_targets": []},
+            },
             config_smoke={"state": "pass", "non_destructive": True, "source_digest": "x", "restored_digest": "x", "summary": "ok"},
             restart={"state": "pass", "controlled_stop_seen": True, "current_release_start_seen": True, "summary": "ok"},
             auth={"available": True, "shared_display_mode": True, "totp_count": 1, "login_mode": "password_or_totp", "recovery_codes_remaining": 5},
             pwa={"mode": "online_first", "cached_private_data": False, "offline_mutations": False, "background_sync": False, "push_notifications": False, "server_auth_required": True, "shared_display_lock_server_enforced": True},
+            runtime_health={"schema": "zen_runtime_health_v1", "ok": True, "status": "healthy"},
             secure_transport=transport,
         )
 

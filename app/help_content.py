@@ -262,7 +262,7 @@ _TOPICS = {
         related=(("Release readiness", "/release-readiness"), ("Diagnostics", "/diagnostics"), ("Performance", "/performance"), ("Import preview", "/help?topic=import_preview")),
     ),
     "release_readiness": _topic(
-        "release_readiness", "Operations", "Core release readiness",
+        "release_readiness", "Operations", "Final release readiness",
         "The v0.50 release gate composes existing runtime, diagnostics, performance, recovery and shared-display evidence without creating a second enforcement authority.",
         does=("Runs a non-destructive export/import/reopen smoke against a temporary policy database.", "Names bounded sanitized diagnostic warning/blocker identities directly in release evidence so a PENDING/FAIL dependency gate explains what requires review.", "Requires affirmative live performance and controlled-restart evidence before reporting PASS."),
         watch=("PENDING is not PASS and missing evidence is never converted to healthy state.", "HTTPS/secure remote access remains post-core commissioning and notification expansion remains behind its human gate."),

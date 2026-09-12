@@ -124,7 +124,7 @@ class HistoricalAnalyticsUxTests(unittest.TestCase):
         self.css = (ROOT / "app/static/historical-analytics.css").read_text()
 
     def test_version_and_history_subtab_are_present(self):
-        self.assertIn('version="0.54.4"', self.main)
+        self.assertIn('version="0.54.5"', self.main)
         self.assertIn("key: 'history', label: 'History'", self.index)
         self.assertIn('Historical analytics', self.index)
 

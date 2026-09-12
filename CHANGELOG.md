@@ -1,3 +1,13 @@
+## v0.54.5 — Final release-readiness closure
+
+- Upgrades the portable readiness contract to `zen_release_readiness_v2` and fixes the final application gate at exactly eight current checks. Final readiness requires `PASS 8 / PENDING 0 / FAIL 0`; contradictory counts/state are rejected by the CLI.
+- Makes Runtime Readiness consume both normal operations readiness and the v0.54.3 minimal embedded-runtime contract, so dead background/reconciler/incident/summary workers or an unavailable serialized mutation lane cannot be hidden behind an HTTP-ready process.
+- Makes Live Performance consume `zen_formal_performance_acceptance_v1`, including v0.54.4 threshold integrity, request-class budgets, prepared-view evidence, background-worker timing, parallel-observation utilisation and mutation-lane evidence. Request-only PASS can no longer manufacture release readiness.
+- Carries bounded attribution for non-passing formal performance evidence into the release artifact without exporting individual request paths or household data.
+- Extends the source-qualified closure matrix through v0.53.1 and v0.54.0-v0.54.4 while keeping live evidence distinct from source qualification.
+- Hardens `scripts/release_acceptance.py` to validate schema, exact check count, state/count consistency and `final_ready` before accepting the artifact.
+- Leaves HTTPS/public-edge publication work and notification expansion as explicit separate gates; no RouterOS authority or mutation-concurrency semantics change.
+
 # Changelog
 
 All notable ZEN Control release slices are recorded here. ZEN is developed as evidence-led, bounded slices; historical entries describe the authority and evidence contracts that were current for that release.

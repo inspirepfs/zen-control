@@ -63,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.4")
+app = FastAPI(title="ZEN Control", version="0.54.5")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -1188,7 +1188,7 @@ operational_diagnostics = OperationalDiagnostics(
 
 
 def current_release_readiness() -> dict:
-    """Capture the v0.50 release gate without inventing healthy evidence."""
+    """Capture the final application release gate without inventing healthy evidence."""
     try:
         operations = operations_monitor.readiness()
     except Exception:
@@ -1205,9 +1205,22 @@ def current_release_readiness() -> dict:
             "counts": {"healthy": 0, "warning": 0, "critical": 0, "offline": 1},
         }
     try:
-        performance = performance_collector.snapshot()
+        performance = current_performance_snapshot()
     except Exception:
-        performance = {"acceptance": {"state": "pending", "targets": []}}
+        performance = {
+            "acceptance": {"state": "pending", "targets": []},
+            "formal_acceptance": {"state": "pending", "evidence_targets": []},
+        }
+    try:
+        runtime_health = build_runtime_health(
+            version=app.version,
+            background_worker=background_worker,
+            reconciler=auto_reconciler,
+            incident_monitor=incident_monitor,
+            summary_delivery=summary_delivery,
+        )
+    except Exception:
+        runtime_health = {"schema": "zen_runtime_health_v1", "ok": False, "status": "degraded"}
     try:
         auth = {**auth_manager.dashboard_state(ADMIN_USER), "available": True}
     except Exception:
@@ -1229,6 +1242,7 @@ def current_release_readiness() -> dict:
         restart=restart_evidence(policy_store, app.version),
         auth=auth,
         pwa=status_contract(app.version),
+        runtime_health=runtime_health,
         secure_transport=current_secure_transport_status(),
     )
 

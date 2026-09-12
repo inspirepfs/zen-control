@@ -141,10 +141,19 @@ class ReleaseReadinessContractTests(unittest.TestCase):
             "operations": {"ok": True, "issues": []},
             "startup": {"status": "ready", "issues": []},
             "diagnostics": {"overall": "healthy", "counts": {"healthy": 12, "warning": 0, "critical": 0, "offline": 0}},
-            "performance": {"acceptance": {"state": "pass", "targets": []}},
+            "performance": {
+                "acceptance": {"schema": "zen_performance_acceptance_v2", "state": "pass", "targets": [], "min_samples": 5},
+                "formal_acceptance": {
+                    "schema": "zen_formal_performance_acceptance_v1",
+                    "state": "pass",
+                    "request_state": "pass",
+                    "evidence_targets": [],
+                },
+            },
             "config_smoke": {"state": "pass", "source_digest": "abc", "restored_digest": "abc"},
             "restart": {"state": "pass", "summary": "Controlled restart observed"},
             "auth": {"shared_display_mode": True, "totp_count": 1, "login_mode": "password_totp", "recovery_codes_remaining": 5},
+            "runtime_health": {"schema": "zen_runtime_health_v1", "ok": True, "status": "healthy"},
             "pwa": {
                 "mode": "online_first",
                 "cached_private_data": False,
@@ -160,18 +169,23 @@ class ReleaseReadinessContractTests(unittest.TestCase):
         result = self.build(**self.inputs())
         self.assertEqual("pass", result["state"])
         self.assertTrue(result["core_ready"])
-        self.assertEqual("zen_release_readiness_v1", result["schema"])
+        self.assertEqual("zen_release_readiness_v2", result["schema"])
+        self.assertTrue(result["final_ready"])
+        self.assertEqual(8, result["required_check_count"])
+        self.assertEqual({"pass": 8, "pending": 0, "fail": 0}, result["counts"])
 
     def test_performance_pending_keeps_release_pending(self):
         values = self.inputs()
-        values["performance"]["acceptance"]["state"] = "pending"
+        values["performance"]["formal_acceptance"]["state"] = "pending"
+        values["performance"]["formal_acceptance"]["request_state"] = "pending"
         result = self.build(**values)
         self.assertEqual("pending", result["state"])
         self.assertFalse(result["core_ready"])
 
     def test_performance_failure_blocks_release(self):
         values = self.inputs()
-        values["performance"]["acceptance"]["state"] = "fail"
+        values["performance"]["formal_acceptance"]["state"] = "fail"
+        values["performance"]["formal_acceptance"]["request_state"] = "fail"
         result = self.build(**values)
         self.assertEqual("fail", result["state"])
 
@@ -357,7 +371,7 @@ class ReleaseReadinessSurfaceTests(unittest.TestCase):
 
     def test_operations_links_to_release_readiness(self):
         self.assertIn('href="/release-readiness"', self.index)
-        self.assertIn("Core release readiness", self.index)
+        self.assertIn("Final release readiness", self.index)
 
     def test_release_readiness_template_explains_pending_is_not_pass(self):
         text = self.template_path.read_text(encoding="utf-8")
@@ -368,7 +382,7 @@ class ReleaseReadinessSurfaceTests(unittest.TestCase):
     def test_release_acceptance_cli_is_strict_by_default(self):
         root = Path(__file__).resolve().parents[1]
         script = (root / "scripts" / "release_acceptance.py").read_text(encoding="utf-8")
-        self.assertIn('zen_release_readiness_v1', script)
+        self.assertIn('zen_release_readiness_v2', script)
         self.assertIn('if state == "pass"', script)
         self.assertIn('--allow-pending', script)
 

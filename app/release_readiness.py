@@ -8,7 +8,8 @@ from typing import Any
 from app.policy_store import PolicyStore
 
 
-RELEASE_READINESS_SCHEMA = "zen_release_readiness_v1"
+RELEASE_READINESS_SCHEMA = "zen_release_readiness_v2"
+FINAL_RELEASE_CHECK_COUNT = 8
 
 CORE_CLOSURE_MATRIX = (
     ("time_policy", "Policy & time-boundary closure", "0.40"),
@@ -26,6 +27,12 @@ CORE_CLOSURE_MATRIX = (
     ("diagnostic_gate", "Diagnostic warning attribution & pre-HTTPS gate", "0.51.0"),
     ("kid_control_migration", "MikroTik Kid Control staged migration", "0.52.0"),
     ("kid_control_authority", "MikroTik Kid Control controlled authority transfer", "0.53.0"),
+    ("commissioning_public_repo", "Commissioning & public repository closure", "0.53.1"),
+    ("revisioned_background", "Revisioned state & background work foundation", "0.54.0"),
+    ("prepared_views", "Background analytics & prepared views", "0.54.1"),
+    ("parallel_observation", "Parallel observation / serialized enforcement", "0.54.2"),
+    ("deployment_runtime", "Deployment topology & runtime-health closure", "0.54.3"),
+    ("formal_performance", "Formal performance acceptance", "0.54.4"),
 )
 
 PARENT_JOURNEY_MATRIX = (
@@ -188,6 +195,31 @@ def restart_evidence(policy_store: Any, version: str) -> dict[str, Any]:
     }
 
 
+def _performance_gate_findings(performance: dict[str, Any]) -> list[dict[str, str]]:
+    """Return bounded identity for non-passing formal performance evidence."""
+    formal = dict((performance or {}).get("formal_acceptance") or {})
+    findings: list[dict[str, str]] = []
+    request_state = _state(formal.get("request_state"), {"pass", "pending", "fail"}, "pending")
+    if request_state != "pass":
+        findings.append({
+            "key": "request_acceptance",
+            "label": "Request-class performance",
+            "state": request_state,
+        })
+    for item in list(formal.get("evidence_targets") or [])[:12]:
+        if not isinstance(item, dict):
+            continue
+        state = _state(item.get("state"), {"pass", "pending", "fail"}, "pending")
+        if state == "pass":
+            continue
+        findings.append({
+            "key": _bounded_text(item.get("key") or "performance_evidence", 64),
+            "label": _bounded_text(item.get("label") or "Performance evidence", 120),
+            "state": state,
+        })
+    return findings
+
+
 def build_release_readiness(
     *,
     version: str,
@@ -199,6 +231,7 @@ def build_release_readiness(
     restart: dict[str, Any],
     auth: dict[str, Any],
     pwa: dict[str, Any],
+    runtime_health: dict[str, Any] | None = None,
     secure_transport: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an evidence-honest release readiness contract.
@@ -211,13 +244,30 @@ def build_release_readiness(
     checks: list[dict[str, Any]] = []
 
     operations_ok = bool((operations or {}).get("ok"))
+    runtime = dict(runtime_health or {})
+    runtime_schema_ok = runtime.get("schema") == "zen_runtime_health_v1"
+    runtime_available = bool(runtime)
+    runtime_ok = bool(runtime.get("ok")) if runtime_available else False
+    if not operations_ok or (runtime_available and not runtime_ok):
+        runtime_state = "fail"
+    elif not runtime_available or not runtime_schema_ok:
+        runtime_state = "pending"
+    else:
+        runtime_state = "pass"
     checks.append(_check(
         "runtime_readiness",
-        "Runtime readiness",
-        "pass" if operations_ok else "fail",
-        "Policy DB, RouterOS authority and reconciler are ready"
-        if operations_ok else "One or more core runtime readiness checks failed",
+        "Runtime & worker readiness",
+        runtime_state,
+        "Policy DB, RouterOS authority, reconciler, embedded workers and mutation lane are ready"
+        if runtime_state == "pass" else (
+            "Embedded runtime-health evidence is required before final release readiness"
+            if runtime_state == "pending"
+            else "One or more runtime, authority, worker or mutation-lane checks failed"
+        ),
         issues=list((operations or {}).get("issues") or []),
+        runtime_health_schema=runtime.get("schema"),
+        embedded_runtime_ok=runtime.get("ok") if runtime_available else None,
+        runtime_status=runtime.get("status") if runtime_available else None,
     ))
 
     startup_state = str((startup or {}).get("status") or "pending").lower()
@@ -288,18 +338,28 @@ def build_release_readiness(
     ))
 
     acceptance = dict((performance or {}).get("acceptance") or {})
-    performance_state = _state(acceptance.get("state"), {"pass", "pending", "fail"}, "pending")
+    formal = dict((performance or {}).get("formal_acceptance") or {})
+    formal_schema_ok = formal.get("schema") == "zen_formal_performance_acceptance_v1"
+    performance_state = (
+        _state(formal.get("state"), {"pass", "pending", "fail"}, "pending")
+        if formal_schema_ok else "pending"
+    )
+    performance_findings = _performance_gate_findings(performance)
     checks.append(_check(
         "live_performance",
-        "Live performance acceptance",
+        "Formal live performance acceptance",
         performance_state,
-        "All live responsiveness classes meet their p95 budgets"
+        "Latency, coherent RouterOS sessions and runtime observability evidence all satisfy the formal gate"
         if performance_state == "pass" else (
-            "More live samples are required before responsiveness can be accepted"
-            if performance_state == "pending" else "One or more live responsiveness budgets are exceeded"
+            "Formal performance evidence is incomplete; PENDING cannot become release readiness"
+            if performance_state == "pending" else "One or more formal performance requirements fail"
         ),
+        formal_schema=formal.get("schema"),
+        request_acceptance_schema=acceptance.get("schema"),
+        request_state=formal.get("request_state"),
         target_count=len(acceptance.get("targets") or []),
         min_samples=acceptance.get("min_samples"),
+        findings=performance_findings,
     ))
 
     config_state = _state((config_smoke or {}).get("state"), {"pass", "fail"}, "fail")
@@ -438,6 +498,8 @@ def build_release_readiness(
         "captured_at": _now_iso(),
         "state": overall,
         "core_ready": overall == "pass",
+        "final_ready": overall == "pass" and len(checks) == FINAL_RELEASE_CHECK_COUNT,
+        "required_check_count": FINAL_RELEASE_CHECK_COUNT,
         "counts": counts,
         "checks": checks,
         "closure_matrix": closure_matrix,
@@ -447,15 +509,17 @@ def build_release_readiness(
         ],
         "deferred": deferred,
         "meaning": {
-            "pass": "Every current core release check has affirmative evidence.",
+            "pass": "Every current application release check has affirmative evidence.",
             "pending": "No blocking failure is proven, but one or more live/commissioning checks still need evidence.",
-            "fail": "At least one core release requirement is currently disproven.",
+            "fail": "At least one application release requirement is currently disproven.",
         },
         "notes": [
             "PENDING is not PASS; missing evidence never becomes a healthy result.",
             "The backup/restore smoke imports only into a temporary database and does not mutate live policy state.",
             "The controlled restart check requires durable stop/start evidence; current uptime alone is insufficient.",
-            "HTTPS/remote access is post-core commissioning evidence and does not alter the core PASS/PENDING/FAIL count.",
+            "The final application release gate contains exactly eight current checks; all eight must PASS.",
+            "Formal performance acceptance includes latency, coherent RouterOS connection budgets and runtime observability evidence.",
+            "HTTPS/remote access remains a separate public-release commissioning gate, does not alter the core PASS/PENDING/FAIL count, and does not alter the eight application checks.",
             "Notification expansion remains behind its explicit human gate.",
         ],
     }

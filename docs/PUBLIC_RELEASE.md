@@ -4,6 +4,7 @@ This checklist is deliberately conservative because ZEN can control a real house
 
 ## Required before changing repository visibility to public
 
+- [ ] Capture `/api/release-readiness` from the candidate release and require `zen_release_readiness_v2` with **PASS 8 / PENDING 0 / FAIL 0**; validate it with `python3 scripts/release_acceptance.py SNAPSHOT.json`.
 - [ ] Select an open-source license and add the root `LICENSE` file.
 - [ ] Rotate any credential that has ever appeared in chat, terminal captures, support bundles or screenshots.
 - [ ] Confirm `.env`, `secrets/`, databases, logs, archives and certificates are ignored and absent from Git history.

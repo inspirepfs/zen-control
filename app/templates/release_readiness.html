@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <title>Core Release Readiness · ZEN Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=0.54.4">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.4">
-  <link rel="stylesheet" href="/static/diagnostics.css?v=0.54.4">
+  <title>Final Release Readiness · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.54.5">
+  <link rel="stylesheet" href="/static/layout.css?v=0.54.5">
+  <link rel="stylesheet" href="/static/diagnostics.css?v=0.54.5">
 </head>
 <body class="standalone-page">
 <main class="standalone-page diagnostics-page">
@@ -15,9 +15,9 @@
 {% include "_context_help.jinja" %}
   <header class="standalone-header diagnostics-header">
     <div>
-      <div class="eyebrow">ZEN CONTROL · CORE CLOSURE</div>
-      <h1>Core release readiness</h1>
-      <p class="muted">Evidence-led v0.50 acceptance across runtime health, live performance, backup/restore, controlled restart and shared-display commissioning. <strong>PENDING is not PASS.</strong></p>
+      <div class="eyebrow">ZEN CONTROL · FINAL RELEASE GATE</div>
+      <h1>Final release readiness</h1>
+      <p class="muted">Evidence-led final application acceptance across runtime/worker health, formal live performance, backup/restore, controlled restart and shared-display commissioning. <strong>PENDING is not PASS.</strong></p>
     </div>
     <div class="standalone-actions diagnostics-actions">
       <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
@@ -39,9 +39,9 @@
 
   <section class="card">
     <h2>Release gate</h2>
-    <p class="muted">A core release is ready only when every current check has affirmative evidence. Missing live performance samples, an uncommissioned shared display or missing controlled restart evidence remains PENDING. A disproven authority, dependency or safety requirement is FAIL.</p>
+    <p class="muted">The application release gate is ready only at <strong>PASS 8 · PENDING 0 · FAIL 0</strong>. Every current check needs affirmative evidence. Missing live performance samples, an uncommissioned shared display or missing controlled restart evidence remains PENDING. A disproven authority, dependency or safety requirement is FAIL.</p>
     <div class="diagnostic-kpis">
-      <span><small>Core checks</small><strong>{{report.checks|length}}</strong></span>
+      <span><small>Required checks</small><strong>{{report.required_check_count}}</strong></span>
       <span><small>Pass</small><strong>{{report.counts.pass}}</strong></span>
       <span><small>Pending</small><strong>{{report.counts.pending}}</strong></span>
       <span><small>Fail</small><strong>{{report.counts.fail}}</strong></span>
@@ -88,6 +88,18 @@
         <a class="button-link compact secondary" href="/diagnostics">Review in diagnostics</a>
       </div>
       {% endif %}
+      {% if item.key == 'live_performance' and item.evidence.findings %}
+      <div class="diagnostic-attribution">
+        <strong>Formal performance evidence still requiring closure</strong>
+        {% for finding in item.evidence.findings %}
+        <div class="diagnostic-attribution-row">
+          <span class="diagnostic-pill">{{finding.state|upper}}</span>
+          <div><strong>{{finding.label}}</strong></div>
+        </div>
+        {% endfor %}
+        <a class="button-link compact secondary" href="/performance">Review in Performance</a>
+      </div>
+      {% endif %}
       {% endif %}
     </article>
     {% endfor %}
@@ -95,7 +107,7 @@
 
   <section class="card">
     <div class="card-heading">
-      <div><h2>Core closure matrix</h2><p class="muted">Previously qualified safety and parity slices retained as the v0.50 acceptance baseline.</p></div>
+      <div><h2>Core closure matrix</h2><p class="muted">Source-qualified closure slices retained through v0.54.4. These do not substitute for the eight live/current checks above.</p></div>
     </div>
     <div class="table-scroll">
       <table class="compact-table">
@@ -127,7 +139,7 @@
 
   <section class="card">
     <h2>Deliberately deferred after core closure</h2>
-    <p class="muted">These items are visible so they cannot be mistaken for completed work, but they do not block the v0.50 core gate.</p>
+    <p class="muted">These items are visible so they cannot be mistaken for completed work, but they remain outside the eight-check application gate.</p>
     {% for item in report.deferred %}
       <p><strong>{{item.label}} · {{item.state|upper}}</strong><br><span class="muted">{{item.summary}}</span></p>
     {% endfor %}
