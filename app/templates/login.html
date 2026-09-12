@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <title>Sign in · ZEN Control</title>
+</head>
+<body class="login-bg">
+  <main class="login-card auth-login-card">
+    <div class="brand">ZEN Control</div>
+    <h1>Parent sign in</h1>
+    <p class="muted">Authorised household controls only.</p>
+    {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+
+    <div class="auth-login-mode">
+      {% if login_mode == 'totp_only' %}
+        <strong>Authenticator code required</strong>
+        <span class="muted small">Password sign-in is disabled for this account.</span>
+      {% elif login_mode == 'password_or_totp' %}
+        <strong>Password or authenticator</strong>
+        <span class="muted small">Use either method. Recovery codes work in the OTP field.</span>
+      {% else %}
+        <strong>Password sign-in</strong>
+        <span class="muted small">OTP can be enabled from Settings after enrolling an authenticator.</span>
+      {% endif %}
+    </div>
+
+    <form method="post" action="/login" class="auth-login-form">
+      <label>Username
+        <input name="username" autocomplete="username" value="{{ admin_user }}" required>
+      </label>
+
+      {% if login_mode in ['password','password_or_totp'] %}
+      <label>Password
+        <input type="password" name="password" autocomplete="current-password" {% if login_mode == 'password' %}required{% endif %}>
+      </label>
+      {% endif %}
+
+      {% if login_mode in ['password_or_totp','totp_only'] %}
+        {% if login_mode == 'password_or_totp' %}<div class="auth-or"><span>OR</span></div>{% endif %}
+        <label>Authenticator or recovery code
+          <input name="otp" autocomplete="one-time-code" placeholder="123456 or recovery code" {% if login_mode == 'totp_only' %}required{% endif %}>
+        </label>
+      {% endif %}
+
+      <button class="primary wide" type="submit">Sign in</button>
+    </form>
+
+    {% if login_mode != 'password' %}
+      <p class="muted small auth-login-foot">{{ totp_count }} authenticator{{ '' if totp_count == 1 else 's' }} enrolled · {{ recovery_codes_remaining }} recovery code{{ '' if recovery_codes_remaining == 1 else 's' }} remaining.</p>
+    {% endif %}
+  </main>
+</body>
+</html>

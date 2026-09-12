@@ -1,0 +1,16 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+jinja2==3.1.6
+python-multipart==0.0.20
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+itsdangerous==2.2.0
+RouterOS-api==0.21.0
+psycopg[binary]>=3.2,<4
+
+# R4 schedule timezone support
+tzdata>=2025.2
+
+# R14 parent authentication / encrypted TOTP enrollment
+cryptography>=46,<47
+qrcode[pil]>=8,<9

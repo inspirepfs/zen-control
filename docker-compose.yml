@@ -1,0 +1,297 @@
+services:
+
+  mikrotik-control:
+    build: .
+    container_name: mikrotik-control
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ADMIN_USER: ${ADMIN_USER}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+      OTP_ENCRYPTION_KEY: ${OTP_ENCRYPTION_KEY:-}
+      OTP_ISSUER: "${OTP_ISSUER:-ZEN Control}"
+
+      MIKROTIK_HOST: ${MIKROTIK_HOST}
+      MIKROTIK_PORT: ${MIKROTIK_PORT}
+      MIKROTIK_USER: ${MIKROTIK_USER}
+      MIKROTIK_PASSWORD: ${MIKROTIK_PASSWORD}
+
+      POLICY_DB: /data/policy.db
+
+      TELEMETRY_DB_HOST: telemetry-db
+      TELEMETRY_DB_PORT: "5432"
+      TELEMETRY_DB_NAME: ${TELEMETRY_DB_NAME:-mikrotik}
+      TELEMETRY_DB_USER: ${TELEMETRY_DB_USER:-mikrotik}
+      TELEMETRY_DB_PASSWORD: ${TELEMETRY_DB_PASSWORD}
+
+      # Optional v0.25 Parent Summary Delivery transports. Delivery remains
+      # disabled until explicitly enabled in ZEN Control settings.
+      SUMMARY_SMTP_HOST: ${SUMMARY_SMTP_HOST:-}
+      SUMMARY_SMTP_PORT: "${SUMMARY_SMTP_PORT:-587}"
+      SUMMARY_SMTP_USERNAME: ${SUMMARY_SMTP_USERNAME:-}
+      SUMMARY_SMTP_PASSWORD: ${SUMMARY_SMTP_PASSWORD:-}
+      SUMMARY_SMTP_FROM: ${SUMMARY_SMTP_FROM:-}
+      SUMMARY_SMTP_STARTTLS: "${SUMMARY_SMTP_STARTTLS:-1}"
+      SUMMARY_WEBHOOK_TOKEN: ${SUMMARY_WEBHOOK_TOKEN:-}
+      SUMMARY_DELIVERY_POLL_SECONDS: "${SUMMARY_DELIVERY_POLL_SECONDS:-30}"
+
+      # v0.30 performance gathering. Metrics are bounded and memory-only.
+      ZEN_PERF_ENABLED: "${ZEN_PERF_ENABLED:-1}"
+      ZEN_PERF_SAMPLE_LIMIT: "${ZEN_PERF_SAMPLE_LIMIT:-500}"
+      ZEN_PERF_COMPONENT_LIMIT: "${ZEN_PERF_COMPONENT_LIMIT:-2000}"
+      ZEN_PERF_SLOW_MS: "${ZEN_PERF_SLOW_MS:-1000}"
+      ZEN_PERF_SQL_PREVIEW: "${ZEN_PERF_SQL_PREVIEW:-1}"
+
+      # v0.51 secure transport. Disabled by default so applying the release does
+      # not alter existing LAN access before Cloudflare commissioning is ready.
+      ZEN_REMOTE_ACCESS_ENABLED: "${ZEN_REMOTE_ACCESS_ENABLED:-0}"
+      ZEN_SECURE_COOKIES: "${ZEN_SECURE_COOKIES:-0}"
+      ZEN_PUBLIC_HOST: "${ZEN_PUBLIC_HOST:-}"
+      ZEN_ALLOWED_HOSTS: "${ZEN_ALLOWED_HOSTS:-}"
+      ZEN_CLOUDFLARE_ACCESS_PROTECTED: "${ZEN_CLOUDFLARE_ACCESS_PROTECTED:-0}"
+      ZEN_HSTS_MAX_AGE: "${ZEN_HSTS_MAX_AGE:-31536000}"
+
+      # v0.46 sanitized classifier-consumer heartbeat. Read-only and contains
+      # no device/domain/traffic evidence.
+      CLASSIFIER_STATUS_FILE: /telemetry-state/classifier-status.json
+      INGEST_STATUS_FILE: /telemetry-state/ingest-status.json
+
+    volumes:
+      - mikrotik-control-data:/data
+      - telemetry-state:/telemetry-state:ro
+
+    # Deliberately no depends_on for telemetry.
+    # The control application must remain available if telemetry is down.
+
+
+  # v0.51 optional outbound-only Cloudflare Tunnel connector. The profile keeps
+  # it stopped until remote access is deliberately commissioned. The remotely
+  # managed route should target http://mikrotik-control:8080 and enable
+  # Cloudflare Tunnel "Protect with Access" in the Cloudflare dashboard.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.0
+    container_name: zen-cloudflared
+    profiles: ["remote-access"]
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+    environment:
+      TUNNEL_TOKEN_FILE: /run/secrets/cloudflare_tunnel_token
+    depends_on:
+      mikrotik-control:
+        condition: service_started
+    secrets:
+      - cloudflare_tunnel_token
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  flow-pipe-init:
+    image: alpine:latest
+    container_name: flow-pipe-init
+
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -p /flow/flows.pipe ]; then
+          mkfifo /flow/flows.pipe
+        fi
+        chmod 666 /flow/flows.pipe
+
+    volumes:
+      - flow-pipe:/flow
+
+    restart: "no"
+
+  goflow2:
+    image: netsampler/goflow2:latest
+    container_name: goflow2
+    restart: unless-stopped
+    depends_on:
+      flow-pipe-init:
+        condition: service_completed_successfully
+    command:
+      - -listen
+      - "netflow://:2055/?count=1&workers=1"
+      - -format
+      - json
+      - -mapping
+      - /etc/goflow2/mapping.yaml
+      - -transport.file
+      - /flow/flows.pipe
+    ports:
+      - "2055:2055/udp"
+    volumes:
+      - flow-pipe:/flow
+      - ./telemetry/goflow2/mapping.yaml:/etc/goflow2/mapping.yaml:ro
+
+
+  telemetry-db:
+    image: postgres:17-bookworm
+    container_name: mikrotik-telemetry-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${TELEMETRY_DB_NAME:-mikrotik}
+      POSTGRES_USER: ${TELEMETRY_DB_USER:-mikrotik}
+      POSTGRES_PASSWORD: ${TELEMETRY_DB_PASSWORD}
+
+    volumes:
+      - telemetry-postgres-data:/var/lib/postgresql/data
+      - ./telemetry/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+
+    # PostgreSQL is only exposed locally on the Docker host.
+    # Containers use telemetry-db:5432 internally.
+    ports:
+      - "127.0.0.1:5433:5432"
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
+
+
+  pihole:
+    image: pihole/pihole:latest
+    container_name: mikrotik-pihole
+    restart: unless-stopped
+    environment:
+      TZ: Europe/London
+
+      FTLCONF_webserver_api_password: ${PIHOLE_PASSWORD}
+
+      FTLCONF_dns_listeningMode: ALL
+      FTLCONF_dns_queryLogging: "true"
+
+      FTLCONF_dns_upstreams: "1.1.1.1;1.0.0.1"
+
+      FTLCONF_database_maxDBdays: "30"
+
+    ports:
+      # DNS available on the LAN specifically through this host IP.
+      - "${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set}:53:53/tcp"
+      - "${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set}:53:53/udp"
+
+      # Pi-hole web UI.
+      - "${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set}:8081:80/tcp"
+
+    volumes:
+      - pihole-etc:/etc/pihole
+
+
+  traffic-ingest:
+    build:
+      context: ./telemetry/ingest
+    container_name: mikrotik-traffic-ingest
+    restart: unless-stopped
+
+    depends_on:
+      telemetry-db:
+        condition: service_healthy
+
+      pihole:
+        condition: service_started
+
+      flow-pipe-init:
+        condition: service_completed_successfully
+
+    environment:
+      TELEMETRY_DB_HOST: telemetry-db
+      TELEMETRY_DB_PORT: "5432"
+      TELEMETRY_DB_NAME: ${TELEMETRY_DB_NAME:-mikrotik}
+      TELEMETRY_DB_USER: ${TELEMETRY_DB_USER:-mikrotik}
+      TELEMETRY_DB_PASSWORD: ${TELEMETRY_DB_PASSWORD}
+
+      # Optional v0.25 Parent Summary Delivery transports. Delivery remains
+      # disabled until explicitly enabled in ZEN Control settings.
+      SUMMARY_SMTP_HOST: ${SUMMARY_SMTP_HOST:-}
+      SUMMARY_SMTP_PORT: "${SUMMARY_SMTP_PORT:-587}"
+      SUMMARY_SMTP_USERNAME: ${SUMMARY_SMTP_USERNAME:-}
+      SUMMARY_SMTP_PASSWORD: ${SUMMARY_SMTP_PASSWORD:-}
+      SUMMARY_SMTP_FROM: ${SUMMARY_SMTP_FROM:-}
+      SUMMARY_SMTP_STARTTLS: "${SUMMARY_SMTP_STARTTLS:-1}"
+      SUMMARY_WEBHOOK_TOKEN: ${SUMMARY_WEBHOOK_TOKEN:-}
+      SUMMARY_DELIVERY_POLL_SECONDS: "${SUMMARY_DELIVERY_POLL_SECONDS:-30}"
+
+      FLOW_PIPE: /flow/flows.pipe
+
+      PIHOLE_DB: /pihole/pihole-FTL.db
+      PIHOLE_DNS: pihole
+
+      STATE_FILE: /state/ingest-state.json
+      CLASSIFIER_STATUS_FILE: /state/classifier-status.json
+      CLASSIFIER_STATUS_SECONDS: "5"
+      INGEST_STATUS_FILE: /state/ingest-status.json
+      INGEST_STATUS_SECONDS: "5"
+      SERVICE_CATALOG_FILE: /control-data/service-catalog.json
+
+      LAN_CIDRS: ${ZEN_LAN_CIDRS:-192.168.1.0/24}
+
+      DNS_POLL_SECONDS: "10"
+      DOMAIN_IP_TTL: "900"
+
+    volumes:
+      - flow-pipe:/flow
+      - pihole-etc:/pihole:ro
+      - telemetry-state:/state
+      - mikrotik-control-data:/control-data:ro
+
+
+
+  # Local HTTPS path for ZEN.
+  #
+  # LAN DNS should resolve ZEN_LOCAL_HOST directly to ZEN_LAN_BIND_IP.
+  # External/public DNS continues to use Cloudflare Access + Tunnel.
+  zen-local-https:
+    build:
+      context: ./deploy/caddy
+      dockerfile: Dockerfile
+    image: zen-local-https:0.52.1
+    container_name: zen-local-https
+    restart: unless-stopped
+
+    environment:
+      CF_API_TOKEN: ${CADDY_CF_API_TOKEN}
+      ZEN_LOCAL_HOST: ${ZEN_LOCAL_HOST:?ZEN_LOCAL_HOST must be set}
+
+    ports:
+      - "${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set}:443:443/tcp"
+      - "${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set}:443:443/udp"
+
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+    depends_on:
+      mikrotik-control:
+        condition: service_started
+
+secrets:
+  cloudflare_tunnel_token:
+    file: ${CLOUDFLARE_TUNNEL_TOKEN_FILE:-./secrets/cloudflare-tunnel-token}
+
+volumes:
+
+  caddy_data:
+  caddy_config:
+
+  mikrotik-control-data:
+
+  telemetry-postgres-data:
+
+  pihole-etc:
+
+  flow-pipe:
+
+  telemetry-state:

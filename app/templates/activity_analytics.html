@@ -1,0 +1,180 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Historical Activity · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="analytics-header standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · HISTORICAL ACTIVITY</div>
+    <div class="brand">{{selected_name}}{% if selected_ip %} <span class="muted">({{selected_ip}})</span>{% endif %}</div>
+    <div class="muted small">{{window.label if window else 'Activity history'}} · {{timezone_name}}</div>
+  </div>
+  <div class="activity-page-actions"><a class="button-link secondary back-link" href="/?view=activity&amp;section=history#activity/history">Back to Activity</a>{% if selected_ip %}<a class="button-link" href="/?view=devices&amp;section=managed&amp;focus=device:{{selected_ip}}#devices/managed">Managed device</a><a class="button-link secondary" href="/?view=policies&amp;section=assignments&amp;focus=assignment:{{selected_ip}}#policies/assignments">Policy</a><a class="button-link secondary" href="/activity/policy-history?period={{period}}&amp;client_ip={{selected_ip}}{% if period == 'custom' %}&amp;start={{custom_start}}&amp;end={{custom_end}}{% endif %}">Policy correlation</a>{% endif %}</div>
+</header>
+<main class="analytics-main">
+{% set page_help = zen_help('activity_history') %}
+{% include "_context_help.jinja" %}
+  <section class="card analytics-filter-card">
+    <div class="analytics-filter-row">
+      <nav class="analytics-periods" aria-label="Activity period">
+        {% for key,label in [('today','Today'),('yesterday','Yesterday'),('7d','7 days'),('30d','30 days')] %}
+          <a class="analytics-period {% if period == key %}active{% endif %}" href="/activity/analytics?period={{key}}{% if selected_ip %}&client_ip={{selected_ip}}{% endif %}">{{label}}</a>
+        {% endfor %}
+      </nav>
+      <form method="get" action="/activity/analytics" class="analytics-device-filter">
+        <input type="hidden" name="period" value="{{period}}">
+        {% if period == 'custom' %}<input type="hidden" name="start" value="{{custom_start}}"><input type="hidden" name="end" value="{{custom_end}}">{% endif %}
+        <label>Device
+          <select name="client_ip" onchange="this.form.submit()">
+            <option value="">All devices</option>
+            {% for ip,name in managed_names|dictsort(by='value') %}
+              <option value="{{ip}}" {% if selected_ip == ip %}selected{% endif %}>{{name}} ({{ip}})</option>
+            {% endfor %}
+          </select>
+        </label>
+      </form>
+    </div>
+    <form method="get" action="/activity/analytics" class="analytics-custom-range">
+      <input type="hidden" name="period" value="custom">
+      {% if selected_ip %}<input type="hidden" name="client_ip" value="{{selected_ip}}">{% endif %}
+      <label>Custom start <input type="date" name="start" value="{{custom_start or window.start_date if window else ''}}" required></label>
+      <label>Custom end <input type="date" name="end" value="{{custom_end or window.end_date if window else ''}}" required></label>
+      <button>Apply custom range</button>
+    </form>
+  </section>
+
+  {% if error %}
+  <section class="card"><div class="conflict-warning">{{error}}</div></section>
+  {% else %}
+
+  {% macro delta(metric) -%}
+    {% set item = comparison.get(metric, {}) %}
+    {% if item.delta_percent is none %}
+      {% if item.current %}<span class="analytics-delta new">NEW</span>{% else %}<span class="analytics-delta flat">0%</span>{% endif %}
+    {% elif item.delta_percent > 0 %}<span class="analytics-delta up">+{{item.delta_percent}}%</span>
+    {% elif item.delta_percent < 0 %}<span class="analytics-delta down">{{item.delta_percent}}%</span>
+    {% else %}<span class="analytics-delta flat">0%</span>{% endif %}
+  {%- endmacro %}
+
+  <section class="card analytics-summary-card">
+    <div class="card-heading">
+      <div><h2>{{window.label}}</h2><p class="muted">Compared with the immediately preceding {{window.duration_hours|round(1)}} hour window.</p></div>
+      <span class="policy-badge enabled">{{window.start_date}} → {{window.end_date}}</span>
+    </div>
+    <div class="analytics-kpi-grid">
+      <div><span>Total traffic</span><strong>{{current.total_bytes_human}}</strong>{{delta('total_bytes')}}</div>
+      <div><span>Download</span><strong>{{current.download_bytes_human}}</strong>{{delta('download_bytes')}}</div>
+      <div><span>Upload</span><strong>{{current.upload_bytes_human}}</strong>{{delta('upload_bytes')}}</div>
+      <div><span>Flows</span><strong>{{current.flows}}</strong>{{delta('flows')}}</div>
+      <div><span>DNS queries</span><strong>{{current.dns_queries}}</strong>{{delta('dns_queries')}}</div>
+      <div><span>Blocked DNS</span><strong>{{current.dns_blocked}}</strong>{{delta('dns_blocked')}}</div>
+      <div><span>Unique domains</span><strong>{{current.unique_domains}}</strong>{{delta('unique_domains')}}</div>
+      <div><span>Service classified</span><strong>{{current.attributed_percent}}%</strong><small>{{current.attributed_bytes_human}} attributed</small></div>
+    </div>
+    <div class="analytics-first-last muted small">First flow {{current.first_flow or '—'}} · Last flow {{current.last_flow or '—'}} · First DNS {{current.first_dns or '—'}} · Last DNS {{current.last_dns or '—'}}</div>
+  </section>
+
+  <section class="card analytics-daily-card">
+    <div class="card-heading"><div><h2>Daily trend</h2><p class="muted">Traffic, DNS and classification coverage by local policy day.</p></div></div>
+    <div class="analytics-daily-list">
+      {% for item in daily %}
+      <div class="analytics-day-row">
+        <strong>{{item.day}}</strong>
+        <div class="analytics-day-bar"><span style="width:{{item.bar_percent}}%"></span></div>
+        <span>{{item.total_bytes_human}}</span>
+        <span>{{item.dns_queries}} DNS</span>
+        <span>{{item.dns_blocked}} blocked</span>
+        <span>{% if item.traffic_percent is none %}NO EVIDENCE traffic classification{% else %}{{item.traffic_percent}}% traffic classified{% endif %}</span>
+        <span>{% if item.dns_percent is none %}NO EVIDENCE DNS classification{% else %}{{item.dns_percent}}% DNS classified{% endif %}</span>
+      </div>
+      {% else %}<p class="muted">No retained activity in this period.</p>{% endfor %}
+    </div>
+  </section>
+
+  <div class="analytics-two-column">
+    {% if not selected_ip %}
+    <section class="card">
+      <div class="card-heading"><div><h2>Top devices</h2><p class="muted">Household traffic ranked for this period.</p></div></div>
+      <div class="analytics-ranked-list">
+        {% for item in top_devices %}
+        <a class="analytics-ranked-row" href="/activity/analytics?period={{period}}&client_ip={{item.client_ip}}{% if period == 'custom' %}&start={{custom_start}}&end={{custom_end}}{% endif %}">
+          <span><strong>{% if item.managed %}{{item.display_name}} <span class="muted">({{item.client_ip}})</span>{% else %}{{item.client_ip}}{% endif %}</strong><small>{{item.flows}} flows</small></span>
+          <span>{{item.total_bytes_human}}</span>
+        </a>
+        {% else %}<p class="muted">No device activity.</p>{% endfor %}
+      </div>
+    </section>
+    {% else %}
+    <section class="card">
+      <div class="card-heading"><div><h2>Active periods</h2><p class="muted">Traffic buckets separated by more than 30 minutes of inactivity.</p></div></div>
+      <div class="analytics-period-list">
+        {% for item in active_periods %}
+        <div><strong>{{item.local_start[5:]}} → {{item.local_end[11:]}}</strong><span>{{item.duration_minutes}} min · {{item.total_bytes_human}} · {{item.flows}} flows</span></div>
+        {% else %}<p class="muted">No active periods detected.</p>{% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <div class="card-heading"><div><h2>Top services</h2><p class="muted">What accounted for the most traffic in this period.</p></div></div>
+      <div class="analytics-ranked-list">
+        {% for item in services %}
+          {% if item.service_key %}<a class="analytics-ranked-row" href="/activity/service/{{item.service_key}}?hours={{window.duration_hours|int}}">{% else %}<div class="analytics-ranked-row">{% endif %}
+            <span><strong>{{item.service_name}}</strong><small>{{item.flows}} flows · {{item.percent}}%</small></span><span>{{item.total_bytes_human}}</span>
+          {% if item.service_key %}</a>{% else %}</div>{% endif %}
+        {% else %}<p class="muted">No service attribution in this period.</p>{% endfor %}
+      </div>
+    </section>
+  </div>
+
+  <div class="analytics-two-column">
+    <section class="card">
+      <div class="card-heading"><div><h2>New domains</h2><p class="muted">Domains seen in this period with no evidence in the preceding 30 days.</p></div><span class="policy-badge staging">{{new_domains|length}} NEW</span></div>
+      <div class="activity-table-wrap analytics-domain-table">
+        <table class="activity-table"><thead><tr><th>Domain</th><th>Service</th><th>Queries</th><th>Devices</th><th>First seen</th></tr></thead><tbody>
+        {% for item in new_domains %}<tr><td><strong>{{item.domain}}</strong>{% if item.blocked %}<span class="policy-badge disabled">{{item.blocked}} BLOCKED</span>{% endif %}</td><td>{{item.service or 'Unknown'}}</td><td>{{item.queries}}</td><td>{{item.devices}}</td><td>{{item.local_first_seen or '—'}}</td></tr>
+        {% else %}<tr><td colspan="5" class="muted">No new domains identified in this period.</td></tr>{% endfor %}
+        </tbody></table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-heading"><div><h2>Top domains</h2><p class="muted">Most frequently queried DNS names in the selected period.</p></div></div>
+      <div class="activity-table-wrap analytics-domain-table">
+        <table class="activity-table"><thead><tr><th>Domain</th><th>Service</th><th>Queries</th><th>Blocked</th></tr></thead><tbody>
+        {% for item in domains[:30] %}<tr><td><strong>{{item.domain}}</strong></td><td>{{item.service or '—'}}</td><td>{{item.queries}}</td><td>{{item.blocked}}</td></tr>
+        {% else %}<tr><td colspan="4" class="muted">No DNS history.</td></tr>{% endfor %}
+        </tbody></table>
+      </div>
+    </section>
+  </div>
+
+  <section class="card analytics-timeline-card">
+    <div class="card-heading"><div><h2>Activity timeline</h2><p class="muted">Chronological 30-minute service traffic plus blocked DNS evidence. This is network evidence, not browser-history reconstruction.</p></div><span class="policy-badge enabled">{{timeline|length}} EVENTS</span></div>
+    <div class="analytics-timeline">
+      {% for item in timeline %}
+      <div class="analytics-timeline-row {{item.kind}}">
+        <time>{{item.local_time}}</time>
+        <span class="analytics-timeline-device">{% if item.managed %}{{item.display_name}} <small>({{item.client_ip}})</small>{% else %}{{item.client_ip}}{% endif %}</span>
+        {% if item.kind == 'blocked_dns' %}
+          <span><strong>Blocked DNS</strong> · {{item.domain}}{% if item.service %} · {{item.service}}{% endif %}</span><strong>{{item.blocked}}×</strong>
+        {% else %}
+          <span><strong>{{item.service}}</strong>{% if item.domain %} · {{item.domain}}{% endif %}</span><strong>{{item.total_bytes_human}}</strong>
+        {% endif %}
+      </div>
+      {% else %}<p class="muted">No timeline evidence in this period.</p>{% endfor %}
+    </div>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

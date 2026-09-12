@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b1020">
+  <title>ZEN Control · Offline</title>
+  <style>
+    :root{color-scheme:dark;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b1020;color:#eef2ff}
+    *{box-sizing:border-box}body{margin:0;min-height:100dvh;display:grid;place-items:center;padding:max(24px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(20px,env(safe-area-inset-left));background:radial-gradient(circle at top,#172344,#0b1020 58%)}
+    main{width:min(520px,100%);padding:24px;border:1px solid #2c3b68;border-radius:18px;background:#111a31;box-shadow:0 18px 55px rgba(0,0,0,.3)}
+    .eyebrow{font-size:.76rem;font-weight:800;letter-spacing:.12em;color:#9fb0da}h1{margin:.35rem 0 .75rem;font-size:clamp(1.65rem,5vw,2.3rem)}p{line-height:1.55;color:#c0cae3}.status{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:999px;background:#5a451a;color:#ffe1a4;font-size:.76rem;font-weight:800}.dot{width:8px;height:8px;border-radius:50%;background:currentColor}button{min-height:44px;margin-top:10px;padding:10px 16px;border:1px solid #7086bd;border-radius:10px;background:#26345e;color:#fff;font-weight:800;cursor:pointer}.fine{font-size:.78rem;color:#8f9cbb;margin-top:18px}
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">ZEN CONTROL</div>
+  <span class="status"><span class="dot"></span>OFFLINE</span>
+  <h1>ZEN Control is unavailable</h1>
+  <p>This installed app needs a live connection to ZEN Control. Policy, device, activity and authentication data are intentionally not stored for offline viewing.</p>
+  <button type="button" onclick="location.reload()">Try again</button>
+  <p class="fine">No changes are queued while offline. RouterOS remains the enforcement authority and ZEN will reconnect normally when the server is reachable.</p>
+</main>
+</body>
+</html>

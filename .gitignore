@@ -1,0 +1,82 @@
+# ============================================================
+# ZEN Control - local/runtime/private files
+# ============================================================
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+certs/
+cloudflare-tunnel-token
+
+# Runtime data
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.pid
+*.sock
+
+# Logs / diagnostics
+*.log
+logs/
+diagnostics/
+*.pcap
+*.pcapng
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+
+# Local backups / working copies
+*.bak
+*.backup
+*.backup-*
+*.pre-*
+*.orig
+*.rej
+
+# Patch/build artefacts
+*.patch
+*.tar.gz
+*.tgz
+*.zip
+*.sha256
+*.manifest.txt
+
+# Runtime performance exports
+zen-runtime-performance.txt
+zen-unit-performance.txt
+zen-performance.json
+zen-release-readiness.json
+
+# ZEN historical working-tree backups
+app.backup-*/
+tests.backup-*/
+backup/
+backups/

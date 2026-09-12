@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Operational Diagnostics · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/diagnostics.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<main class="standalone-page diagnostics-page">
+{% set page_help = zen_help('diagnostics') %}
+{% include "_context_help.jinja" %}
+  <header class="standalone-header diagnostics-header">
+    <div>
+      <div class="eyebrow">ZEN CONTROL · OPERATIONS</div>
+      <h1>Operational diagnostics</h1>
+      <p class="muted">Read-only capture of application, data, RouterOS authority, telemetry dependencies, workers and performance evidence. It does not repair or change policy.</p>
+    </div>
+    <div class="standalone-actions diagnostics-actions">
+      <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
+      <a class="button-link secondary" href="/performance">Performance</a>
+      <a class="button-link" href="/api/operations/diagnostics">JSON</a>
+      <a class="button-link primary" href="/local/operations/diagnostics/export">Download sanitized bundle</a>
+      <a class="button-link secondary" href="/diagnostics">Run again</a>
+    </div>
+  </header>
+
+  <section class="diagnostic-hero state-{{report.overall}}">
+    <div>
+      <span class="diagnostic-state">{{report.overall|upper}}</span>
+      <strong>{{report.counts.healthy}} healthy · {{report.counts.warning}} warning · {{report.counts.critical}} critical · {{report.counts.offline}} offline</strong>
+    </div>
+    <div class="muted small">Captured {{report.captured_at}} · ZEN {{report.version}}</div>
+  </section>
+
+  <section class="diagnostic-grid">
+    {% for item in report.checks %}
+    <article class="diagnostic-check state-{{item.state}}">
+      <div class="diagnostic-check-heading">
+        <strong>{{item.label}}</strong>
+        <span class="diagnostic-pill">{{item.state|upper}}</span>
+      </div>
+      <div class="diagnostic-summary">{{item.summary}}</div>
+      {% if item.duration_ms %}<div class="muted small">Probe {{'%.1f'|format(item.duration_ms)}} ms</div>{% endif %}
+      {% if item.facts %}
+      <div class="diagnostic-facts">
+        {% for key, value in item.facts.items() %}
+          <span><small>{{key|replace('_',' ')|title}}</small><strong>{{value}}</strong></span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="card diagnostics-performance">
+    <div class="card-heading">
+      <div><h2>Performance evidence</h2><p class="muted">Bounded performance evidence retained in memory. Use the Performance workbench for v0.39 acceptance and request-level drill-down.</p></div>
+      <a class="button-link compact secondary" href="/performance">Open Performance</a>
+    </div>
+    {% set req = report.performance.requests %}
+    {% if report.performance.available %}
+    <div class="diagnostic-kpis">
+      <span><small>Requests retained</small><strong>{{req.retained}}</strong></span>
+      <span><small>p50</small><strong>{{'%.1f'|format(req.p50_ms)}} ms</strong></span>
+      <span><small>p95</small><strong>{{'%.1f'|format(req.p95_ms)}} ms</strong></span>
+      <span><small>p99</small><strong>{{'%.1f'|format(req.p99_ms)}} ms</strong></span>
+      <span><small>Max</small><strong>{{'%.1f'|format(req.max_ms)}} ms</strong></span>
+      <span><small>Slow</small><strong>{{req.slow_count}}</strong></span>
+    </div>
+    {% if report.performance.slow_routes %}
+    <div class="table-scroll">
+      <table class="compact-table">
+        <thead><tr><th>Route</th><th>Calls</th><th>p50</th><th>p95</th><th>Max</th><th>Errors</th></tr></thead>
+        <tbody>
+        {% for row in report.performance.slow_routes %}
+          <tr><td><code>{{row.route}}</code></td><td>{{row.count}}</td><td>{{'%.1f'|format(row.p50_ms)}} ms</td><td>{{'%.1f'|format(row.p95_ms)}} ms</td><td>{{'%.1f'|format(row.max_ms)}} ms</td><td>{{row.errors}}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<p class="muted">No retained request samples yet.</p>{% endif %}
+    {% else %}<p class="muted">Performance evidence is unavailable for this capture. Other diagnostic checks remain valid independently.</p>{% endif %}
+  </section>
+
+  <section class="card diagnostics-privacy">
+    <h2>Sanitized support bundle</h2>
+    <p class="muted">The downloadable bundle is intentionally safe to share for troubleshooting. It includes health states, counts and timings only.</p>
+    <div class="diagnostic-omit-list">
+      {% for item in report.privacy.omitted %}<span>Not included: <strong>{{item}}</strong></span>{% endfor %}
+    </div>
+    <div class="local-only-note">Diagnostics are observational. ZEN will not create, repair or alter critical RouterOS authority from this page.</div>
+  </section>
+</main>
+</body>
+</html>

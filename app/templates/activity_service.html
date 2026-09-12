@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Service activity · {{service.name}} · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · SERVICE INTELLIGENCE</div>
+    <div class="brand">{{service.name}}</div>
+    <div class="muted small">{{service.key}} · {{service.category|upper}}</div>
+  </div>
+  <div class="activity-page-actions"><a class="button-link secondary back-link" href="/?view=activity&amp;section=services#activity/services">Back to Activity</a><a class="button-link" href="/?view=policies&amp;section=services&amp;focus=service:{{service.key}}#policies/services">Policy definition</a></div>
+</header>
+<main>
+{% set page_help = zen_help('activity_services') %}
+{% include "_context_help.jinja" %}
+  {% if error %}
+    <section class="card"><div class="conflict-warning">{{error}}</div></section>
+  {% else %}
+  <section class="card">
+    <div class="card-heading">
+      <div><h2>{{hours}} hour service summary</h2><p class="muted">Retained IPFIX traffic and Pi-hole DNS evidence attributed to this service.</p></div>
+      {% if router_health %}
+        {% if router_health.healthy %}<span class="policy-badge enabled">TLS CONTRACT HEALTHY</span>{% else %}<span class="policy-badge disabled">TLS CONTRACT DEGRADED</span>{% endif %}
+      {% elif service.dns_suffixes or service.tls_patterns %}
+        <span class="policy-badge staging">REPORTING CLASSIFIER</span>
+      {% else %}<span class="policy-badge staging">NO SIGNATURES</span>{% endif %}
+    </div>
+    <div class="service-drill-grid">
+      <div><span>Traffic</span><strong>{{detail.total_bytes_human}}</strong></div>
+      <div><span>Flows</span><strong>{{detail.flows}}</strong></div>
+      <div><span>Devices</span><strong>{{detail.devices}}</strong></div>
+      <div><span>DNS queries</span><strong>{{detail.dns_queries}}</strong></div>
+      <div><span>DNS blocked</span><strong>{{detail.dns_blocked}}</strong></div>
+      <div><span>Domains</span><strong>{{detail.domains}}</strong></div>
+    </div>
+    <div class="muted small" style="margin-top:6px">First flow {{detail.first_seen or '—'}} · Last flow {{detail.last_seen or '—'}} · Last DNS {{detail.dns_last_seen or '—'}}</div>
+  </section>
+
+  <section class="card classifier-contract-panel">
+    <div class="card-heading"><div><h2>Classifier coverage</h2><p class="muted">The signatures that make this service identifiable.</p></div></div>
+    <div class="classifier-contract-meta">
+      <span class="policy-badge staging">{{service.dns_suffixes|length}} DNS SUFFIXES</span>
+      <span class="policy-badge staging">{{service.tls_patterns|length}} TLS PATTERNS</span>
+      {% if router_health %}<span class="policy-badge enabled">{{router_health.detector_addresses or 0}} DETECTOR IPS</span>{% endif %}
+    </div>
+    <div class="signature-grid">
+      <div><span class="muted small">TLS/SNI search patterns</span><div class="signature-chips">{% for item in service.tls_patterns %}<code>{{item}}</code>{% else %}<span class="muted">No TLS signatures configured.</span>{% endfor %}</div></div>
+      <div><span class="muted small">DNS suffixes</span><div class="signature-chips">{% for item in service.dns_suffixes %}<code>{{item}}</code>{% else %}<span class="muted">No DNS suffixes configured.</span>{% endfor %}</div></div>
+    </div>
+    {% if router_health.error %}<div class="conflict-warning">{{router_health.error}}</div>{% endif %}
+    {% if service.coverage_note %}<div class="muted small">{{service.coverage_note}}</div>{% endif %}
+  </section>
+
+  <div class="service-drill-layout">
+    <section class="card">
+      <div class="card-heading"><div><h2>Devices using {{service.name}}</h2><p class="muted">Highest attributed traffic first.</p></div></div>
+      <div class="activity-table-wrap">
+        <table class="activity-table">
+          <thead><tr><th>Device</th><th>Traffic</th><th>Flows</th><th>Last seen</th></tr></thead>
+          <tbody>
+          {% for item in detail.top_devices %}
+            <tr><td><strong>{% if item.managed %}<a class="activity-inline-link" href="/devices/{{item.client_ip}}">{{item.display_name}}</a> <span class="muted">({{item.client_ip}})</span>{% else %}{{item.client_ip}}{% endif %}</strong>{% if item.managed %}<div><a class="inline-context-link" href="/policy/explain/{{item.client_ip}}?service={{service.key}}">why this service?</a> · <a class="inline-context-link" href="/activity/device/{{item.client_ip}}">activity</a> · <a class="inline-context-link" href="/?view=devices&amp;section=managed&amp;focus=device:{{item.client_ip}}#devices/managed">managed device</a></div>{% endif %}</td><td>{{item.total_bytes_human}}</td><td>{{item.flows}}</td><td>{{item.last_seen or '—'}}</td></tr>
+          {% else %}<tr><td colspan="4" class="muted">No attributed IPFIX traffic in this window.</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-heading"><div><h2>DNS names</h2><p class="muted">Domains currently attributed to this service.</p></div></div>
+      <div class="activity-table-wrap">
+        <table class="activity-table">
+          <thead><tr><th>Domain</th><th>Queries</th><th>Devices</th><th>Blocked</th></tr></thead>
+          <tbody>
+          {% for item in detail.top_domains %}
+            <tr><td><strong>{{item.domain}}</strong></td><td>{{item.queries}}</td><td>{{item.devices}}</td><td>{{item.blocked}}</td></tr>
+          {% else %}<tr><td colspan="4" class="muted">No DNS evidence attributed to this service.</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Hourly traffic</h2><p class="muted">Simple retained traffic profile for quick pattern spotting.</p></div></div>
+    {% set hourly_max = detail.hourly|map(attribute='total_bytes')|max if detail.hourly else 1 %}
+    <div class="service-hour-bars">
+      {% for item in detail.hourly %}
+        <div class="service-hour-row"><span>{{item.bucket[5:16].replace('T',' ') if item.bucket else '—'}}</span><div class="service-hour-track"><div class="service-hour-fill" style="width:{{ ((item.total_bytes * 100 / hourly_max) if hourly_max else 0)|round(1) }}%"></div></div><strong>{{item.total_bytes_human}}</strong></div>
+      {% else %}<p class="muted">No hourly service traffic in this window.</p>{% endfor %}
+    </div>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

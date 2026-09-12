@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Why this policy? · {{explanation.device.name}} · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header">
+  <div><div class="eyebrow">ZEN CONTROL · POLICY EXPLAINABILITY</div><div class="brand">{{explanation.device.name}} <span class="muted">({{explanation.device.ip}})</span></div></div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="/devices/{{explanation.device.ip}}">Back to Device 360</a>
+    <a class="button-link" href="{{explanation.links.assignment}}">Policy assignment</a>
+    <a class="button-link secondary" href="{{explanation.links.activity}}">Activity</a>
+    <a class="button-link secondary" href="{{explanation.links.history}}">7-day history</a>
+  </div>
+</header>
+<main>
+{% set page_help = zen_help('policy_explain') %}
+{% include "_context_help.jinja" %}
+<section class="card policy-explain-hero">
+  <div class="card-heading">
+    <div><h2>Why is this state active?</h2><p class="muted">{{explanation.summary.headline}}</p></div>
+    <div class="card-heading-actions">
+      <span class="live-state live-state-{{explanation.summary.effective_now}}">{{explanation.summary.effective_now|upper}}</span>
+      {% if explanation.summary.sync_status == 'in_sync' %}<span class="reconcile-state reconcile-sync">IN SYNC</span>
+      {% elif explanation.summary.sync_status == 'temporary' %}<span class="reconcile-state reconcile-temp">TEMP OVERRIDE</span>
+      {% elif explanation.summary.sync_status in ['drift','partial'] %}<span class="reconcile-state reconcile-drift">{{explanation.summary.sync_status|upper}}</span>
+      {% else %}<span class="reconcile-state reconcile-error">LIVE UNKNOWN</span>{% endif %}
+    </div>
+  </div>
+  <div class="policy-explain-kpis">
+    <div><span>Desired device mode</span><strong>{{explanation.summary.desired_mode|upper}}</strong><small>{{explanation.summary.mode_source}}</small></div>
+    <div><span>Live device mode</span><strong>{{explanation.summary.live_mode|upper}}</strong><small>RouterOS MC device state</small></div>
+    <div><span>Household mode</span><strong>{{explanation.summary.global_mode|upper}}</strong><small>Global MASTER remains authoritative</small></div>
+    <div><span>Service blocks</span><strong>{{explanation.summary.blocked_services}}</strong><small>{{explanation.summary.service_drift}} service drift</small></div>
+  </div>
+  <div class="local-only-note">Policy explainability is read-only. It describes the computed ZEN policy and fresh RouterOS evidence; it does not create, repair or change firewall authority.</div>
+</section>
+
+<section class="card">
+  <div class="card-heading"><div><h2>Device mode decision chain</h2><p class="muted">Ordered policy inputs and live enforcement evidence. Highlighted rows are actively affecting state.</p></div><span class="policy-badge staging">{{explanation.policy_at or 'NOW'}} · {{explanation.timezone or ''}}</span></div>
+  <div class="policy-explain-chain">
+    {% for row in explanation.mode_chain %}
+    <div class="policy-explain-step {{'active' if row.active else ''}}">
+      <div class="policy-explain-marker">{{loop.index}}</div>
+      <div><strong>{{row.label}}</strong><span class="muted small">{{row.detail}}</span></div>
+      <span class="policy-badge {{'enabled' if row.active else 'staging'}}">{{row.value}}</span>
+      {% if row.href %}<a class="inline-context-link" href="{{row.href}}">Open</a>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+{% if explanation.next_changes %}
+<section class="card">
+  <div class="card-heading"><div><h2>Next automatic change</h2><p class="muted">Known upcoming transitions from the policy clock or RouterOS temporary-access scheduler.</p></div></div>
+  <div class="policy-explain-next">
+    {% for row in explanation.next_changes %}<div><strong>{{row.when}}</strong><span>{{row.label}}{% if row.wall_resolution and row.wall_resolution.adjusted %} · DST adjusted from {{row.requested_time}}{% endif %}</span></div>{% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<section class="card">
+  <div class="card-heading"><div><h2>Service decisions</h2><p class="muted">Concrete service policy provenance, desired state and live RouterOS state. Logical groups are explained as sources, never as firewall primitives.</p></div><span class="policy-badge staging">{{explanation.services|length}} SERVICES</span></div>
+  <div class="activity-table-wrap"><table class="policy-table policy-explain-services">
+    <thead><tr><th>Service</th><th>Desired</th><th>Source</th><th>Live RouterOS</th><th>State</th><th>Drill-down</th></tr></thead>
+    <tbody>
+    {% for svc in explanation.services %}
+      <tr class="{{'context-focus' if svc.focus else ''}}" id="service-{{svc.key}}">
+        <td><strong>{{svc.name}}</strong><div class="muted small">{{svc.key}} · {{svc.classification}}</div></td>
+        <td><span class="policy-badge {{'disabled' if 'BLOCK' in svc.desired else 'enabled'}}">{{svc.desired}}</span></td>
+        <td><strong>{{svc.source}}</strong><div class="muted small">{{svc.detail}}</div></td>
+        <td>{{svc.live}}{% if svc.error %}<div class="conflict-warning">{{svc.error}}</div>{% endif %}</td>
+        <td>{% if not svc.live_known %}<span class="reconcile-state reconcile-error">LIVE UNKNOWN</span>{% elif svc.drift %}<span class="reconcile-state reconcile-drift">DRIFT</span>{% elif svc.available %}<span class="reconcile-state reconcile-sync">PROVEN</span>{% else %}<span class="reconcile-state reconcile-partial">REPORTING ONLY</span>{% endif %}</td>
+        <td><a class="inline-context-link" href="/?view=policies&amp;section=services&amp;focus=service:{{svc.key}}#policies/services">Policy</a>{% if svc.defined %}<a class="inline-context-link" href="/activity/service/{{svc.key}}">Activity</a>{% endif %}</td>
+      </tr>
+    {% else %}<tr><td colspan="6" class="muted">No concrete service definitions are available.</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</section>
+
+<section class="grid two">
+  <div class="card">
+    <h2>Bandwidth decision</h2>
+    <div class="policy-explain-facts">
+      <div><span>Profile preset</span><strong>{{explanation.bandwidth.name}}</strong></div>
+      <div><span>Desired cap</span><strong>{{explanation.bandwidth.upload}} up / {{explanation.bandwidth.download}} down</strong></div>
+      <div><span>Live queue</span><strong>{{explanation.bandwidth.live_limit or ('ACTIVE' if explanation.bandwidth.live_active else 'Unlimited / none')}}</strong></div>
+      <div><span>Status</span><strong>{% if explanation.bandwidth.drift %}DRIFT{% elif explanation.bandwidth.suspended %}SUSPENDED{% else %}OK{% endif %}</strong></div>
+    </div>
+    {% if explanation.bandwidth.suspended %}<div class="local-only-note">Profile bandwidth is intentionally suspended by {{explanation.bandwidth.suspension_reason}}.</div>{% endif %}
+  </div>
+  <div class="card">
+    <h2>Evidence / limits</h2>
+    <p class="muted small">Service policy and network telemetry are not proof of foreground application use or browser history.</p>
+    {% for item in explanation.limitations %}<div class="policy-explain-limit">{{item}}</div>{% endfor %}
+    {% for item in explanation.conflicts %}<div class="conflict-warning">{{item}}</div>{% endfor %}
+    {% if explanation.live_reason %}<div class="muted small">Live plan: {{explanation.live_reason}}</div>{% endif %}
+  </div>
+</section>
+
+{% if explanation.planned_actions %}
+<section class="card"><div class="card-heading"><div><h2>What reconciliation would change</h2><p class="muted">Read-only preview of current actionable drift. Use the normal Managed Device reconciliation controls to write.</p></div></div>
+  <div class="policy-explain-next">{% for action in explanation.planned_actions %}<div><strong>{{action.kind|upper}}</strong><span>{{action.summary}}</span></div>{% endfor %}</div>
+</section>
+{% endif %}
+</main>
+{% if explanation.focus_service %}<script>document.getElementById('service-{{explanation.focus_service.key}}')?.scrollIntoView({block:'center'});</script>{% endif %}
+</body>
+</html>

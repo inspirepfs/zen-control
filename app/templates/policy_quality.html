@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Policy Quality · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/policy-quality.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="page-header compact-page-header quality-page-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · POLICY QUALITY</div>
+    <h1>Conflict &amp; shadow analysis</h1>
+    <div class="muted small">Static saved-configuration review · no RouterOS reads · no writes</div>
+  </div>
+  <div class="activity-page-actions">
+    <span class="policy-badge staging">READ ONLY</span>
+    <a class="button-link secondary back-link" href="/?view=policies&amp;section=tools#policies/tools">Back to Policy tools</a>
+    <a class="button-link secondary" href="/policy/simulate">What-if</a>
+    <a class="button-link secondary" href="/?view=schedules&amp;section=planner#schedules/planner">Schedules</a>
+  </div>
+</header>
+<main class="quality-main">
+{% set page_help = zen_help('policy_quality') %}
+{% include "_context_help.jinja" %}
+  <section class="card quality-summary-card">
+    <div class="card-heading">
+      <div>
+        <h2>Policy quality state</h2>
+        <p class="muted">Deterministic analysis of saved profiles, assignments, schedules, exceptions, service collections and quota configuration.</p>
+      </div>
+      <span class="quality-state quality-state-{{report.state}}">{{report.state|upper}}</span>
+    </div>
+    <div class="quality-kpis">
+      <button type="button" class="quality-filter active" data-quality-filter="all"><span>Total findings</span><strong>{{report.counts.total}}</strong></button>
+      <button type="button" class="quality-filter" data-quality-filter="conflict"><span>Conflicts</span><strong>{{report.counts.conflict}}</strong></button>
+      <button type="button" class="quality-filter" data-quality-filter="warning"><span>Warnings</span><strong>{{report.counts.warning}}</strong></button>
+      <button type="button" class="quality-filter" data-quality-filter="shadow"><span>Shadows</span><strong>{{report.counts.shadow}}</strong></button>
+      <button type="button" class="quality-filter" data-quality-filter="redundant"><span>Redundant</span><strong>{{report.counts.redundant}}</strong></button>
+      <button type="button" class="quality-filter" data-quality-filter="unused"><span>Unused</span><strong>{{report.counts.unused}}</strong></button>
+    </div>
+    <div class="quality-inventory muted small">
+      <span>{{report.inventory.profiles}} profiles</span>
+      <span>{{report.inventory.managed_devices}} managed devices</span>
+      <span>{{report.inventory.schedules}} schedules</span>
+      <span>{{report.inventory.date_exceptions}} date exceptions</span>
+      <span>{{report.inventory.aggregate_policy_groups}} aggregate groups</span>
+      <span>{{report.inventory.service_collections}} reusable collections</span>
+    </div>
+  </section>
+
+  <section class="card quality-guide">
+    <div class="card-heading"><div><h2>How to read this</h2><p class="muted">Not every finding is an error. Shadows and redundancy often represent intentional precedence; ZEN makes them visible so the effective design stays understandable.</p></div></div>
+    <div class="quality-guide-grid">
+      <div><span class="quality-kind conflict">CONFLICT</span><small>Ambiguous or malformed configuration that should be corrected.</small></div>
+      <div><span class="quality-kind warning">WARNING</span><small>Intent exists but a dependency or enforcement condition is inactive/missing.</small></div>
+      <div><span class="quality-kind shadow">SHADOW</span><small>A more-specific control deterministically wins over a broader control.</small></div>
+      <div><span class="quality-kind redundant">REDUNDANT</span><small>Configuration duplicates an outcome and may be unnecessary.</small></div>
+      <div><span class="quality-kind unused">UNUSED</span><small>Saved configuration currently has no managed target/effect.</small></div>
+    </div>
+  </section>
+
+  <section class="card quality-findings-card">
+    <div class="card-heading">
+      <div><h2>Findings</h2><p class="muted"><span id="quality-visible-count">{{report.counts.total}}</span> shown · direct links open the owning editor.</p></div>
+      <a class="inline-context-link" href="/api/policy/quality">JSON contract</a>
+    </div>
+    <div class="quality-findings" id="quality-findings">
+      {% for item in report.findings %}
+      <article class="quality-finding" data-quality-category="{{item.category}}">
+        <div class="quality-finding-head">
+          <div class="quality-finding-title">
+            <span class="quality-kind {{item.category}}">{{item.category|upper}}</span>
+            <strong>{{item.title}}</strong>
+            <span class="muted small">{{item.id}}</span>
+          </div>
+          {% if item.link %}<a class="button-link compact secondary" href="{{item.link}}">Open owner</a>{% endif %}
+        </div>
+        <div class="quality-finding-body">
+          <p>{{item.detail}}</p>
+          {% if item.scope %}<div class="muted small"><strong>Scope:</strong> {{item.scope}}</div>{% endif %}
+          {% if item.evidence %}<div class="quality-evidence">{% for evidence in item.evidence %}<code>{{evidence}}</code>{% endfor %}</div>{% endif %}
+        </div>
+      </article>
+      {% else %}
+      <div class="quality-clean">
+        <strong>No policy-quality findings.</strong>
+        <span class="muted">Saved configuration contains no detected conflicts, shadows, redundancies, warnings or unused objects.</span>
+      </div>
+      {% endfor %}
+    </div>
+    <p class="muted small quality-evidence-note">{{report.evidence_note}}</p>
+  </section>
+</main>
+<script>
+(() => {
+  const buttons = Array.from(document.querySelectorAll('[data-quality-filter]'));
+  const findings = Array.from(document.querySelectorAll('[data-quality-category]'));
+  const count = document.getElementById('quality-visible-count');
+  function applyFilter(category) {
+    let visible = 0;
+    findings.forEach(row => {
+      const show = category === 'all' || row.dataset.qualityCategory === category;
+      row.hidden = !show;
+      if (show) visible += 1;
+    });
+    if (count) count.textContent = String(visible);
+    buttons.forEach(button => button.classList.toggle('active', button.dataset.qualityFilter === category));
+  }
+  buttons.forEach(button => button.addEventListener('click', () => applyFilter(button.dataset.qualityFilter)));
+})();
+</script>
+</body>
+</html>

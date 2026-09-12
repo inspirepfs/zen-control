@@ -1,0 +1,159 @@
+/* Parent activity reporting and incident-centre density. */
+
+/* Incident centre: materially tighter without reducing action clarity. */
+.incident-hero-card{padding:6px 7px!important}
+.incident-hero-card .card-heading{margin-bottom:3px}
+.incident-hero-card .card-heading p{max-width:900px;font-size:.70rem;line-height:1.2}
+.incident-summary-grid{display:grid;grid-template-columns:repeat(6,minmax(72px,1fr));gap:3px;margin:4px 0}
+.incident-summary-grid>div{min-height:38px;padding:4px 6px;border-radius:6px}
+.incident-summary-grid span{font-size:.58rem}
+.incident-summary-grid strong{font-size:.82rem;line-height:1.05}
+.incident-monitor-strip{display:grid;grid-template-columns:auto auto auto minmax(0,2fr);gap:3px;margin:3px 0;padding:0}
+.incident-monitor-strip>div{padding:4px 6px;border-radius:6px;min-width:0}
+.incident-monitor-strip span{font-size:.57rem}
+.incident-monitor-strip strong{font-size:.69rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.incident-scan-form{margin-top:3px}
+.incident-scan-form button{min-height:26px;padding:3px 7px;font-size:.68rem}
+.incident-list{gap:4px}
+.incident-card{padding:5px 6px!important;border-radius:7px}
+.incident-card-main{gap:2px}
+.incident-card-heading{gap:4px;align-items:center}
+.incident-card-heading>strong{font-size:.78rem;line-height:1.15}
+.incident-severity-badge{padding:2px 5px;font-size:.52rem}
+.incident-meta{gap:4px;font-size:.62rem;margin-top:1px}
+.incident-card p{font-size:.69rem;line-height:1.18;margin:2px 0}
+.incident-timestamps{font-size:.59rem!important}
+.incident-actions{gap:3px}
+.incident-actions button{min-height:26px;padding:3px 6px;font-size:.65rem}
+.incident-history-row{padding:4px 0;gap:5px;font-size:.68rem}
+.incident-history-resolution{font-size:.64rem}
+.incident-clear-state{padding:8px}
+
+/* Activity overview. */
+.activity-kpis-r16{grid-template-columns:repeat(8,minmax(0,1fr));gap:4px}
+.activity-kpis-r16 .activity-kpi{min-width:0;padding:5px 6px}
+.activity-kpis-r16 .activity-kpi strong{font-size:.86rem;overflow:hidden;text-overflow:ellipsis}
+.telemetry-insights-card{padding:7px!important}
+.telemetry-insight-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;margin:5px 0}
+.telemetry-insight-grid>div{display:grid;gap:1px;padding:6px;border:1px solid rgba(255,255,255,.07);border-radius:7px;background:rgba(255,255,255,.025);min-width:0}
+.telemetry-insight-grid span{font-size:.60rem;color:#94a3c3;text-transform:uppercase;letter-spacing:.035em}
+.telemetry-insight-grid strong{font-size:.92rem;line-height:1.08}
+.telemetry-insight-grid small{font-size:.57rem;color:#7f8baa}
+.activity-feature-list-r16{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:4px}
+.activity-feature-list-r16>div{padding:5px 6px;border-radius:6px;display:grid;gap:1px}
+.activity-feature-list-r16 strong{font-size:.69rem}
+.activity-feature-list-r16 span{font-size:.62rem;line-height:1.16}
+.telemetry-freshness{margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.60rem!important}
+
+/* Expandable device reporting. */
+.activity-devices-card{padding:7px!important}
+.activity-device-list{display:grid;gap:4px}
+.activity-device-card{border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(255,255,255,.018);overflow:hidden}
+.activity-device-card>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;list-style:none;cursor:pointer;padding:6px 7px}
+.activity-device-card>summary::-webkit-details-marker{display:none}
+.activity-device-card>summary::before{content:'›';font-size:1rem;line-height:1;color:#8090b4;transition:transform .12s ease}
+.activity-device-card[open]>summary::before{transform:rotate(90deg)}
+.activity-device-identity{display:grid;gap:1px;min-width:0;flex:1}
+.activity-device-identity strong{font-size:.76rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.activity-device-identity .muted{font-weight:400}
+.activity-device-summary-right{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.activity-device-summary-right>strong{font-size:.78rem}
+.activity-device-card>.usage-track{margin:0 7px 5px;height:3px}
+.activity-device-detail-grid{display:grid;grid-template-columns:minmax(170px,.7fr) minmax(190px,1fr) minmax(240px,1.2fr);gap:5px;padding:0 7px 6px}
+.activity-mini-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px}
+.activity-mini-kpis>div{display:grid;gap:1px;padding:4px 5px;border-radius:5px;background:rgba(255,255,255,.025)}
+.activity-mini-kpis span{font-size:.57rem;color:#8f9bb8}
+.activity-mini-kpis strong{font-size:.72rem}
+.activity-device-services,.activity-device-domains{min-width:0;padding:4px 5px;border-radius:5px;background:rgba(255,255,255,.018)}
+.activity-device-services h3,.activity-device-domains h3{font-size:.67rem!important;margin:0 0 3px!important;color:#b9c4dc}
+.activity-service-chips{display:flex;flex-wrap:wrap;gap:3px}
+.activity-service-chips>span{padding:3px 5px;border-radius:999px;background:#17213c;border:1px solid #29385e;font-size:.60rem;white-space:nowrap}
+.activity-domain-mini{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:5px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:.60rem}
+.activity-domain-mini:last-child{border-bottom:0}
+.activity-domain-mini>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.activity-domain-mini em{font-style:normal;color:#e8a2a8;font-size:.56rem}
+.activity-device-footer{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:5px 7px;border-top:1px solid rgba(255,255,255,.06)}
+.activity-device-footer .button-link{font-size:.64rem;padding:4px 6px}
+
+/* Dynamic policy service reporting. */
+.activity-services-card{padding:7px!important}
+.service-activity-table-wrap{max-height:68vh;overflow:auto;border:1px solid rgba(255,255,255,.06);border-radius:7px}
+.service-activity-table{min-width:760px}
+.service-activity-table thead th{position:sticky;top:0;z-index:2;background:#111a31}
+.service-activity-table td,.service-activity-table th{padding:5px 6px!important;font-size:.68rem!important}
+.activity-untracked-service{opacity:.72}
+.activity-seen-dot{display:inline-block;width:6px;height:6px;margin-right:4px;border-radius:50%;background:#69d597;box-shadow:0 0 0 2px rgba(105,213,151,.12)}
+.activity-evidence-note{margin-top:5px!important;font-size:.61rem!important}
+
+/* DNS is intentionally larger than the other activity tables. */
+.activity-dns-card{padding:8px!important}
+.dns-table-large{max-height:72vh;overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:7px}
+.activity-dns-table{min-width:680px}
+.activity-dns-table thead th{position:sticky;top:0;z-index:2;background:#111a31}
+.activity-dns-table th{font-size:.72rem!important;padding:7px 8px!important}
+.activity-dns-table td{font-size:.78rem!important;padding:7px 8px!important}
+.activity-dns-table td:first-child{font-size:.81rem!important}
+.dns-row-blocked{background:rgba(190,65,75,.045)}
+
+/* Full device activity page. */
+body .traffic-bars{min-height:160px}
+body .activity-table-wrap{scrollbar-width:thin}
+
+@media(max-width:1000px){
+  .activity-kpis-r16{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .telemetry-insight-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .activity-feature-list-r16{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .activity-device-detail-grid{grid-template-columns:1fr 1fr}
+  .activity-device-domains{grid-column:1/-1}
+  .incident-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .incident-monitor-strip{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .incident-monitor-summary{grid-column:1/-1}
+}
+
+@media(max-width:700px){
+  .activity-kpis-r16{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .telemetry-insight-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .activity-feature-list-r16{grid-template-columns:1fr}
+  .activity-device-card>summary{padding:5px 6px;gap:5px}
+  .activity-device-identity strong{font-size:.70rem}
+  .activity-device-summary-right{gap:3px}
+  .activity-device-detail-grid{grid-template-columns:1fr;padding:0 6px 5px}
+  .activity-device-domains{grid-column:auto}
+  .activity-device-footer{align-items:flex-start;flex-direction:column}
+  .activity-device-footer .button-link{align-self:flex-end}
+  .incident-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .incident-summary-grid>div{min-height:34px;padding:3px 4px}
+  .incident-card{padding:4px 5px!important}
+  .incident-card p{font-size:.65rem}
+}
+
+@media(max-width:480px){
+  .telemetry-insight-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .activity-device-summary-right .policy-badge{display:none}
+  .incident-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .incident-monitor-strip{grid-template-columns:1fr 1fr}
+  .incident-monitor-summary{grid-column:1/-1}
+}
+
+
+/* Keep shared-display parent unlock in the header next to lock state. */
+.header-parent-unlock-form{display:flex;align-items:center;gap:5px;margin:0}
+.header-parent-unlock-form input{width:132px;min-width:0;margin:0;padding:5px 7px;font-size:.72rem;border-radius:8px}
+.header-parent-unlock-form button{white-space:nowrap}
+.header-parent-extend-form{display:flex;align-items:center;gap:5px;margin:0}
+.header-parent-extend-form[hidden]{display:none!important}
+.header-parent-extend-form input{width:104px;min-width:0;margin:0;padding:5px 7px;font-size:.72rem;border-radius:8px}
+.header-parent-extend-form button{white-space:nowrap}
+.parent-unlock-banner-compact{padding:5px 8px;margin-bottom:5px}
+@media(max-width:900px){
+  .header-auth-actions{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:5px;align-items:center}
+  .header-parent-unlock-form,.header-parent-extend-form{min-width:0;display:grid;grid-template-columns:minmax(86px,1fr) auto;gap:4px}
+  .header-parent-unlock-form input,.header-parent-extend-form input{width:100%;min-width:0}
+  .header-parent-unlock-form button,.header-parent-extend-form button{padding:6px 8px;font-size:.7rem}
+}
+@media(max-width:560px){
+  .header-auth-actions{grid-template-columns:1fr auto}
+  .header-parent-unlock-form,.header-parent-extend-form{grid-column:1/-1;grid-row:1}
+  .parent-lock-badge{grid-column:1;justify-self:start}
+  .header-auth-actions>form[action="/logout"]{grid-column:2;justify-self:end}
+}

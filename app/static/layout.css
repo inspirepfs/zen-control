@@ -1,0 +1,377 @@
+/* Compact responsive navigation and information architecture. */
+.section-subnav{
+  position:sticky;
+  top:58px;
+  z-index:15;
+  display:flex;
+  gap:5px;
+  overflow-x:auto;
+  scrollbar-width:none;
+  margin:0 0 10px;
+  padding:6px 2px 8px;
+  background:linear-gradient(180deg,rgba(11,16,32,.97) 72%,rgba(11,16,32,0));
+  backdrop-filter:blur(8px);
+}
+.section-subnav::-webkit-scrollbar{display:none}
+.section-subtab{
+  flex:0 0 auto;
+  min-height:32px;
+  padding:6px 10px;
+  border-radius:999px;
+  border:1px solid #2d3b65;
+  background:#111a31;
+  color:#aebbd8;
+  font-size:.76rem;
+  letter-spacing:.01em;
+}
+.section-subtab.active{background:#26345e;color:#fff;border-color:#52699e;box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
+.ux-section[hidden]{display:none!important}
+.ux-section{animation:ux-section-in .12s ease-out}
+@keyframes ux-section-in{from{opacity:.65;transform:translateY(2px)}to{opacity:1;transform:none}}
+
+/* Density pass: preserve touch targets while removing desktop-era whitespace. */
+header{padding:14px 16px}
+main{padding:0 16px 28px}
+.app-tabs{gap:4px;padding:7px 10px;margin-bottom:8px}
+.app-tab{padding:8px 11px;border-radius:10px;font-size:.82rem}
+.hero,.card,.login-card{border-radius:16px}
+.hero{padding:18px;gap:14px}
+.card{padding:14px}
+.card h2{font-size:1.05rem;margin-bottom:6px}
+.card-heading{gap:10px}
+.grid{gap:10px;margin-top:10px}
+button{border-radius:10px;padding:9px 12px}
+.mode-btn{padding:14px}
+.compact{padding:6px 9px;font-size:.78rem}
+.policy-badge{padding:5px 8px;font-size:.65rem}
+.desired-pill{padding:4px 7px;font-size:.65rem}
+.reconcile-state{padding:4px 7px;font-size:.61rem}
+.live-state{padding:4px 7px;font-size:.64rem}
+label{gap:5px;margin:10px 0}
+input,select,textarea{border-radius:9px;padding:9px 10px}
+.actions{gap:6px}
+.local-only-note{margin:9px 0 12px;padding:10px 12px;border-radius:10px}
+.profile-editor,.device-policy-row{border-radius:12px;padding:11px;margin:8px 0}
+.service-grid{gap:5px;margin:8px 0}
+.service-chip span{padding:6px 8px;font-size:.74rem}
+.weekday-picker{gap:5px;margin:9px 0}
+.day-chip span{padding:7px 9px}
+.bulk-device-list{gap:5px;margin:8px 0}
+.bulk-device-chip span{padding:7px 9px;border-radius:9px}
+.favourite-grid{gap:7px}
+.favourite-card{gap:4px;padding:10px;border-radius:11px}
+.managed-device-list{gap:8px;margin-top:9px}
+.managed-device-card{border-radius:12px;padding:11px}
+.managed-device-summary{gap:8px;margin-top:8px;padding:7px 0}
+.service-summary-chips{gap:4px}
+.service-summary-chips span{padding:3px 6px;font-size:.63rem}
+.policy-drift-banner{gap:8px;margin-top:7px;padding:7px 8px;border-radius:9px}
+.managed-device-controls{gap:8px;margin-top:7px}
+.device-policy-details{margin-top:7px;padding-top:7px}
+.device-policy-details>summary{font-size:.77rem}
+.policy-reconcile-panel{margin-top:6px;padding:8px;border-radius:9px}
+.service-policy-state{margin-top:7px;padding-top:6px}
+.service-policy-row{gap:6px;padding:4px 0}
+.schedule-row{gap:10px;padding:9px 0}
+.schedule-builder,.template-panel{margin-top:12px;padding-top:12px}
+.schedule-template-entry{margin:9px 0;padding:9px;border-radius:9px}
+.simple-config-row{gap:8px;padding:8px 0}
+.activity-kpis{gap:7px;margin-top:10px}
+.activity-kpi{gap:3px;padding:10px;border-radius:10px}
+.activity-table th,.activity-table td,.policy-table th,.policy-table td{padding:7px}
+.setting-item{gap:4px;padding:10px;border-radius:10px}
+.settings-grid{gap:8px}
+.auto-reconcile-status,.security-summary-grid,.operations-summary-grid{gap:7px}
+.incident-summary-grid{gap:7px}
+.incident-card{padding:10px}
+.flash{margin:6px auto;padding:8px 11px;border-radius:9px}
+.parent-unlock-banner{padding:9px 12px}
+
+@media(max-width:900px){
+  header{padding:10px 12px}
+  main{padding:0 11px 76px}
+  .section-subnav{top:0;margin-left:-1px;margin-right:-1px;padding-top:5px}
+  .card{padding:11px;border-radius:13px}
+  .hero{padding:14px;border-radius:13px}
+  .grid{gap:8px;margin-top:8px}
+  .app-tabs{padding:6px 7px}
+  .app-tab{min-width:auto;padding:8px 10px;font-size:.78rem}
+  .section-subtab{min-height:30px;padding:5px 9px;font-size:.73rem}
+  .managed-device-card{padding:9px}
+  .managed-device-summary{grid-template-columns:1fr 1fr;gap:6px}
+  .activity-kpis{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+  .activity-kpi{padding:8px}
+}
+
+@media(max-width:600px){
+  .brand{font-size:.92rem}
+  .small{font-size:.78rem}
+  .mode{font-size:2.45rem}
+  .lock-note{padding:9px 10px;border-radius:10px}
+  .card h2{font-size:1rem}
+  .card-heading{gap:7px}
+  .policy-badge{letter-spacing:.04em}
+  .activity-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .incident-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .auto-reconcile-status{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .parent-unlock-banner{align-items:stretch;gap:7px}
+  .parent-unlock-form{gap:6px}
+  .parent-unlock-form input,.parent-unlock-form button{min-height:38px}
+}
+
+
+/* Ultra-compact density pass for desktop, tablet and mobile. */
+body{font-size:.90rem;line-height:1.28}
+header{padding:8px 12px}
+header .muted.small{font-size:.70rem}
+main{padding:0 12px 20px}
+.app-tabs{gap:2px;padding:4px 6px;margin-bottom:5px}
+.app-tab{min-height:30px;padding:5px 8px;border-radius:8px;font-size:.73rem}
+.section-subnav{gap:3px;margin:0 0 6px;padding:3px 0 5px}
+.section-subtab{min-height:27px;padding:4px 7px;border-radius:8px;font-size:.68rem}
+.hero,.card,.login-card{border-radius:11px}
+.hero{padding:11px;gap:8px}
+.card{padding:9px}
+.tab-panel>.card{margin-bottom:7px}
+.card h2{font-size:.94rem;margin:0 0 3px;line-height:1.18}
+.card h3,.card h4{margin:3px 0;font-size:.86rem;line-height:1.2}
+p{margin:.28rem 0}
+.small{font-size:.74rem}
+.muted.small{font-size:.71rem}
+.card-heading{gap:6px;margin-bottom:4px}
+.grid{gap:6px;margin-top:6px}
+button{min-height:31px;border-radius:8px;padding:6px 9px;font-size:.77rem;line-height:1.15}
+.compact{min-height:27px;padding:4px 7px;font-size:.70rem}
+input,select,textarea{min-height:33px;border-radius:7px;padding:6px 8px;font-size:.80rem}
+label{gap:3px;margin:5px 0;font-size:.76rem}
+.actions{gap:4px}
+.policy-badge{padding:3px 6px;font-size:.57rem;letter-spacing:.035em}
+.desired-pill{padding:3px 6px;font-size:.58rem}
+.reconcile-state{padding:3px 6px;font-size:.56rem}
+.live-state{padding:3px 6px;font-size:.58rem}
+.local-only-note{margin:5px 0 7px;padding:6px 8px;border-radius:7px;font-size:.74rem}
+.profile-editor,.device-policy-row{border-radius:8px;padding:7px;margin:5px 0}
+.service-grid{gap:3px;margin:5px 0}
+.service-chip span{padding:4px 6px;font-size:.68rem}
+.weekday-picker{gap:3px;margin:5px 0}
+.day-chip span{padding:5px 7px;font-size:.70rem}
+.bulk-device-list{gap:3px;margin:5px 0}
+.bulk-device-chip span{padding:5px 7px;border-radius:7px;font-size:.72rem}
+.favourite-grid{gap:5px}
+.favourite-card{gap:2px;padding:6px;border-radius:8px}
+.managed-device-list{gap:5px;margin-top:5px}
+.managed-device-card{border-radius:8px;padding:6px}
+.managed-device-top{gap:5px}
+.managed-device-identity{gap:2px}
+.managed-device-badges{gap:3px}
+.managed-device-summary{gap:5px;margin-top:5px;padding:4px 0}
+.managed-device-summary>div{gap:1px}
+.service-summary-chips{gap:2px}
+.service-summary-chips span{padding:2px 5px;font-size:.56rem}
+.policy-drift-banner{gap:5px;margin-top:4px;padding:5px 6px;border-radius:6px}
+.managed-device-controls{gap:5px;margin-top:4px}
+.device-policy-details{margin-top:4px;padding-top:4px}
+.device-policy-details>summary{font-size:.70rem}
+.policy-reconcile-panel{margin-top:4px;padding:5px;border-radius:6px}
+.service-policy-state{margin-top:4px;padding-top:4px}
+.service-policy-row{gap:4px;padding:3px 0;font-size:.74rem}
+.schedule-row{gap:6px;padding:6px 0}
+.schedule-builder,.template-panel{margin-top:7px;padding-top:7px}
+.schedule-template-entry{margin:5px 0;padding:6px;border-radius:6px}
+.simple-config-row{gap:5px;padding:5px 0}
+.activity-kpis{gap:4px;margin-top:5px}
+.activity-kpi{gap:2px;padding:6px;border-radius:7px}
+.activity-kpi span{font-size:.66rem}.activity-kpi strong{font-size:.95rem}
+.activity-table th,.activity-table td,.policy-table th,.policy-table td{padding:5px;font-size:.72rem}
+.setting-item{gap:2px;padding:6px;border-radius:7px}
+.settings-grid{gap:5px}
+.auto-reconcile-status,.security-summary-grid,.operations-summary-grid,.incident-summary-grid{gap:4px}
+.incident-card{padding:6px}
+.flash{margin:4px auto;padding:6px 8px;border-radius:7px;font-size:.75rem}
+.parent-unlock-banner{padding:6px 8px;margin-bottom:6px;border-radius:9px}
+.auth-summary-grid,.auth-settings-grid{gap:6px;margin-top:7px}
+.auth-summary-grid>div,.auth-settings-pane{padding:7px;border-radius:8px}
+.auth-device-row{padding:6px;border-radius:7px}
+.audit-list{display:grid;gap:0}
+.audit-row-compact{padding:6px 0;font-size:.72rem}
+.audit-row-compact strong{font-size:.73rem}
+.audit-main-card{max-width:none}
+.devices-managed-section{margin:0}
+
+/* Device discovery: frozen read-only inventory with a fixed add panel on larger screens. */
+.discovery-layout{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:7px;align-items:start}
+.discovery-results{min-width:0}
+.discovery-toolbar{margin:4px 0}
+.discovery-table-wrap{max-height:min(64vh,560px);overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:7px}
+.discovery-table-wrap .policy-table{min-width:620px}
+.discovery-table-wrap thead th{position:sticky;top:0;z-index:2;background:#111a31}
+.discovery-add-device{position:sticky;top:76px;margin:0;padding:7px;border:1px solid #2d3b65;border-radius:8px;background:#0f162a}
+.discovery-add-heading{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.discovery-device-form{grid-template-columns:1fr;gap:2px}
+.discovery-device-form button{grid-column:auto}
+
+/* Policy Studio supports a virtual Device assignment subtab without duplicating the card. */
+.ux-inner-section[hidden]{display:none!important}
+.policy-studio-grid{grid-template-columns:1fr}
+.policy-assignments{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}
+.policy-assignments>h3{grid-column:1/-1}
+.policy-assignments>.device-policy-row{margin:0}
+
+@media(max-width:900px){
+  body{font-size:.87rem}
+  header{padding:6px 9px}
+  main{padding:0 8px 64px}
+  .app-tabs{padding:4px;gap:2px}
+  .app-tab{min-width:72px;padding:5px 7px;font-size:.68rem}
+  .section-subnav{top:0;padding:3px 0 4px}
+  .section-subtab{min-height:26px;padding:4px 6px;font-size:.66rem}
+  .card{padding:7px;border-radius:9px}
+  .hero{padding:9px;border-radius:9px}
+  .grid{gap:5px;margin-top:5px}
+  .managed-device-card{padding:5px}
+  .managed-device-summary{grid-template-columns:1fr 1fr;gap:4px}
+  .activity-kpi{padding:5px}
+  .policy-assignments{grid-template-columns:1fr}
+}
+@media(max-width:760px){
+  .discovery-layout{grid-template-columns:1fr}
+  .discovery-add-device{position:static;order:-1}
+  .discovery-table-wrap{max-height:52vh}
+  .audit-row-compact{grid-template-columns:1fr auto}
+  .audit-row-compact .muted,.audit-row-compact small{grid-column:1/-1}
+}
+@media(max-width:600px){
+  body{font-size:.84rem}
+  .brand{font-size:.86rem}
+  .small,.muted.small{font-size:.68rem}
+  .card h2{font-size:.88rem}
+  .card-heading{gap:4px}
+  .policy-badge{font-size:.54rem}
+  .managed-device-badges{max-width:48%;justify-content:flex-end}
+  .parent-unlock-form input,.parent-unlock-form button{min-height:34px}
+}
+
+/* v0.26 connected-product UX: dense health, contextual drill-down and focus. */
+.connected-overview-card{border-color:rgba(99,132,225,.24)}
+.connected-overview-heading{align-items:flex-start}
+.connected-overview-state{display:grid;justify-items:end;gap:3px;text-align:right}
+.connected-health-list{display:grid;gap:4px;margin-top:6px}
+.connected-health-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:7px 8px;border:1px solid rgba(255,255,255,.07);border-left-width:3px;border-radius:8px;background:rgba(255,255,255,.018)}
+.connected-health-row.integration-state-healthy{border-left-color:#44c27a}
+.connected-health-row.integration-state-warning{border-left-color:#d7a541}
+.connected-health-row.integration-state-critical{border-left-color:#d85b67}
+.connected-health-row.integration-state-offline{border-left-color:#71809f}
+.connected-health-main{display:grid;gap:2px;min-width:0}
+.connected-health-title{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.connected-health-headline{font-size:.78rem;color:#dfe7ff;font-weight:700}
+.connected-health-facts{display:flex;gap:4px;flex-wrap:wrap}
+.connected-health-facts span{font-size:.64rem;color:#9ca9c8;border:1px solid rgba(255,255,255,.06);border-radius:999px;padding:2px 5px;background:rgba(255,255,255,.018)}
+.connected-health-actions{display:flex;gap:4px;justify-content:flex-end;flex-wrap:wrap}
+.integration-dot{display:inline-flex;align-items:center;padding:2px 5px;border-radius:999px;font-size:.54rem;font-weight:900;letter-spacing:.04em}
+.integration-dot-healthy,.policy-badge.integration-state-healthy{background:#184a36;color:#88efbe}
+.integration-dot-warning,.policy-badge.integration-state-warning{background:#58451d;color:#f1cd72}
+.integration-dot-critical,.policy-badge.integration-state-critical{background:#5b2030;color:#ffabb6}
+.integration-dot-offline,.policy-badge.integration-state-offline{background:#27324b;color:#bcc7de}
+.button-link.secondary{background:#1b2646;color:#dbe5ff;border-color:#35476f}
+.button-link.secondary:visited{color:#dbe5ff}
+.button-link.secondary:hover,.button-link.secondary:focus-visible{background:#28375f;color:#fff;border-color:#5f76a8}
+.favourite-card-actions,.managed-device-links{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-top:3px}
+.managed-device-links{padding-top:4px;border-top:1px solid rgba(255,255,255,.055)}
+.inline-context-link{display:inline-flex;margin-top:3px;color:#a9c0ff;font-size:.66rem;font-weight:750;text-decoration:none}
+.inline-context-link:hover,.inline-context-link:focus-visible{color:#fff;text-decoration:underline}
+.incident-context-link{margin-top:5px}
+.audit-toolbar{display:grid;grid-template-columns:minmax(180px,320px) auto auto;gap:7px;align-items:end;margin:6px 0}
+.audit-toolbar label{margin:0}
+.audit-toolbar input{min-height:29px}
+.audit-context-link{justify-self:end;align-self:center;margin:0}
+.context-focus{outline:2px solid #7f99ff!important;outline-offset:2px;box-shadow:0 0 0 5px rgba(90,120,255,.14)!important;transition:outline-color .2s ease,box-shadow .2s ease}
+
+@media(max-width:800px){
+  .connected-health-row{grid-template-columns:1fr}
+  .connected-health-actions{justify-content:flex-start}
+  .connected-overview-state{justify-items:start;text-align:left}
+  .audit-toolbar{grid-template-columns:1fr auto}
+  .audit-toolbar label{grid-column:1/-1}
+}
+@media(max-width:520px){
+  .connected-health-actions .button-link,.managed-device-links .button-link,.favourite-card-actions .button-link{flex:1 1 auto;text-align:center}
+  .audit-toolbar{grid-template-columns:1fr}
+}
+.policy-summary-actions{display:flex;gap:5px;flex-wrap:wrap}
+.activity-inline-link{color:#dce6ff;text-decoration:none}.activity-inline-link:hover,.activity-inline-link:focus-visible{color:#fff;text-decoration:underline}
+.audit-row-compact{display:grid;grid-template-columns:minmax(160px,.8fr) minmax(100px,.45fr) minmax(220px,1.7fr) minmax(120px,.7fr) auto;gap:7px;align-items:center;border-bottom:1px solid rgba(255,255,255,.05)}
+@media(max-width:900px){.audit-row-compact{grid-template-columns:1fr auto}.audit-row-compact .muted,.audit-row-compact small,.audit-row-compact .audit-context-link{grid-column:1/-1;justify-self:start}}
+
+/* v0.32 recurring UX validation: standalone pages share compact, wrapping actions. */
+.page-header,.standalone-header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.page-header h1,.standalone-header h1{margin:.1rem 0}.activity-page-actions,.header-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex-wrap:wrap}
+@media(max-width:720px){.page-header,.standalone-header{flex-direction:column}.activity-page-actions,.header-actions{justify-content:flex-start;width:100%}.activity-page-actions .button-link,.header-actions .button-link{flex:1 1 auto;text-align:center}}
+
+/* v0.36 recurring UX validation: consistent standalone chrome, focus and tablet navigation. */
+.standalone-page>header,
+.standalone-page .standalone-header,
+.analytics-header.standalone-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  gap:10px;
+}
+.standalone-page>header .brand,
+.standalone-page .standalone-header .brand{
+  overflow-wrap:anywhere;
+}
+.standalone-page .activity-page-actions,
+.standalone-page .standalone-actions,
+.standalone-page .header-actions,
+.standalone-form-actions{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:4px;
+  flex-wrap:wrap;
+}
+.standalone-form-actions{
+  margin-top:8px;
+  padding-top:8px;
+  border-top:1px solid rgba(255,255,255,.07);
+}
+.button-link.back-link::before{content:'←';font-weight:900;line-height:1}
+.button-link.compact{min-height:30px}
+button,.button-link,.app-tab,.section-subtab{touch-action:manipulation}
+button:focus-visible,.button-link:focus-visible,.app-tab:focus-visible,.section-subtab:focus-visible,
+input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{
+  outline:2px solid #8ea5ff;
+  outline-offset:2px;
+}
+.app-tabs,.section-subnav{scroll-snap-type:x proximity;overscroll-behavior-x:contain}
+.app-tab,.section-subtab{scroll-snap-align:center}
+.app-tabs{scroll-padding-inline:24px}
+.section-subnav{scroll-padding-inline:12px}
+
+@media(max-width:720px){
+  .standalone-page>header,
+  .standalone-page .standalone-header,
+  .analytics-header.standalone-header{
+    flex-direction:column;
+  }
+  .standalone-page .activity-page-actions,
+  .standalone-page .standalone-actions,
+  .standalone-page .header-actions,
+  .standalone-form-actions{
+    width:100%;
+    justify-content:flex-start;
+  }
+  .standalone-page .activity-page-actions .button-link,
+  .standalone-page .standalone-actions .button-link,
+  .standalone-page .header-actions .button-link,
+  .standalone-form-actions>*{
+    flex:1 1 auto;
+    text-align:center;
+  }
+  .standalone-form-actions button{min-height:34px}
+}
+
+@media(prefers-reduced-motion:reduce){
+  .ux-section{animation:none}
+  html:focus-within{scroll-behavior:auto}
+}

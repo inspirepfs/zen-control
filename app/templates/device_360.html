@@ -1,0 +1,191 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Device 360 · {{snapshot.device.name}} · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/device360.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · DEVICE 360</div>
+    <div class="brand">{{snapshot.device.name}} <span class="muted">({{snapshot.device.ip}})</span></div>
+  </div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="{{snapshot.links.device}}">Back to Devices</a>
+    <a class="button-link" href="{{snapshot.links.assignment}}">Policy</a>
+    <a class="button-link secondary" href="/policy/explain/{{snapshot.device.ip}}">Why this state?</a>
+    <a class="button-link secondary" href="{{snapshot.links.activity}}">Activity</a>
+    <a class="button-link secondary" href="{{snapshot.links.history}}">7-day history</a>
+    <a class="button-link secondary" href="/activity/policy-history?period=7d&amp;client_ip={{snapshot.device.ip}}">Policy history</a>
+  </div>
+</header>
+<main>
+{% set page_help = zen_help('device_360') %}
+{% include "_context_help.jinja" %}
+<section class="card device360-hero">
+  <div class="card-heading">
+    <div>
+      <div class="device360-title">
+        <h2>Device overview</h2>
+        <span class="live-state live-state-{{snapshot.summary.effective_now}}">{{snapshot.summary.effective_now|upper}}</span>
+        {% if snapshot.summary.sync_status == 'in_sync' %}<span class="reconcile-state reconcile-sync">IN SYNC</span>
+        {% elif snapshot.summary.sync_status == 'temporary' %}<span class="reconcile-state reconcile-temp">TEMP OVERRIDE</span>
+        {% elif snapshot.summary.sync_status in ['drift','partial'] %}<span class="reconcile-state reconcile-drift">{{snapshot.summary.sync_status|upper}}</span>
+        {% else %}<span class="reconcile-state reconcile-error">LIVE UNKNOWN</span>{% endif %}
+      </div>
+      <p class="muted">{{snapshot.headline}}</p>
+    </div>
+    <span class="policy-badge staging">{{snapshot.schema_version}}</span>
+  </div>
+  <div class="device360-kpis">
+    <div><span>Effective now</span><strong>{{snapshot.summary.effective_now|upper}}</strong><small>{{snapshot.summary.mode_source}}</small></div>
+    <div><span>Desired</span><strong>{{snapshot.summary.desired_mode|upper}}</strong><small>ZEN policy</small></div>
+    <div><span>Live RouterOS</span><strong>{{snapshot.summary.live_mode|upper}}</strong><small>device mode</small></div>
+    <div><span>Profile</span><strong>{{snapshot.device.profile}}</strong><small>{{snapshot.device.category}}</small></div>
+    <div><span>Service blocks</span><strong>{{snapshot.service_counts.blocked}}</strong><small>{{snapshot.service_counts.drift}} drift · {{snapshot.service_counts.requested_only}} requested-only</small></div>
+    <div><span>Incidents</span><strong>{{snapshot.incident_counts.active}}</strong><small>{{snapshot.incident_counts.critical}} critical · {{snapshot.incident_counts.warning}} warning</small></div>
+  </div>
+  <div class="local-only-note device360-evidence-note">{{snapshot.evidence_note}}</div>
+</section>
+
+<section class="grid two">
+  <div class="card">
+    <div class="card-heading"><div><h2>Policy &amp; enforcement</h2><p class="muted">Current effective policy and fresh RouterOS evidence when available.</p></div><a class="inline-context-link" href="/policy/explain/{{snapshot.device.ip}}">full decision chain</a></div>
+    <div class="device360-facts">
+      <div><span>Household mode</span><strong>{{snapshot.summary.global_mode|upper}}</strong></div>
+      <div><span>Policy sync</span><strong>{{snapshot.summary.sync_status|upper}}</strong></div>
+      <div><span>Bandwidth</span><strong>{{snapshot.policy.bandwidth.name}}</strong><small>{{snapshot.policy.bandwidth.upload}} up / {{snapshot.policy.bandwidth.download}} down</small></div>
+      <div><span>Service contracts</span><strong>{{snapshot.service_counts.defined}}</strong><small>{{snapshot.service_counts.reporting_only}} reporting-only · {{snapshot.service_counts.degraded}} degraded · {{snapshot.service_counts.unavailable}} unavailable · {{snapshot.service_counts.unsupported}} unsupported</small></div>
+    </div>
+    {% if snapshot.policy.planned_actions %}
+      <div class="conflict-warning"><strong>{{snapshot.policy.planned_actions|length}} reconciliation change(s) pending.</strong> <a class="inline-context-link" href="{{snapshot.links.device}}">Open managed device controls</a></div>
+    {% endif %}
+    {% for item in snapshot.policy.conflicts %}<div class="conflict-warning">{{item}}</div>{% endfor %}
+  </div>
+
+  <div class="card">
+    <div class="card-heading"><div><h2>Access, reward &amp; quota</h2><p class="muted">Current access modifiers and retained reward/quota state.</p></div></div>
+    {% set reward=snapshot.access.reward or {} %}{% set quota=snapshot.access.quota or {} %}{% set daily=quota.get('daily', {}) %}
+    <div class="device360-access-grid">
+      <div><span class="muted small">Temporary access</span><strong>{{'ACTIVE' if snapshot.access.temporary else 'Inactive'}}</strong><small>Mode-only override; service/global controls remain authoritative.</small></div>
+      <div><span class="muted small">Reward bank</span><strong>{{reward.get('balance_minutes', 0)}} min</strong><small>{% if reward.get('enabled') %}enabled{% else %}disabled{% endif %}{% if reward.get('error') %} · {{reward.get('error')}}{% endif %}</small></div>
+      <div><span class="muted small">Daily quota</span>
+        {% if not quota.get('configured') %}<strong>Unlimited</strong><small>no daily/service quota configured</small>
+        {% elif not quota.get('enabled') %}<strong>Configured · OFF</strong><small>quota engine disabled</small>
+        {% elif not quota.get('available') %}<strong>Unavailable</strong><small>fail-open; no inferred exhaustion</small>
+        {% elif daily.get('limit_mb') %}<strong>{{daily.get('percent',0)}}%</strong><small>{{daily.get('used_human','0 B')}} / {{daily.get('limit_mb')}} MiB</small>
+        {% else %}<strong>Tracking</strong><small>{{quota.get('services',[])|length}} service quota(s)</small>{% endif %}
+      </div>
+    </div>
+    {% if quota.get('telemetry_error') %}<div class="device360-error">{{quota.get('telemetry_error')}}</div>{% endif %}
+  </div>
+</section>
+
+{% if snapshot.next_changes %}
+<section class="card">
+  <div class="card-heading"><div><h2>What changes next?</h2><p class="muted">Known automatic transitions from schedules or temporary RouterOS access.</p></div><a class="inline-context-link" href="/?view=schedules&amp;section=planner#schedules/planner">Schedules</a></div>
+  <div class="policy-explain-next">
+    {% for row in snapshot.next_changes %}<div><strong>{{row.when}}</strong><span>{{row.label}}</span></div>{% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<section class="grid two">
+  <div class="card">
+    <div class="card-heading"><div><h2>Service policy</h2><p class="muted">Most relevant concrete service decisions: drift first, then blocked/reporting-only services.</p></div><a class="inline-context-link" href="/policy/explain/{{snapshot.device.ip}}">all services</a></div>
+    <div class="device360-service-list">
+      {% for svc in snapshot.service_attention %}
+      <div class="device360-service-row">
+        <div><strong>{{svc.name}}</strong><small class="muted">{{svc.source}}</small></div>
+        <div><span class="policy-badge {{'disabled' if 'BLOCK' in svc.desired else 'enabled'}}">{{svc.desired}}</span><small class="muted">live: {{svc.live}}</small></div>
+        <div>{% if svc.drift %}<span class="reconcile-state reconcile-drift">DRIFT</span>{% elif svc.live_known and svc.available %}<span class="reconcile-state reconcile-sync">PROVEN</span>{% elif svc.live_known %}<span class="reconcile-state reconcile-partial">REPORTING</span>{% else %}<span class="reconcile-state reconcile-error">UNKNOWN</span>{% endif %}<small><a class="inline-context-link" href="/policy/explain/{{snapshot.device.ip}}?service={{svc.key}}">explain</a></small></div>
+      </div>
+      {% else %}<div class="device360-list-empty">No service policy evidence available.</div>{% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-heading"><div><h2>Today’s activity</h2><p class="muted">Retained network evidence for this managed IP in the configured household timezone.</p></div><a class="inline-context-link" href="{{snapshot.links.activity}}">full activity</a></div>
+    {% if not snapshot.activity.available %}
+      <div class="device360-error"><strong>Telemetry unavailable.</strong> {{snapshot.activity.error}}<br><span class="muted small">ZEN does not turn missing telemetry into zero activity.</span></div>
+    {% else %}
+      {% set cur=snapshot.activity.current or {} %}{% set cmp=snapshot.activity.comparison or {} %}{% set delta=cmp.get('total_bytes',{}).get('delta_percent') %}
+      <div class="device360-facts">
+        <div><span>Total traffic</span><strong>{{cur.get('total_bytes_human','0 B')}}</strong><small class="device360-delta-{{'new' if delta is none else ('up' if delta > 0 else ('down' if delta < 0 else 'flat'))}}">{% if delta is none %}new vs prior window{% elif delta > 0 %}+{{delta}}%{% else %}{{delta}}%{% endif %}</small></div>
+        <div><span>Classification</span><strong>{{cur.get('attributed_percent',0)}}%</strong><small>{{cur.get('attributed_bytes_human','0 B')}} attributed</small></div>
+        <div><span>DNS</span><strong>{{cur.get('dns_queries',0)}}</strong><small>{{cur.get('dns_blocked',0)}} blocked</small></div>
+        <div><span>New domains</span><strong>{{snapshot.activity.new_domains|length}}</strong><small>30-day device lookback</small></div>
+      </div>
+      <div class="device360-service-list" style="margin-top:.6rem">
+      {% for svc in snapshot.activity.services %}
+        <div class="device360-service-row"><div><strong>{{svc.service_name}}</strong><small class="muted">{{svc.flows}} flows</small></div><div><strong>{{svc.total_bytes_human}}</strong><small class="muted">{{svc.percent}}%</small></div><div>{% if svc.service_key %}<a class="inline-context-link" href="/activity/service/{{svc.service_key}}">service</a>{% endif %}</div></div>
+      {% else %}<div class="device360-list-empty">No attributed service traffic yet today.</div>{% endfor %}
+      </div>
+    {% endif %}
+  </div>
+</section>
+
+{% if snapshot.activity.available %}
+<section class="grid two">
+  <div class="card">
+    <div class="card-heading"><div><h2>DNS attention</h2><p class="muted">Explicit new/blocked DNS evidence only; no anomaly score.</p></div></div>
+    <h3>Blocked</h3>
+    <div class="device360-domain-list">
+      {% for row in snapshot.activity.blocked_domains %}<div class="device360-domain"><div><strong>{{row.domain}}</strong></div><span class="device360-domain-service muted small">{{row.service or 'unclassified'}}</span><span class="policy-badge disabled">{{row.blocked}} blocked</span></div>{% else %}<div class="device360-list-empty">No blocked DNS names in this window.</div>{% endfor %}
+    </div>
+    <h3>New to this device</h3>
+    <div class="device360-domain-list">
+      {% for row in snapshot.activity.new_domains %}<div class="device360-domain"><div><strong>{{row.domain}}</strong></div><span class="device360-domain-service muted small">{{row.service or 'unclassified'}}</span><span class="policy-badge staging">{{row.queries}} queries</span></div>{% else %}<div class="device360-list-empty">No new domains in this window.</div>{% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-heading"><div><h2>Recent network evidence</h2><p class="muted">Traffic buckets and explicitly blocked DNS events from today.</p></div><a class="inline-context-link" href="{{snapshot.links.history}}">7-day analytics</a></div>
+    <div class="device360-event-list">
+      {% for row in snapshot.activity.timeline %}
+      <div class="device360-event">
+        <div><strong>{{row.event_time[11:16] if row.event_time else '—'}}</strong><small class="device360-timeline-kind">{{row.kind}}</small></div>
+        <div>{% if row.kind == 'blocked_dns' %}<strong>{{row.domain}}</strong><small class="muted">{{row.blocked}} blocked DNS</small>{% else %}<strong>{{row.service}}</strong><small class="muted">{{row.domain or 'network flow evidence'}}</small>{% endif %}</div>
+        <div>{% if row.kind == 'traffic' %}<strong>{{row.total_bytes_human}}</strong><small class="muted">{{row.flows}} flows</small>{% else %}<span class="policy-badge disabled">BLOCKED</span>{% endif %}</div>
+      </div>
+      {% else %}<div class="device360-list-empty">No retained network evidence in this window.</div>{% endfor %}
+    </div>
+  </div>
+</section>
+{% endif %}
+
+<section class="grid two">
+  <div class="card">
+    <div class="card-heading"><div><h2>Related incidents</h2><p class="muted">Incidents are included only when their stored text explicitly mentions this device IP/name.</p></div><a class="inline-context-link" href="/?view=incidents&amp;section=active#incidents/active">Incident centre</a></div>
+    <div class="device360-event-list">
+      {% for row in snapshot.incidents %}
+      <div class="device360-event"><div><span class="policy-badge {{'disabled' if row.severity == 'critical' else 'staging'}}">{{row.severity|upper}}</span><small class="muted">{{row.status|upper}}</small></div><div><strong>{{row.title}}</strong><small class="muted">{{row.detail}}</small></div><div><small>{{row.updated_at or row.last_seen_at or ''}}</small></div></div>
+      {% else %}<div class="device360-list-empty">No explicitly related incident records found.</div>{% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-heading"><div><h2>Recent audit evidence</h2><p class="muted">Recent audit rows explicitly mentioning this device IP/name.</p></div><a class="inline-context-link" href="/?view=audit&amp;section=recent#audit/recent">Audit</a></div>
+    <div class="device360-event-list">
+      {% for row in snapshot.audit %}
+      <div class="device360-event"><div><strong>{{row.event}}</strong><small class="muted">{{row.ts}}</small></div><div class="device360-audit-detail"><span>{{row.detail}}</span><small class="muted">{{row.actor or row.user}}</small></div><div><span class="policy-badge staging">{{row.severity|upper}}</span></div></div>
+      {% else %}<div class="device360-list-empty">No explicitly related recent audit rows found.</div>{% endfor %}
+    </div>
+  </div>
+</section>
+
+{% if snapshot.limitations %}
+<section class="card">
+  <div class="card-heading"><div><h2>Evidence limits</h2><p class="muted">Device 360 keeps unknowns visible instead of inventing certainty.</p></div></div>
+  {% for item in snapshot.limitations %}<div class="policy-explain-limit">{{item}}</div>{% endfor %}
+</section>
+{% endif %}
+</main>
+</body>
+</html>

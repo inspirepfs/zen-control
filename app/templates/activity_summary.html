@@ -1,0 +1,157 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Parent Summary · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/parent-summary.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="analytics-header parent-summary-header standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · PARENT SUMMARY</div>
+    <div class="brand">{{window.label if window else 'Daily summary'}}</div>
+    <div class="muted small">Managed-device network evidence · {{timezone_name}}</div>
+  </div>
+  <div class="parent-summary-header-actions activity-page-actions">
+    <a class="button-link secondary back-link" href="/?view=activity&amp;section=summaries#activity/summaries">Back to Activity</a>
+    <a class="button-link" href="/activity/analytics?period={{period}}">Full analytics</a>
+  </div>
+</header>
+<main class="parent-summary-main">
+{% set page_help = zen_help('activity_summaries') %}
+{% include "_context_help.jinja" %}
+  <section class="card parent-summary-filter">
+    <nav class="analytics-periods" aria-label="Summary day">
+      <a class="analytics-period {% if period == 'today' %}active{% endif %}" href="/activity/summary?period=today">Today</a>
+      <a class="analytics-period {% if period == 'yesterday' %}active{% endif %}" href="/activity/summary?period=yesterday">Yesterday</a>
+    </nav>
+    <span class="muted small">Compared with the immediately preceding equivalent local-time window.</span>
+  </section>
+
+  {% if error %}
+  <section class="card"><div class="conflict-warning">{{error}}</div></section>
+  {% else %}
+
+  {% set hc = household.current or {} %}
+  {% set hcomp = household.comparison or {} %}
+  <section class="card parent-household-card">
+    <div class="card-heading">
+      <div><h2>Household managed-device summary</h2><p class="muted">{{evidence_note}}</p></div>
+      <span class="policy-badge enabled">{{household.active_devices}} / {{household.managed_devices}} ACTIVE</span>
+    </div>
+    <div class="parent-summary-kpis">
+      <div><span>Traffic</span><strong>{{hc.total_bytes_human or '0 B'}}</strong>{% set d=hcomp.get('total_bytes',{}).get('delta_percent') %}<small>{% if d is none and hc.total_bytes %}new vs prior{% elif d is not none %}{{'+' if d > 0 else ''}}{{d}}% vs prior{% else %}—{% endif %}</small></div>
+      <div><span>DNS queries</span><strong>{{hc.dns_queries or 0}}</strong>{% set d=hcomp.get('dns_queries',{}).get('delta_percent') %}<small>{% if d is none and hc.dns_queries %}new vs prior{% elif d is not none %}{{'+' if d > 0 else ''}}{{d}}% vs prior{% else %}—{% endif %}</small></div>
+      <div><span>Blocked DNS</span><strong>{{hc.dns_blocked or 0}}</strong><small>{{household.blocked_domains}} domains</small></div>
+      <div><span>New domains</span><strong>{{household.new_domains}}</strong><small>{{household.unclassified_new_domains}} unclassified</small></div>
+      <div><span>Classified traffic</span><strong>{{hc.attributed_percent or 0}}%</strong><small>{{hc.attributed_bytes_human or '0 B'}}</small></div>
+      <div><span>Devices with signals</span><strong>{{household.devices_with_signals}}</strong><small>evidence categories, not risk</small></div>
+      {% if quota_current %}
+      <div><span>Quota warnings</span><strong>{{household.quota_warnings}}</strong><small>{{household.quota_exhausted}} exhausted</small></div>
+      {% else %}
+      <div><span>Quota status</span><strong>Current only</strong><small>not backdated to old config</small></div>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if attention_domains %}
+  <section class="card parent-attention-card">
+    <div class="card-heading">
+      <div><h2>New / blocked DNS attention</h2><p class="muted">Deterministic signals only: new to the preceding 30-day device history, blocked by DNS policy, or currently unclassified.</p></div>
+      <span class="policy-badge staging">{{attention_domains|length}} SHOWN</span>
+    </div>
+    <div class="activity-table-wrap parent-attention-table">
+      <table class="activity-table">
+        <thead><tr><th>Device</th><th>Domain</th><th>Evidence</th><th>Queries</th><th>Blocked</th><th>Service</th></tr></thead>
+        <tbody>
+        {% for item in attention_domains %}
+          <tr>
+            <td><a href="/activity/analytics?period={{period}}&client_ip={{item.client_ip}}">{{item.device_name}}</a><small class="muted"> {{item.client_ip}}</small></td>
+            <td><strong>{{item.domain}}</strong></td>
+            <td>{% for tag in item.tags %}<span class="parent-signal-tag {{tag}}">{{tag|replace('_',' ')|upper}}</span>{% endfor %}</td>
+            <td>{{item.queries}}</td><td>{{item.blocked}}</td><td>{{item.service or 'Unclassified'}}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="parent-device-grid">
+    {% for device in devices %}
+    {% set cur=device.current or {} %}
+    {% set cmp=device.comparison or {} %}
+    <article class="card parent-device-summary {% if device.signal_count %}has-signals{% endif %}">
+      <div class="parent-device-heading">
+        <div>
+          <h2>{{device.name}} <span class="muted">({{device.ip}})</span></h2>
+          <span class="policy-badge enabled">{{device.profile_name}}</span>
+          {% if not device.active %}<span class="policy-badge staging">NO EVIDENCE</span>{% endif %}
+        </div>
+        <div class="parent-device-total"><strong>{{cur.total_bytes_human or '0 B'}}</strong>{% set d=cmp.get('total_bytes',{}).get('delta_percent') %}<small>{% if d is none and cur.total_bytes %}new vs prior{% elif d is not none %}{{'+' if d > 0 else ''}}{{d}}%{% else %}—{% endif %}</small></div>
+      </div>
+
+      <div class="parent-device-kpis">
+        <div><span>DNS</span><strong>{{cur.dns_queries or 0}}</strong></div>
+        <div><span>Blocked</span><strong>{{cur.dns_blocked or 0}}</strong></div>
+        <div><span>New domains</span><strong>{{device.new_domain_count}}</strong></div>
+        <div><span>Unclassified new</span><strong>{{device.unclassified_new_count}}</strong></div>
+        <div><span>Classified</span><strong>{{cur.attributed_percent or 0}}%</strong></div>
+        <div><span>Signals</span><strong>{{device.signal_count}}</strong></div>
+      </div>
+
+      {% if device.signals %}
+      <div class="parent-signal-strip">
+        {% for signal in device.signals %}<span class="parent-signal-tag {{signal}}">{{signal|replace('_',' ')|upper}}</span>{% endfor %}
+      </div>
+      {% endif %}
+
+      {% if device.quota_current %}
+      {% set quota=device.quota or {} %}{% set daily=quota.daily or {} %}
+      <div class="parent-quota-row">
+        <strong>Quota</strong>
+        {% if not quota.configured %}<span class="muted">Not configured</span>
+        {% elif not quota.available %}<span class="policy-badge staging">UNAVAILABLE</span><span class="muted small">{{quota.telemetry_error or 'Quota telemetry unavailable'}}</span>
+        {% else %}<span>{{daily.used_human or '0 B'}} / {{daily.limit_mb or 0}} MB</span><span class="policy-badge {% if device.quota_exhausted %}disabled{% elif device.quota_warning %}staging{% else %}enabled{% endif %}">{{daily.percent or 0}}%</span>{% endif %}
+      </div>
+      {% endif %}
+
+      <div class="parent-device-columns">
+        <div>
+          <h3>Top services</h3>
+          <div class="parent-service-list">
+          {% for item in device.services %}
+            {% if item.service_key %}<a href="/activity/service/{{item.service_key}}?hours={{window.duration_hours|int}}">{% else %}<span>{% endif %}<strong>{{item.service_name}}</strong><small>{{item.total_bytes_human}} · {{item.percent}}%</small>{% if item.service_key %}</a>{% else %}</span>{% endif %}
+          {% else %}<span class="muted">No attributed service traffic.</span>{% endfor %}
+          </div>
+        </div>
+        <div>
+          <h3>Attention domains</h3>
+          <div class="parent-domain-list">
+          {% for item in device.attention_domains[:6] %}
+            <div><span><strong>{{item.domain}}</strong><small>{{item.service or 'Unclassified'}}</small></span><span>{% for tag in item.tags %}<b class="parent-signal-tag {{tag}}">{{tag|upper}}</b>{% endfor %}</span></div>
+          {% else %}<span class="muted">No new or blocked DNS evidence in this window.</span>{% endfor %}
+          </div>
+        </div>
+      </div>
+      <div class="parent-device-actions">
+        <a class="button-link" href="/activity/analytics?period={{period}}&amp;client_ip={{device.ip}}">Full history</a>
+        <a class="button-link" href="/devices/{{device.ip}}">Device 360</a><a class="button-link secondary" href="/activity/device/{{device.ip}}?hours=24">Activity detail</a>
+        <a class="button-link secondary" href="/?view=devices&amp;section=managed&amp;focus=device:{{device.ip}}#devices/managed">Managed device</a>
+      </div>
+    </article>
+    {% else %}
+    <section class="card"><p class="muted">No managed devices are configured.</p></section>
+    {% endfor %}
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

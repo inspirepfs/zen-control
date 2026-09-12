@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>MikroTik Kid Control Migration · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · MIGRATION</div>
+    <div class="brand">MikroTik Kid Control migration</div>
+    <div class="muted small">Read the existing Kid Control policy, stage an equivalent ZEN replacement, and transfer authority with explicit validation and rollback.</div>
+  </div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
+    <span class="policy-badge staging">CONTROLLED CUTOVER</span>
+  </div>
+</header>
+<main>
+{% set page_help = zen_help('kid_control_migration') %}
+{% include "_context_help.jinja" %}
+
+{% if flash_error %}<div class="conflict-warning">{{ flash_error }}</div>{% endif %}
+{% if flash_ok %}<div class="local-only-note">{{ flash_ok }}</div>{% endif %}
+{% if read_error %}<div class="conflict-warning">RouterOS Kid Control inventory unavailable: {{ read_error }}</div>{% endif %}
+
+<section class="card">
+  <div class="card-heading">
+    <div>
+      <h2>Authority boundary</h2>
+      <p class="muted">Legacy Kid Control remains read-only except for one bounded authority action: ZEN may disable or re-enable an exact validated profile during cutover/rollback. It never deletes or edits legacy schedules or device membership.</p>
+    </div>
+    <span class="policy-badge enabled">SAFE STAGING</span>
+  </div>
+  <div class="security-summary-grid">
+    <div><span class="muted small">Router reads</span><strong>READ ONLY</strong></div>
+    <div><span class="muted small">Router writes</span><strong>CUTOVER ONLY</strong></div>
+    <div><span class="muted small">Legacy mutation</span><strong>DISABLED FLAG ONLY</strong></div>
+    <div><span class="muted small">Rollback</span><strong>RETAINED LEGACY</strong></div>
+  </div>
+  <div class="local-only-note">Dynamic discovery rows are ignored. Cutover requires every configured device to have a unique current MAC/IP match and an existing static DHCP lease. The legacy profile is retained intact for immediate rollback.</div>
+</section>
+
+{% if preview %}
+<section class="card">
+  <div class="card-heading">
+    <div><h2>Current legacy configuration</h2><p class="muted">Fresh RouterOS read captured {{ preview.captured_at }} · fingerprint <code>{{ preview.source_fingerprint[:12] }}</code></p></div>
+    {% if preview.summary.warnings %}<span class="policy-badge staging">{{ preview.summary.warnings }} REVIEW</span>{% else %}<span class="policy-badge enabled">TRANSLATION CLEAN</span>{% endif %}
+  </div>
+  <div class="security-summary-grid">
+    <div><span class="muted small">Profiles</span><strong>{{ preview.summary.legacy_profiles }}</strong></div>
+    <div><span class="muted small">Configured devices</span><strong>{{ preview.summary.configured_devices }}</strong></div>
+    <div><span class="muted small">Matched IPv4</span><strong>{{ preview.summary.matched_devices }}</strong></div>
+    <div><span class="muted small">Unresolved / ambiguous</span><strong>{{ preview.summary.unresolved_devices + preview.summary.ambiguous_devices }}</strong></div>
+    <div><span class="muted small">Dynamic rows ignored</span><strong>{{ preview.summary.ignored_dynamic_devices }}</strong></div>
+    <div><span class="muted small">Router writes</span><strong>0</strong></div>
+  </div>
+</section>
+
+{% for profile in preview.profiles %}
+<section class="card">
+  <div class="card-heading">
+    <div>
+      <h2>{{ profile.legacy_name }}</h2>
+      <p class="muted">Legacy Kid Control profile → proposed ZEN profile. Base mode is BLOCKED and allowed windows become explicit NORMAL/BLOCKED schedule transitions.</p>
+    </div>
+    <span class="policy-badge staging">PROPOSED</span>
+  </div>
+  <div class="security-summary-grid">
+    <div><span class="muted small">ZEN base mode</span><strong>{{ profile.proposed.desired_mode|upper }}</strong></div>
+    <div><span class="muted small">Bandwidth preset</span><strong>{{ profile.proposed.bandwidth_preset|upper }}</strong></div>
+    <div><span class="muted small">Legacy rate limit</span><strong>{{ profile.legacy_rate_limit or 'NONE' }}</strong></div>
+    <div><span class="muted small">Legacy disabled</span><strong>{{ 'YES' if profile.legacy_disabled else 'NO' }}</strong></div>
+  </div>
+  <div class="discovery-table-wrap">
+    <table class="policy-table">
+      <thead><tr><th>Days</th><th>Time</th><th>Proposed mode</th></tr></thead>
+      <tbody>
+      {% for event in profile.proposed.schedule %}
+        <tr><td>{{ event.days|join(', ')|upper }}</td><td>{{ event.time }}</td><td>{{ event.mode|upper }}</td></tr>
+      {% else %}
+        <tr><td colspan="3">No allowed windows translated; profile remains BLOCKED by default.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% for warning in profile.warnings %}<div class="conflict-warning">{{ warning }}</div>{% endfor %}
+</section>
+{% endfor %}
+
+<section class="card">
+  <div class="card-heading"><div><h2>Configured device mapping</h2><p class="muted">No dynamic Kid Control discovery row is copied. Device profile assignment is retained by MAC identity and current IP evidence is shown only for review.</p></div></div>
+  <div class="discovery-table-wrap">
+    <table class="policy-table">
+      <thead><tr><th>Legacy device</th><th>MAC</th><th>Profile</th><th>Identity evidence</th><th>State</th></tr></thead>
+      <tbody>
+      {% for device in preview.devices %}
+        <tr>
+          <td><strong>{{ device.legacy_name or '(unnamed)' }}</strong>{% if device.legacy_inactive %}<div class="muted small">Legacy row inactive</div>{% endif %}</td>
+          <td><code>{{ device.mac or 'INVALID' }}</code></td>
+          <td>{{ device.proposed.profile_name or 'UNRESOLVED' }}</td>
+          <td>{% if device.identity.ipv4 %}<code>{{ device.identity.ipv4 }}</code><div class="muted small">{{ device.identity.evidence|join(' + ') }}</div>{% elif device.identity.candidates %}{{ device.identity.candidates|join(', ') }}{% else %}No current IPv4 evidence{% endif %}</td>
+          <td><span class="policy-badge {% if device.identity.state == 'matched' %}enabled{% else %}staging{% endif %}">{{ device.identity.state|upper }}</span></td>
+        </tr>
+        {% if device.warnings %}<tr><td colspan="5">{% for warning in device.warnings %}<div class="conflict-warning">{{ warning }}</div>{% endfor %}</td></tr>{% endif %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-heading">
+    <div><h2>Stage replacement</h2><p class="muted">Staging persists this translated proposal in ZEN for later review/cutover work. It does not create active profiles, schedules or device assignments.</p></div>
+    {% if staged %}<span class="policy-badge enabled">STAGED</span>{% else %}<span class="policy-badge staging">NOT STAGED</span>{% endif %}
+  </div>
+  {% if staged %}
+    <div class="local-only-note">Current staged copy: {{ staged.staged_at }} by {{ staged.actor or 'unknown' }} · <code>{{ staged.source_fingerprint[:12] }}</code>. A fresh Stage action safely replaces the staged copy for this source.</div>
+  {% endif %}
+  {% if user.role == 'admin' %}
+  <div class="row-actions kid-control-stage-actions">
+    <form method="post" action="/local/migration/kid-control/stage">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="preview_fingerprint" value="{{ preview.source_fingerprint }}">
+      <button class="primary" type="submit">Stage this replacement</button>
+    </form>
+    {% if staged %}
+    <form method="post" action="/local/migration/kid-control/discard" onsubmit="return confirm('Discard only the staged ZEN migration proposal? Legacy MikroTik Kid Control will not be changed.');">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="danger-soft" type="submit">Discard staged copy</button>
+    </form>
+    {% endif %}
+  </div>
+  {% else %}
+    <div class="muted">Viewer/operator roles can inspect the translation; only an admin can stage it.</div>
+  {% endif %}
+</section>
+
+{% if staged %}
+<section class="card">
+  <div class="card-heading">
+    <div>
+      <h2>Authority transfer</h2>
+      <p class="muted">Cutover is fail-closed: fresh legacy fingerprint, clean translation, static device identity, RouterOS security posture, automatic ENFORCE reconciliation and a fresh parent OTP are all required.</p>
+    </div>
+    {% if cutover and cutover.state == 'authoritative' %}
+      <span class="policy-badge enabled">ZEN AUTHORITATIVE</span>
+    {% elif cutover and cutover.state == 'failed' and cutover.evidence and cutover.evidence.cleanup_complete %}
+      <span class="policy-badge staging">FAILED · LEGACY RESTORED · FINALIZE</span>
+    {% elif cutover and cutover.state in ['prepared', 'failed'] %}
+      <span class="policy-badge staging">{{ cutover.state|upper }} · RECOVERY REQUIRED</span>
+    {% elif readiness and readiness.ready %}
+      <span class="policy-badge enabled">READY FOR CUTOVER</span>
+    {% else %}
+      <span class="policy-badge staging">NOT READY</span>
+    {% endif %}
+  </div>
+
+  {% if cutover %}
+  <div class="local-only-note">Latest authority event #{{ cutover.id }} · {{ cutover.state|upper }} · {{ cutover.recorded_at }} · actor {{ cutover.actor or 'unknown' }}.</div>
+  {% endif %}
+
+  {% if readiness %}
+  <div class="discovery-table-wrap">
+    <table class="policy-table">
+      <thead><tr><th>Gate</th><th>Result</th><th>Detail</th></tr></thead>
+      <tbody>
+      {% for check in readiness.checks %}
+        <tr>
+          <td>{{ check.key|replace('_', ' ')|title }}</td>
+          <td><span class="policy-badge {{ 'enabled' if check.ok else 'staging' }}">{{ 'PASS' if check.ok else 'BLOCK' }}</span></td>
+          <td>{{ check.detail }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if readiness and readiness.devices %}
+  <h3>Cutover device proof</h3>
+  <div class="discovery-table-wrap">
+    <table class="policy-table">
+      <thead><tr><th>Device</th><th>MAC</th><th>IPv4</th><th>Static lease</th><th>Ready</th></tr></thead>
+      <tbody>
+      {% for device in readiness.devices %}
+        <tr>
+          <td>{{ device.name or '(unnamed)' }}</td>
+          <td><code>{{ device.mac }}</code></td>
+          <td><code>{{ device.ip or 'UNRESOLVED' }}</code></td>
+          <td>{{ 'YES' if device.static_lease else 'NO' }}</td>
+          <td><span class="policy-badge {{ 'enabled' if device.ready else 'staging' }}">{{ 'READY' if device.ready else 'BLOCKED' }}</span>{% if device.reason %}<div class="muted small">{{ device.reason }}</div>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if user.role == 'admin' %}
+    {% if cutover and cutover.state in ['prepared', 'authoritative', 'failed'] %}
+      {% if cutover.state == 'failed' and cutover.evidence and cutover.evidence.cleanup_complete %}
+      <div class="conflict-warning">The failed transfer already restored legacy authority successfully. Finalize rollback to acknowledge the recovered state; ZEN will prove the retained legacy profile is active without replaying completed device cleanup.</div>
+      {% else %}
+      <div class="conflict-warning">Rollback restores the legacy profile first, restores pre-cutover ZEN device state, removes only migration-created RouterOS membership, and restores local policy objects.</div>
+      {% endif %}
+      <form method="post" action="/local/migration/kid-control/rollback" onsubmit="return confirm('Restore legacy MikroTik Kid Control authority now?');">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>Fresh authenticator / recovery code<input name="otp" inputmode="numeric" autocomplete="one-time-code" required></label>
+        <button class="danger-soft" type="submit">Roll back to legacy Kid Control</button>
+      </form>
+    {% elif readiness and readiness.ready %}
+      <div class="conflict-warning"><strong>Authority transfer:</strong> ZEN will materialise/reuse equivalent local policy, prove live enforcement for every device, then disable only the validated legacy Kid Control profile. The legacy configuration is not deleted.</div>
+      <form method="post" action="/local/migration/kid-control/cutover" onsubmit="return confirm('Transfer Kid Control authority to ZEN? Legacy configuration will be retained but disabled after ZEN enforcement is verified.');">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>Fresh authenticator / recovery code<input name="otp" inputmode="numeric" autocomplete="one-time-code" required></label>
+        <button class="primary" type="submit">Transfer authority to ZEN</button>
+      </form>
+    {% else %}
+      <div class="muted">Resolve every blocking gate above before authority transfer. Automatic reconciliation must be set to ENFORCE under Settings → Automation.</div>
+    {% endif %}
+  {% endif %}
+</section>
+{% endif %}
+
+{% elif staged %}
+<section class="card"><h2>Staged migration retained</h2><p class="muted">The live RouterOS read is currently unavailable, but the previously staged proposal remains stored locally. If a cutover was PREPARED, use rollback/recovery after RouterOS connectivity returns.</p></section>
+{% endif %}
+</main>
+</body>
+</html>

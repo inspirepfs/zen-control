@@ -1,0 +1,14 @@
+{% if page_help %}
+{% set help_return = request.url.path ~ (('?' ~ request.url.query) if request.url.query else '') %}
+<aside class="context-help-strip" aria-label="Context help">
+  <div class="context-help-copy">
+    <span class="context-help-label">CONTEXT HELP</span>
+    <strong>{{ page_help.title }}</strong>
+    <span>{{ page_help.summary }}</span>
+  </div>
+  <div class="context-help-actions">
+    <a class="button-link compact secondary" href="/help?topic={{ page_help.key }}&amp;return_to={{ help_return|urlencode }}">Open help</a>
+    <a class="inline-context-link" href="/help?topic=glossary&amp;return_to={{ help_return|urlencode }}">Glossary</a>
+  </div>
+</aside>
+{% endif %}

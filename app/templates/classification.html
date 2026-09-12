@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Classification Intelligence · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/classification-intelligence.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<main class="page-shell classification-page">
+{% set page_help = zen_help('classification') %}
+{% include "_context_help.jinja" %}
+  <header class="page-header compact-page-header standalone-header">
+    <div><div class="eyebrow">ZEN CONTROL · ACTIVITY</div><h1>Classification intelligence</h1><div class="muted small">Evidence-led classifier coverage, change and candidate triage · {{timezone_name}}</div></div>
+    <div class="activity-page-actions"><a class="button-link secondary back-link" href="/?view=activity&amp;section=classification#activity/classification">Back to Activity</a><a class="button-link secondary" href="/?view=policies&amp;section=services#policies/services">Service definitions</a><a class="button-link secondary" href="/activity/analytics?period=7d">Historical analytics</a></div>
+  </header>
+
+  {% if error %}<section class="card"><div class="conflict-warning">{{error}}</div><p class="muted small">No zero-activity inference is made while telemetry is unavailable.</p></section>{% endif %}
+  {% if degraded_evidence %}<section class="card"><div class="conflict-warning">DEGRADED EVIDENCE · one or more classification evidence or consumer components are unavailable, stale, fallback or inconsistent. Healthy evidence remains visible and ZEN never converts a degraded source into zero.</div>{% for item in evidence_errors %}<p class="muted small">{{item.source or item.component or 'telemetry'}} · {{item.error}}</p>{% endfor %}</section>{% endif %}
+
+  <section class="card classification-period-card">
+    <div class="card-heading"><div><h2>Review window</h2><p class="muted">Rank candidate evidence and compare coverage with the immediately preceding equivalent window.</p></div><span class="policy-badge {{'enabled' if trend == 'improving' else 'disabled' if trend == 'declining' else 'staging'}}">{{trend|upper}}</span></div>
+    <nav class="classification-periods" aria-label="Classification window">
+      <a class="button-link compact {{'primary' if hours == 24 else 'secondary'}}" href="/activity/classification?hours=24">24 hours</a>
+      <a class="button-link compact {{'primary' if hours == 168 else 'secondary'}}" href="/activity/classification?hours=168">7 days</a>
+      <a class="button-link compact {{'primary' if hours == 720 else 'secondary'}}" href="/activity/classification?hours=720">30 days</a>
+    </nav>
+  </section>
+
+  <section class="classification-kpi-grid">
+    <div class="card"><span>Traffic classified</span>{% if not evidence.traffic_available %}<strong>UNAVAILABLE</strong><small class="muted">IPFIX traffic evidence could not be queried</small>{% elif current.traffic_percent is none and not evidence.traffic_accounting_valid %}<strong>INCONSISTENT</strong><small class="muted">Traffic accounting did not reconcile</small>{% elif current.traffic_percent is none %}<strong>NO EVIDENCE</strong><small class="muted">No traffic bytes observed in this window</small>{% else %}<strong>{{current.traffic_percent}}%</strong><small class="{{'delta-up' if deltas.traffic_pp is not none and deltas.traffic_pp > 0 else 'delta-down' if deltas.traffic_pp is not none and deltas.traffic_pp < 0 else 'muted'}}">{% if deltas.traffic_pp is none %}Prior comparison unavailable{% else %}{{'+' if deltas.traffic_pp > 0 else ''}}{{deltas.traffic_pp}} pp vs prior{% endif %}</small>{% endif %}</div>
+    <div class="card"><span>DNS classified</span>{% if not evidence.dns_available %}<strong>UNAVAILABLE</strong><small class="muted">DNS evidence could not be queried</small>{% elif current.dns_percent is none and not evidence.dns_accounting_valid %}<strong>INCONSISTENT</strong><small class="muted">DNS accounting did not reconcile</small>{% elif current.dns_percent is none %}<strong>NO EVIDENCE</strong><small class="muted">No DNS queries observed in this window</small>{% else %}<strong>{{current.dns_percent}}%</strong><small class="{{'delta-up' if deltas.dns_pp is not none and deltas.dns_pp > 0 else 'delta-down' if deltas.dns_pp is not none and deltas.dns_pp < 0 else 'muted'}}">{% if deltas.dns_pp is none %}Prior comparison unavailable{% else %}{{'+' if deltas.dns_pp > 0 else ''}}{{deltas.dns_pp}} pp vs prior{% endif %}</small>{% endif %}</div>
+    <div class="card"><span>Unclassified traffic</span><strong>{% if not evidence.traffic_available %}UNAVAILABLE{% elif not evidence.traffic_accounting_valid %}INCONSISTENT{% elif not evidence.traffic_observed %}NO EVIDENCE{% else %}{{current.unclassified_bytes_human}}{% endif %}</strong><small>{% if evidence.traffic_observed %}{{current.total_bytes}} bytes observed{% else %}No observed denominator{% endif %}</small></div>
+    <div class="card"><span>Unknown DNS</span><strong>{% if not evidence.dns_available %}UNAVAILABLE{% elif not evidence.dns_accounting_valid %}INCONSISTENT{% elif not evidence.dns_observed %}NO EVIDENCE{% else %}{{current.unknown_domains}}{% endif %}</strong><small>{% if evidence.dns_observed %}{{current.dns_unclassified_queries}} unclassified of {{current.dns_queries}} queries{% else %}No observed denominator{% endif %}</small></div>
+  </section>
+
+  {% if evidence.status != 'unavailable' and not evidence.accounting_valid %}
+  <section class="card"><div class="conflict-warning">Classification accounting mismatch detected. ZEN is withholding confidence in the affected coverage totals rather than normalising inconsistent retained evidence.</div></section>
+  {% endif %}
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Classifier catalogue</h2><p class="muted">Current concrete service definitions and signatures published to telemetry. Logical policy groups are deliberately excluded.</p></div><span class="policy-badge enabled">{{catalogue.classifier_enabled or 0}} ENABLED</span></div>
+    <div class="classification-consumer-status"><strong>Telemetry consumer</strong> <span class="policy-badge {{'enabled' if not classifier_consumer.degraded else 'staging' if classifier_consumer.availability == 'available' else 'disabled'}}">{{classifier_consumer.source|upper}}</span> <span class="muted small">{{classifier_consumer.availability|upper}} · {{classifier_consumer.services}} services · {{classifier_consumer.signatures}} DNS signatures{% if classifier_consumer.age_seconds is not none %} · heartbeat {{classifier_consumer.age_seconds}}s ago{% endif %}</span>{% if classifier_consumer.error %}<div class="muted small">{{classifier_consumer.error}}</div>{% endif %}</div>
+    <div class="classification-catalogue-grid">
+      <div><span>Concrete services</span><strong>{{catalogue.services or 0}}</strong></div>
+      <div><span>Disabled classifiers</span><strong>{{catalogue.classifier_disabled or 0}}</strong></div>
+      <div><span>DNS suffixes</span><strong>{{catalogue.dns_signatures or 0}}</strong></div>
+      <div><span>TLS/SNI patterns</span><strong>{{catalogue.tls_signatures or 0}}</strong></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Coverage trend</h2><p class="muted">Daily traffic and DNS attribution across the last {{trend_days}} days. This measures classifier coverage, not user behaviour.</p></div><span class="policy-badge staging">{{daily|length}} DAYS</span></div>
+    <div class="classification-daily-grid">
+      {% for item in daily %}
+      <div class="classification-day-row">
+        <strong>{{item.day}}</strong>
+        <span>Traffic {% if item.traffic_percent is none %}NO EVIDENCE{% else %}{{item.traffic_percent}}%{% endif %}</span>
+        <span>DNS {% if item.dns_percent is none %}NO EVIDENCE{% else %}{{item.dns_percent}}%{% endif %}</span>
+        <span>{{item.total_bytes_human}}</span>
+      </div>
+      {% else %}<p class="muted">No retained daily classification evidence.</p>{% endfor %}
+    </div>
+  </section>
+
+  <section class="card classification-candidates-card">
+    <div class="card-heading"><div><h2>Candidate triage</h2><p class="muted">Unknown DNS evidence ranked by query volume. Current-signature matches, name-only hints and unmatched domains are separated so operator actions stay evidence-led.</p></div><div class="classification-badge-row"><span class="policy-badge enabled">{{candidate_counts.signature_match}} SIGNATURE</span><span class="policy-badge staging">{{candidate_counts.name_hint}} NAME HINT</span><span class="policy-badge staging">{{candidate_counts.unmatched}} UNMATCHED</span></div></div>
+    <div class="activity-table-wrap classification-candidate-table-wrap">
+      <table class="activity-table classification-candidate-table">
+        <thead><tr><th>Domain / evidence</th><th>Queries</th><th>Devices</th><th>Blocked</th><th>Unknown share</th><th>Review action</th></tr></thead>
+        <tbody>
+        {% for item in candidates %}
+          <tr class="candidate-{{item.review_state}}">
+            <td><strong>{{item.domain}}</strong><div class="candidate-evidence">
+              {% if item.review_state == 'signature_match' %}<span class="policy-badge enabled">CURRENT SIGNATURE</span>{% for match in item.signature_matches %}<span class="muted small">Matches <a href="{{match.service_url}}">{{match.name}}</a> via <code>{{match.suffixes|join(', ')}}</code>{% if not match.classifier_enabled %} · classifier disabled{% endif %}</span>{% endfor %}
+              {% elif item.review_state == 'name_hint' %}<span class="policy-badge staging">NAME-ONLY HINT</span>{% for hint in item.name_hints %}<span class="muted small">Hostname resembles <a href="{{hint.service_url}}">{{hint.name}}</a> ({{hint.tokens|join(', ')}}). Manual-review clue only.</span>{% endfor %}
+              {% else %}<span class="policy-badge staging">UNMATCHED</span><span class="muted small">No current DNS signature or service-name hint.</span>{% endif %}
+            </div><small class="muted">Last seen {{item.last_seen or '—'}}</small></td>
+            <td>{{item.queries}}</td><td>{{item.devices}}</td><td>{{item.blocked}}</td><td>{% if not candidate_accounting.valid %}INCONSISTENT{% elif item.unknown_query_share is none %}NO EVIDENCE{% else %}{{item.unknown_query_share}}%{% endif %}</td>
+            <td><strong>{{item.recommended_action}}</strong><div class="candidate-actions">{% if item.review_state != 'signature_match' %}<a class="button-link compact" href="{{item.prefill_url}}">Prefill custom service</a>{% else %}<a class="button-link compact secondary" href="{{item.signature_matches[0].service_url}}">Review signature</a>{% endif %}</div></td>
+          </tr>
+        {% else %}<tr><td colspan="6" class="muted">No unclassified DNS candidates in this window.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="muted small">A CURRENT SIGNATURE row means the retained DNS event was unclassified even though the hostname matches today's catalogue. That can happen when a signature was added later, was disabled at ingestion time, or the telemetry consumer had not yet reloaded the catalogue. ZEN does not silently rewrite historical evidence.</p>
+    <p class="muted small">Candidate table accounting: {{candidate_accounting.listed_queries}} of {{candidate_accounting.unknown_queries}} unknown queries are represented by the bounded candidate list{% if candidate_accounting.listed_share_percent is not none %} ({{candidate_accounting.listed_share_percent}}%){% endif %}. A bounded list may legitimately cover less than 100%; it must never exceed the unknown-query total. {% if not candidate_accounting.valid %}INCONSISTENT snapshot accounting detected; candidate shares are withheld because late-arriving or changing retained evidence made the bounded list exceed its captured denominator.{% endif %}</p>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Named attribution movement</h2><p class="muted">Largest byte changes for already-attributed services versus the immediately preceding equivalent window. This is network attribution movement, not foreground-app time.</p></div><span class="policy-badge staging">{{service_changes|length}} SHOWN</span></div>
+    <div class="activity-table-wrap"><table class="activity-table"><thead><tr><th>Service</th><th>Current</th><th>Previous</th><th>Change</th></tr></thead><tbody>
+      {% for item in service_changes %}<tr><td><strong>{{item.service_name}}</strong></td><td>{{item.current_human}}</td><td>{{item.previous_human}}</td><td class="{{'delta-up' if item.delta_bytes > 0 else 'delta-down'}}">{{item.delta_human}}{% if item.delta_percent is not none %} · {{item.delta_percent}}%{% else %} · new in window{% endif %}</td></tr>
+      {% else %}<tr><td colspan="4" class="muted">No attributed-service movement in this window.</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+
+  <section class="card evidence-boundary-card"><h2>Evidence boundary</h2><p class="muted">{{evidence_note}}</p><p class="muted small">No candidate is auto-added to the catalogue, no classifier is automatically changed, and no RouterOS contract is created from this page. Custom-service provisioning still requires the explicit v0.23 preview/approval workflow.</p></section>
+</main>
+</body>
+</html>

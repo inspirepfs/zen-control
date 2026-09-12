@@ -1,0 +1,11 @@
+/* v0.37 Android/tablet PWA shell. */
+:root{--zen-safe-top:env(safe-area-inset-top,0px);--zen-safe-right:env(safe-area-inset-right,0px);--zen-safe-bottom:env(safe-area-inset-bottom,0px);--zen-safe-left:env(safe-area-inset-left,0px)}
+@media(display-mode:standalone){
+  body{padding-left:var(--zen-safe-left);padding-right:var(--zen-safe-right)}
+  body>header,.standalone-header{padding-top:max(12px,var(--zen-safe-top))}
+  .app-tabs{padding-left:max(8px,var(--zen-safe-left));padding-right:max(8px,var(--zen-safe-right))}
+  @media(max-width:760px){main{padding-bottom:calc(86px + var(--zen-safe-bottom))}.app-tabs{padding-bottom:max(8px,var(--zen-safe-bottom))}}
+}
+.pwa-install-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:13px;border:1px solid rgba(255,255,255,.09);border-radius:14px;background:#0f162a}
+.pwa-install-copy{display:flex;flex-direction:column;gap:4px;min-width:0}.pwa-install-copy strong{font-size:.95rem}.pwa-install-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.pwa-state{display:inline-flex;padding:5px 8px;border-radius:999px;border:1px solid #445887;font-size:.68rem;font-weight:900;letter-spacing:.04em;color:#d9e2ff}.pwa-security-note{grid-column:1/-1;margin:0;color:#9ca9c8;font-size:.78rem;line-height:1.45}.pwa-update-banner{position:fixed;z-index:1000;left:50%;bottom:18px;transform:translateX(-50%);width:min(620px,calc(100vw - 28px));display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 14px;border:1px solid #52679d;border-radius:14px;background:#111a31;box-shadow:0 18px 55px rgba(0,0,0,.45);color:#eef2ff}.pwa-update-banner>div{display:flex;flex-direction:column;gap:2px}.pwa-update-banner span{font-size:.78rem;color:#aebbd8}.pwa-update-banner button{flex:0 0 auto}
+@media(max-width:700px){.pwa-install-card{grid-template-columns:1fr}.pwa-install-actions{justify-content:flex-start}.pwa-update-banner{bottom:calc(84px + var(--zen-safe-bottom));align-items:stretch}.pwa-update-banner button{align-self:center}}

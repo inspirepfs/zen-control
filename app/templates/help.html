@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Help · {{selected.title}} · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/help.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header help-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · HELP</div>
+    <div class="brand">Context &amp; help</div>
+    <div class="muted small">Short, evidence-led guidance for the feature you are using.</div>
+  </div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="{{back_href}}">Back to {{back_label}}</a>
+    <a class="button-link secondary" href="/help?topic=getting_started">Start here</a>
+    <a class="button-link secondary" href="/help?topic=glossary">Glossary</a>
+    <a class="button-link secondary" href="/api/help?topic={{selected.key}}">JSON</a>
+  </div>
+</header>
+<main class="help-shell">
+  <section class="card help-topic-panel">
+    <div class="help-topic-heading">
+      <div>
+        <span class="policy-badge staging">{{selected.category}}</span>
+        <h1>{{selected.title}}</h1>
+        <p>{{selected.summary}}</p>
+      </div>
+      <span class="reconcile-state reconcile-sync">READ ONLY</span>
+    </div>
+
+    {% if selected.does %}
+    <div class="help-block">
+      <h2>What this means / does</h2>
+      <ul>{% for item in selected.does %}<li>{{item}}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+
+    {% if selected.watch %}
+    <div class="help-block help-watch">
+      <h2>Important boundaries</h2>
+      <ul>{% for item in selected.watch %}<li>{{item}}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+
+    {% if selected.evidence %}
+    <div class="local-only-note help-evidence"><strong>Evidence note:</strong> {{selected.evidence}}</div>
+    {% endif %}
+
+    {% if selected.related %}
+    <div class="help-related">
+      <h2>Related</h2>
+      <div>{% for link in selected.related %}<a class="button-link compact secondary" href="{{link.href}}">{{link.label}}</a>{% endfor %}</div>
+    </div>
+    {% endif %}
+  </section>
+
+  <aside class="card help-index-card">
+    <div class="card-heading">
+      <div><h2>Help index</h2><p class="muted">Filter by feature or term.</p></div>
+      <span id="helpCount" class="policy-badge staging">{{topics|length}} TOPICS</span>
+    </div>
+    <label class="help-search-label" for="helpSearch">Find help</label>
+    <input id="helpSearch" type="search" placeholder="device, quota, RouterOS, classification…" autocomplete="off">
+    <div id="helpTopicList" class="help-topic-list">
+      {% for topic in topics %}
+      <a class="help-topic-link {{'active' if topic.key == selected.key else ''}}" href="/help?topic={{topic.key}}" data-search="{{topic.category}} {{topic.title}} {{topic.summary}}">
+        <span>{{topic.category}}</span><strong>{{topic.title}}</strong><small>{{topic.summary}}</small>
+      </a>
+      {% endfor %}
+    </div>
+  </aside>
+</main>
+<script>
+(() => {
+  const search = document.getElementById('helpSearch');
+  const items = Array.from(document.querySelectorAll('.help-topic-link'));
+  const count = document.getElementById('helpCount');
+  if (!search) return;
+  search.addEventListener('input', () => {
+    const query = search.value.trim().toLowerCase();
+    let visible = 0;
+    items.forEach(item => {
+      const match = !query || item.dataset.search.toLowerCase().includes(query);
+      item.hidden = !match;
+      if (match) visible += 1;
+    });
+    count.textContent = `${visible} TOPIC${visible === 1 ? '' : 'S'}`;
+  });
+})();
+</script>
+</body>
+</html>

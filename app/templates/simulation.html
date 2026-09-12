@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Policy Simulation · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/policy-simulation.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<main class="simulation-shell">
+{% set page_help = zen_help('policy_simulation') %}
+{% include "_context_help.jinja" %}
+  <section class="card simulation-header">
+    <div class="card-heading">
+      <div>
+        <h2>Policy Simulation</h2>
+        <p class="muted">Ask “what will happen?” using the same effective-policy resolver as live reconciliation, without saving policy or writing RouterOS.</p>
+      </div>
+      <div class="activity-page-actions"><span class="policy-badge staging">READ ONLY</span><a class="button-link secondary back-link" href="/?view=policies&amp;section=tools#policies/tools">Back to Policy tools</a><a class="button-link secondary" href="/policy/quality">Policy quality</a></div>
+    </div>
+    <div class="local-only-note"><strong>Simulation boundary:</strong> proposed values stay in memory. Future quota consumption is not predicted. A live RouterOS comparison, when requested, compares against RouterOS <em>now</em>; it is not a forecast of future RouterOS state.</div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>What-if workbench</h2><p class="muted">Choose a device/time, then optionally change its profile assignment or mode override for this preview only.</p></div><span class="policy-badge enabled">{{clock.time}} · {{clock.timezone}}</span></div>
+    <form method="post" action="/policy/simulate" class="simulation-form">
+      <input type="hidden" name="csrf" value="{{csrf}}">
+      <label>Device
+        <select name="ip" required>
+          {% for d in devices %}<option value="{{d.ip}}" {% if selected and selected.ip == d.ip %}selected{% endif %}>{{d.alias or d.name or d.ip}} · {{d.ip}}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Date<input type="date" name="date" value="{{selected.date if selected else clock.date}}" required></label>
+      <label>Time<input type="time" name="clock_time" value="{{selected.time if selected else clock.time}}" required></label>
+      <label>Proposed profile
+        <select name="scenario_profile_id">
+          <option value="keep" {% if not selected or selected.profile == 'keep' %}selected{% endif %}>Keep current assignment</option>
+          <option value="unassigned" {% if selected and selected.profile == 'unassigned' %}selected{% endif %}>Unassigned</option>
+          {% for p in profiles %}<option value="{{p.id}}" {% if selected and selected.profile|string == p.id|string %}selected{% endif %}>{{p.name}}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Proposed mode override
+        <select name="scenario_mode_override">
+          <option value="keep" {% if not selected or selected.mode == 'keep' %}selected{% endif %}>Keep current override</option>
+          {% for mode in ['inherit','normal','slow','blocked'] %}<option value="{{mode}}" {% if selected and selected.mode == mode %}selected{% endif %}>{{mode|title}}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="simulation-check"><input type="checkbox" name="compare_live" value="true" {% if selected and selected.compare_live %}checked{% endif %}><span>Compare simulated desired state with fresh RouterOS state now</span></label>
+      <button class="primary">Run what-if simulation</button>
+    </form>
+  </section>
+
+  {% if result %}
+  <section class="card simulation-result-card">
+    <div class="card-heading">
+      <div><h2>{{result.device.name}} <span class="muted">({{result.device.ip}})</span></h2><p class="muted">{{result.scenario_label}} · {{result.simulation_at}} · {{result.timezone}}{% if result.scenario.policy_time_resolution and result.scenario.policy_time_resolution.adjusted %} · requested local time {{result.scenario.policy_time_resolution.requested_local}} was DST-adjusted to {{result.scenario.policy_time_resolution.resolved_local}}{% endif %}</p></div>
+      {% if result.changed %}<span class="reconcile-state reconcile-drift">{{result.change_count}} CHANGE{% if result.change_count != 1 %}S{% endif %}</span>{% else %}<span class="reconcile-state reconcile-sync">NO DESIRED CHANGE</span>{% endif %}
+    </div>
+
+    <div class="simulation-state-grid">
+      <article><span>Baseline mode</span><strong>{{result.baseline.mode|upper}}</strong><small>{{result.baseline.mode_source}}</small></article>
+      <article><span>Simulated mode</span><strong>{{result.scenario.mode|upper}}</strong><small>{{result.scenario.mode_source}}</small></article>
+      <article><span>Baseline bandwidth</span><strong>{{result.baseline.bandwidth_name}}</strong><small>{{result.baseline.bandwidth_upload}} / {{result.baseline.bandwidth_download}}</small></article>
+      <article><span>Simulated bandwidth</span><strong>{{result.scenario.bandwidth_name}}</strong><small>{{result.scenario.bandwidth_upload}} / {{result.scenario.bandwidth_download}}</small></article>
+      <article><span>Baseline service blocks</span><strong>{{result.baseline.blocked_services|length}}</strong><small>{{result.baseline.blocked_policy_groups|length}} policy group(s)</small></article>
+      <article><span>Simulated service blocks</span><strong>{{result.scenario.blocked_services|length}}</strong><small>{{result.scenario.blocked_policy_groups|length}} policy group(s)</small></article>
+    </div>
+
+    <h3>Desired-policy impact</h3>
+    {% if result.changes %}
+    <div class="simulation-delta-list">
+      {% for row in result.changes %}<div class="simulation-delta"><span>{{row.label}}{% if row.enforceable is sameas false %} <span class="policy-badge staging">REPORTING ONLY</span>{% endif %}</span><code>{{row.from}}</code><strong>→</strong><code>{{row.to}}</code></div>{% endfor %}
+    </div>
+    {% else %}<p class="muted">The selected what-if inputs resolve to the same desired policy as the saved configuration at this time.</p>{% endif %}
+
+    {% if result.scenario.scheduled_service_overrides %}
+    <details><summary>Active scheduled service decisions</summary><div class="compact-list">{% for row in result.scenario.scheduled_service_overrides %}<div><strong>{{row.service}}</strong><span>{{row.state|upper}} · {{row.label}}</span></div>{% endfor %}</div></details>
+    {% endif %}
+    {% if result.scenario.active_date_exception %}<div class="local-only-note">Active date exception: <strong>{{result.scenario.active_date_exception.label}}</strong></div>{% endif %}
+    {% if result.scenario.conflicts %}{% for warning in result.scenario.conflicts %}<div class="conflict-warning">{{warning}}</div>{% endfor %}{% endif %}
+
+    <h3>Current RouterOS comparison</h3>
+    {% if result.live_comparison.available %}
+      <div class="local-only-note">{{result.live_comparison.note}}</div>
+      {% if result.live_comparison.actions %}<div class="simulation-delta-list">{% for row in result.live_comparison.actions %}<div class="simulation-delta"><span>{{row.label}}</span><code>{{row.from}}</code><strong>→</strong><code>{{row.to}}</code>{% if not row.supported %}<span class="reconcile-state reconcile-partial">UNSUPPORTED</span>{% endif %}</div>{% endfor %}</div>{% else %}<p class="muted">No reconciliation actions would be required against the live state read for this comparison.</p>{% endif %}
+    {% elif result.live_comparison.error %}<div class="conflict-warning">RouterOS comparison unavailable: {{result.live_comparison.error}}</div>
+    {% else %}<p class="muted">Live comparison was not requested.</p>{% endif %}
+
+    <div class="local-only-note">{{result.quota_prediction.note}}</div>
+    <div class="simulation-actions"><a class="button-link" href="/policy/explain/{{result.device.ip}}">Explain current state</a><a class="button-link secondary" href="/devices/{{result.device.ip}}">Device 360</a><a class="button-link secondary" href="/?view=policies&amp;section=assignments&amp;focus=assignment:{{result.device.ip}}#policies/assignments">Edit assignment</a></div>
+  </section>
+  {% endif %}
+
+  {% if impact %}
+  <section class="card">
+    <div class="card-heading"><div><h2>Unsaved profile impact · {{impact.profile_name}}</h2><p class="muted">{{impact.simulation_at}}</p></div><span class="reconcile-state {% if impact.changed_devices %}reconcile-drift{% else %}reconcile-sync{% endif %}">{{impact.changed_devices}} / {{impact.device_count}} DEVICES CHANGE</span></div>
+    <div class="simulation-state-grid impact-stats">
+      <article><span>Affected devices</span><strong>{{impact.device_count}}</strong></article>
+      <article><span>Changed devices</span><strong>{{impact.changed_devices}}</strong></article>
+      <article><span>Mode changes</span><strong>{{impact.mode_change_devices}}</strong></article>
+      <article><span>Bandwidth changes</span><strong>{{impact.bandwidth_change_devices}}</strong></article>
+      <article><span>Service/group changes</span><strong>{{impact.service_change_devices}}</strong></article>
+      <article><span>Quota-policy changes</span><strong>{{impact.quota_change_devices}}</strong></article>
+      <article><span>Unchanged</span><strong>{{impact.unchanged_devices}}</strong></article>
+    </div>
+    {% if impact.rows %}
+    <div class="table-scroll"><table class="dense-table"><thead><tr><th>Device</th><th>Current</th><th>Proposed</th><th>Impact</th><th></th></tr></thead><tbody>
+      {% for row in impact.rows %}<tr><td><strong>{{row.device.name}}</strong><div class="muted small">{{row.device.ip}}</div></td><td>{{row.baseline.mode|upper}} · {{row.baseline.bandwidth_name}}</td><td>{{row.scenario.mode|upper}} · {{row.scenario.bandwidth_name}}</td><td>{% if row.changed %}<strong>{{row.change_count}} change{% if row.change_count != 1 %}s{% endif %}</strong>{% for d in row.changes[:3] %}<div class="muted small">{{d.label}}: {{d.from}} → {{d.to}}</div>{% endfor %}{% else %}<span class="muted">No desired change</span>{% endif %}</td><td><a class="inline-context-link" href="/policy/explain/{{row.device.ip}}">current explanation</a></td></tr>{% endfor %}
+    </tbody></table></div>
+    {% else %}<p class="muted">No managed devices are currently assigned to this profile. Saving it would not immediately change any device's desired policy.</p>{% endif %}
+    <div class="local-only-note">{{impact.evidence_note}}</div>
+    <div class="simulation-actions"><a class="button-link" href="/?view=policies&amp;section=profiles#policies/profiles">Return to unsaved profile editor</a></div>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

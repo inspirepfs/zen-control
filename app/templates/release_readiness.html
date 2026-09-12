@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Core Release Readiness · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/diagnostics.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<main class="standalone-page diagnostics-page">
+{% set page_help = zen_help('release_readiness') %}
+{% include "_context_help.jinja" %}
+  <header class="standalone-header diagnostics-header">
+    <div>
+      <div class="eyebrow">ZEN CONTROL · CORE CLOSURE</div>
+      <h1>Core release readiness</h1>
+      <p class="muted">Evidence-led v0.50 acceptance across runtime health, live performance, backup/restore, controlled restart and shared-display commissioning. <strong>PENDING is not PASS.</strong></p>
+    </div>
+    <div class="standalone-actions diagnostics-actions">
+      <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
+      <a class="button-link secondary" href="/diagnostics">Diagnostics</a>
+      <a class="button-link secondary" href="/performance">Performance</a>
+      <a class="button-link" href="/api/release-readiness">JSON</a>
+      <a class="button-link primary" href="/local/release-readiness/export">Download evidence</a>
+      <a class="button-link secondary" href="/release-readiness">Run again</a>
+    </div>
+  </header>
+
+  <section class="diagnostic-hero state-{{ 'healthy' if report.state == 'pass' else ('warning' if report.state == 'pending' else 'critical') }}">
+    <div>
+      <span class="diagnostic-state">{{report.state|upper}}</span>
+      <strong>{{report.counts.pass}} pass · {{report.counts.pending}} pending · {{report.counts.fail}} fail</strong>
+    </div>
+    <div class="muted small">Captured {{report.captured_at}} · ZEN {{report.version}}</div>
+  </section>
+
+  <section class="card">
+    <h2>Release gate</h2>
+    <p class="muted">A core release is ready only when every current check has affirmative evidence. Missing live performance samples, an uncommissioned shared display or missing controlled restart evidence remains PENDING. A disproven authority, dependency or safety requirement is FAIL.</p>
+    <div class="diagnostic-kpis">
+      <span><small>Core checks</small><strong>{{report.checks|length}}</strong></span>
+      <span><small>Pass</small><strong>{{report.counts.pass}}</strong></span>
+      <span><small>Pending</small><strong>{{report.counts.pending}}</strong></span>
+      <span><small>Fail</small><strong>{{report.counts.fail}}</strong></span>
+      <span><small>Closed slices</small><strong>{{report.closure_matrix|length}}</strong></span>
+    </div>
+  </section>
+
+  <section class="diagnostic-grid">
+    {% for item in report.checks %}
+    <article class="diagnostic-check state-{{ 'healthy' if item.state == 'pass' else ('warning' if item.state == 'pending' else 'critical') }}">
+      <div class="diagnostic-check-heading">
+        <strong>{{item.label}}</strong>
+        <span class="diagnostic-pill">{{item.state|upper}}</span>
+      </div>
+      <div class="diagnostic-summary">{{item.summary}}</div>
+      {% if item.evidence %}
+      <div class="diagnostic-facts">
+        {% for key, value in item.evidence.items() %}
+          {% if key not in ('warning_checks', 'blocking_checks') %}
+          <span><small>{{key|replace('_',' ')|title}}</small><strong>{{value}}</strong></span>
+          {% endif %}
+        {% endfor %}
+      </div>
+      {% if item.key == 'dependency_health' and (item.evidence.warning_checks or item.evidence.blocking_checks) %}
+      <div class="diagnostic-attribution">
+        {% if item.evidence.warning_checks %}
+        <strong>Warnings requiring review</strong>
+        {% for finding in item.evidence.warning_checks %}
+        <div class="diagnostic-attribution-row">
+          <span class="diagnostic-pill">{{finding.state|upper}}</span>
+          <div><strong>{{finding.label}}</strong><small>{{finding.summary}}</small></div>
+        </div>
+        {% endfor %}
+        {% endif %}
+        {% if item.evidence.blocking_checks %}
+        <strong>Blocking dependency findings</strong>
+        {% for finding in item.evidence.blocking_checks %}
+        <div class="diagnostic-attribution-row">
+          <span class="diagnostic-pill">{{finding.state|upper}}</span>
+          <div><strong>{{finding.label}}</strong><small>{{finding.summary}}</small></div>
+        </div>
+        {% endfor %}
+        {% endif %}
+        <a class="button-link compact secondary" href="/diagnostics">Review in diagnostics</a>
+      </div>
+      {% endif %}
+      {% endif %}
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <div class="card-heading">
+      <div><h2>Core closure matrix</h2><p class="muted">Previously qualified safety and parity slices retained as the v0.50 acceptance baseline.</p></div>
+    </div>
+    <div class="table-scroll">
+      <table class="compact-table">
+        <thead><tr><th>Capability</th><th>Closed in</th><th>State</th></tr></thead>
+        <tbody>
+        {% for item in report.closure_matrix %}
+          <tr><td>{{item.label}}</td><td>v{{item.closed_in}}</td><td>{{item.state|upper}}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading">
+      <div><h2>Source-qualified parent journeys</h2><p class="muted">Cross-capability journeys retained by the full regression suite. These are source qualification, not substitutes for the live checks above.</p></div>
+    </div>
+    <div class="table-scroll">
+      <table class="compact-table">
+        <thead><tr><th>Journey</th><th>Path</th><th>State</th></tr></thead>
+        <tbody>
+        {% for item in report.parent_journeys %}
+          <tr><td>{{item.label}}</td><td>{{item.path}}</td><td>{{item.state|replace('_',' ')|upper}}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Deliberately deferred after core closure</h2>
+    <p class="muted">These items are visible so they cannot be mistaken for completed work, but they do not block the v0.50 core gate.</p>
+    {% for item in report.deferred %}
+      <p><strong>{{item.label}} · {{item.state|upper}}</strong><br><span class="muted">{{item.summary}}</span></p>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <h2>Acceptance notes</h2>
+    {% for note in report.notes %}<p class="muted">{{note}}</p>{% endfor %}
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Configuration Import Preview · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · OPERATIONS</div>
+    <div class="brand">Configuration import preview</div>
+    <div class="muted small">Review container-side changes before replacing the current policy model.</div>
+  </div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
+    <span class="policy-badge staging">PREVIEW</span>
+  </div>
+</header>
+<main>
+{% set page_help = zen_help('import_preview') %}
+{% include "_context_help.jinja" %}
+<section class="card">
+  <div class="card-heading">
+    <div><h2>Proposed configuration changes</h2><p class="muted">Nothing is changed until you explicitly apply this preview.</p></div>
+  </div>
+  <div class="discovery-table-wrap">
+    <table class="policy-table">
+      <thead><tr><th>Section</th><th>Current</th><th>Incoming</th><th>Changed?</th></tr></thead>
+      <tbody>
+      {% for row in diff %}
+        <tr><td>{{row.section}}</td><td>{{row.current}}</td><td>{{row.incoming}}</td><td>{{'YES' if row.changed else 'No'}}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <form method="post" action="/local/config/import" class="standalone-form-actions">
+    <input type="hidden" name="csrf" value="{{csrf}}">
+    <textarea name="config_json" hidden>{{config_json}}</textarea>
+    <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Cancel import</a>
+    <button class="danger-soft" onclick="return confirm('Replace the current container-side policy configuration?');">Apply import</button>
+  </form>
+</section>
+</main>
+</body>
+</html>

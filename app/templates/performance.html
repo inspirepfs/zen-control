@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Performance · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/performance.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<main class="standalone-shell performance-shell">
+{% set page_help = zen_help('performance') %}
+{% include "_context_help.jinja" %}
+  <header class="standalone-header compact-header">
+    <div>
+      <div class="eyebrow">ZEN CONTROL · PERFORMANCE CLOSURE</div>
+      <h1>Performance evidence</h1>
+      <p class="muted">v0.39 measures responsiveness against explicit acceptance budgets after the v0.30.1 optimization work.</p>
+    </div>
+    <div class="header-actions">
+      <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
+      <a class="button-link" href="/api/performance">JSON snapshot</a>
+      <a class="button-link primary" href="/performance">Refresh</a>
+    </div>
+  </header>
+
+  {% if not snapshot.enabled %}
+  <section class="card perf-warning">
+    <strong>Performance collection is disabled.</strong>
+    <span>Set <code>ZEN_PERF_ENABLED=1</code> and rebuild/restart the application.</span>
+  </section>
+  {% endif %}
+
+  <section class="perf-stat-grid" aria-label="Performance summary">
+    <div class="perf-stat"><span>Retained requests</span><strong>{{ snapshot.request_summary.retained }}</strong><small>{{ snapshot.request_summary.recorded_total }} recorded since reset</small></div>
+    <div class="perf-stat"><span>Average server time</span><strong>{{ '%.1f'|format(snapshot.request_summary.avg_ms) }} ms</strong><small>p50 {{ '%.1f'|format(snapshot.request_summary.p50_ms) }} ms</small></div>
+    <div class="perf-stat"><span>p95 server time</span><strong>{{ '%.1f'|format(snapshot.request_summary.p95_ms) }} ms</strong><small>p99 {{ '%.1f'|format(snapshot.request_summary.p99_ms) }} ms</small></div>
+    <div class="perf-stat"><span>Slow requests</span><strong>{{ snapshot.request_summary.slow_count }}</strong><small>threshold {{ snapshot.configuration.slow_request_ms|int }} ms</small></div>
+    <div class="perf-stat"><span>Current RSS</span><strong>{% if snapshot.process.current_rss_mb is not none %}{{ '%.1f'|format(snapshot.process.current_rss_mb) }} MB{% else %}n/a{% endif %}</strong><small>max {{ '%.1f'|format(snapshot.process.max_rss_mb) }} MB</small></div>
+    <div class="perf-stat"><span>Process</span><strong>{{ snapshot.process.threads }} threads</strong><small>uptime {{ snapshot.process.uptime_seconds|int }}s</small></div>
+  </section>
+
+  <section class="card perf-acceptance state-{{ snapshot.acceptance.state }}">
+    <div class="card-heading">
+      <div>
+        <h2>Responsiveness acceptance</h2>
+        <p class="muted">Closure gate based on retained live requests. A target remains PENDING until it has at least {{ snapshot.acceptance.min_samples }} representative samples.</p>
+      </div>
+      <span class="perf-acceptance-state">{{ snapshot.acceptance.state|upper }}</span>
+    </div>
+    <div class="table-scroll">
+      <table class="dense-table">
+        <thead><tr><th>Target</th><th>Samples</th><th>Observed</th><th>Budget</th><th>State</th></tr></thead>
+        <tbody>
+        {% for row in snapshot.acceptance.targets %}
+          <tr>
+            <td><strong>{{ row.label }}</strong><div class="muted small">{{ row.description }}</div></td>
+            <td>{{ row.samples }} / {{ row.min_samples }}</td>
+            {% if row.key == 'router_connections' %}
+              <td>p95 {{ '%.2f'|format(row.p95_calls) }} · max {{ row.max_calls }}</td>
+              <td>≤ {{ '%.1f'|format(row.budget_p95_calls) }} connection/request</td>
+            {% else %}
+              <td>p50 {{ '%.1f'|format(row.p50_ms) }} ms · p95 <strong>{{ '%.1f'|format(row.p95_ms) }} ms</strong></td>
+              <td>p95 ≤ {{ '%.0f'|format(row.budget_p95_ms) }} ms</td>
+            {% endif %}
+            <td><span class="perf-target-state state-{{ row.state }}">{{ row.state|upper }}</span></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="muted small">PASS means the current retained live sample set meets the agreed current-scope budgets; it does not waive RouterOS fresh-read or post-write validation requirements.</p>
+  </section>
+
+  <section class="card">
+    <div class="card-heading">
+      <div>
+        <h2>Browser baseline probe</h2>
+        <p class="muted">Runs authenticated same-origin GETs from this browser. First pass warms each path; later passes are measured. It performs no configuration writes.</p>
+      </div>
+    </div>
+    <div class="perf-probe-controls">
+      <label>Paths, one per line
+        <textarea id="perfPaths" rows="7">/?view=dashboard&section=overview
+/?view=devices&section=managed
+/?view=policies&section=profiles
+/?view=activity&section=overview
+/?view=settings&section=parents
+/activity/analytics
+/local/policy-summary
+/policy/simulate</textarea>
+      </label>
+      <label>Measured rounds
+        <input id="perfRounds" type="number" min="1" max="20" value="5">
+      </label>
+      <button id="runPerfProbe" type="button">Run baseline probe</button>
+    </div>
+    <p id="perfProbeState" class="muted">No browser probe run yet.</p>
+    <div class="table-scroll">
+      <table class="dense-table" id="perfProbeTable">
+        <thead><tr><th>Path</th><th>Samples</th><th>Browser avg</th><th>Server avg</th><th>Server p95</th><th>Bytes avg</th><th>Status</th></tr></thead>
+        <tbody><tr><td colspan="7" class="muted">Run the probe after normal application traffic has warmed.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Route latency</h2><p class="muted">Server-side duration grouped by FastAPI route. Highest p95 first.</p></div></div>
+    <div class="table-scroll">
+      <table class="dense-table">
+        <thead><tr><th>Route</th><th>Count</th><th>Avg</th><th>p50</th><th>p95</th><th>p99</th><th>Max</th><th>Slow</th></tr></thead>
+        <tbody>
+        {% for row in snapshot.routes %}
+          <tr>
+            <td><code>{{ row.route }}</code></td><td>{{ row.count }}</td>
+            <td>{{ '%.1f'|format(row.avg_ms) }} ms</td><td>{{ '%.1f'|format(row.p50_ms) }} ms</td>
+            <td><strong>{{ '%.1f'|format(row.p95_ms) }} ms</strong></td><td>{{ '%.1f'|format(row.p99_ms) }} ms</td>
+            <td>{{ '%.1f'|format(row.max_ms) }} ms</td><td>{{ row.slow_count }}</td>
+          </tr>
+          {% if row.top_components %}
+          <tr class="perf-detail-row"><td colspan="8">
+            {% for component in row.top_components %}
+              <span class="perf-chip"><code>{{ component.name }}</code> {{ '%.1f'|format(component.avg_ms_per_request) }}ms · {{ component.avg_calls_per_request }} calls/req</span>
+            {% endfor %}
+          </td></tr>
+          {% endif %}
+        {% else %}
+          <tr><td colspan="8" class="muted">No measured requests yet. Use ZEN normally or run the browser probe.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Component cost</h2><p class="muted">Inclusive timings for RouterOS, SQLite, telemetry, policy composition and template rendering. Counts make N+1 patterns visible.</p></div></div>
+    <div class="table-scroll">
+      <table class="dense-table">
+        <thead><tr><th>Component</th><th>Calls</th><th>Avg</th><th>p95</th><th>Max</th><th>Errors</th><th>Scope</th></tr></thead>
+        <tbody>
+        {% for row in snapshot.components[:40] %}
+          <tr><td><code>{{ row.name }}</code></td><td>{{ row.count }}</td><td>{{ '%.1f'|format(row.avg_ms) }} ms</td><td>{{ '%.1f'|format(row.p95_ms) }} ms</td><td>{{ '%.1f'|format(row.max_ms) }} ms</td><td>{{ row.errors }}</td><td>{% for key, count in row.scopes.items() %}<span class="perf-chip">{{ key }} {{ count }}</span>{% endfor %}</td></tr>
+        {% else %}
+          <tr><td colspan="7" class="muted">No component evidence yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>PostgreSQL query cost</h2><p class="muted">ActivityStore query fingerprints and timings. SQL is static application SQL; parameter values are not captured.</p></div></div>
+    <div class="table-scroll">
+      <table class="dense-table">
+        <thead><tr><th>Fingerprint / query</th><th>Calls</th><th>Avg</th><th>p95</th><th>Max</th><th>Errors</th></tr></thead>
+        <tbody>
+        {% for row in snapshot.sql[:30] %}
+          <tr><td><code>{{ row.fingerprint }}</code>{% if row.preview %}<div class="perf-sql">{{ row.preview }}</div>{% endif %}</td><td>{{ row.count }}</td><td>{{ '%.1f'|format(row.avg_ms) }} ms</td><td>{{ '%.1f'|format(row.p95_ms) }} ms</td><td>{{ '%.1f'|format(row.max_ms) }} ms</td><td>{{ row.errors }}</td></tr>
+        {% else %}
+          <tr><td colspan="6" class="muted">No PostgreSQL query evidence yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Slowest retained requests</h2><p class="muted">Useful for drilling into a representative slow request ID and its measured component mix.</p></div></div>
+    <div class="table-scroll">
+      <table class="dense-table">
+        <thead><tr><th>Time</th><th>ID</th><th>Route</th><th>Status</th><th>Duration</th><th>Top components</th></tr></thead>
+        <tbody>
+        {% for row in snapshot.slow_requests[:20] %}
+          <tr><td>{{ row.started_at }}</td><td><code>{{ row.request_id }}</code></td><td><code>{{ row.method }} {{ row.route }}</code></td><td>{{ row.status }}</td><td><strong>{{ '%.1f'|format(row.duration_ms) }} ms</strong></td><td>{% for component in row.components[:5] %}<span class="perf-chip"><code>{{ component.name }}</code> {{ '%.1f'|format(component.total_ms) }}ms ×{{ component.calls }}</span>{% endfor %}</td></tr>
+        {% else %}
+          <tr><td colspan="6" class="muted">No retained requests yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card perf-evidence-boundary">
+    <div class="card-heading"><div><h2>Measurement boundary</h2></div></div>
+    <ul class="compact-list">
+      {% for note in snapshot.notes %}<li>{{ note }}</li>{% endfor %}
+      <li>The browser probe adds browser/network transfer time; <code>X-ZEN-Request-Ms</code> is the server-side measurement for the same request.</li>
+      <li>v0.39 adds a read-only managed-device observational snapshot for Dashboard/Managed Devices, route-specific main-view timings and explicit acceptance budgets. Write/pre-write/post-write validation still performs fresh RouterOS reads; there is no cross-request RouterOS value cache.</li>
+    </ul>
+    {% if user.role in ['admin', 'operator'] %}
+    <form method="post" action="/local/performance/reset" class="inline-form" onsubmit="return confirm('Clear the in-memory performance sample set?');">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="danger-soft">Reset performance samples</button>
+    </form>
+    {% endif %}
+  </section>
+</main>
+
+<script>
+(() => {
+  const button = document.getElementById('runPerfProbe');
+  const state = document.getElementById('perfProbeState');
+  const tbody = document.querySelector('#perfProbeTable tbody');
+  const percentile = (values, p) => {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a,b) => a-b);
+    const pos = (sorted.length - 1) * p;
+    const low = Math.floor(pos), high = Math.min(low + 1, sorted.length - 1);
+    return sorted[low] + (sorted[high] - sorted[low]) * (pos - low);
+  };
+  const avg = values => values.length ? values.reduce((a,b) => a+b, 0) / values.length : 0;
+
+  async function one(path) {
+    const started = performance.now();
+    const response = await fetch(path, {
+      method: 'GET', credentials: 'same-origin', cache: 'no-store',
+      headers: {'X-ZEN-Performance-Probe': '1'}
+    });
+    const body = await response.arrayBuffer();
+    return {
+      path,
+      status: response.status,
+      browser_ms: performance.now() - started,
+      server_ms: Number(response.headers.get('X-ZEN-Request-Ms') || 0),
+      bytes: body.byteLength,
+      redirected: response.redirected,
+      url: response.url,
+    };
+  }
+
+  button.addEventListener('click', async () => {
+    const paths = document.getElementById('perfPaths').value.split(/\r?\n/).map(v => v.trim()).filter(v => v.startsWith('/'));
+    const rounds = Math.max(1, Math.min(20, Number(document.getElementById('perfRounds').value || 5)));
+    if (!paths.length) return;
+    button.disabled = true;
+    tbody.innerHTML = '';
+    state.textContent = `Warming ${paths.length} paths...`;
+    try {
+      for (const path of paths) await one(path);
+      const rows = new Map(paths.map(path => [path, []]));
+      for (let round = 1; round <= rounds; round++) {
+        state.textContent = `Measured round ${round}/${rounds}...`;
+        for (const path of paths) rows.get(path).push(await one(path));
+      }
+      for (const [path, samples] of rows) {
+        const browser = samples.map(v => v.browser_ms);
+        const server = samples.map(v => v.server_ms).filter(v => v > 0);
+        const bytes = samples.map(v => v.bytes);
+        const statuses = [...new Set(samples.map(v => v.status))].join(', ');
+        const redirect = samples.some(v => v.redirected && new URL(v.url).pathname === '/login');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td><code>${path}</code>${redirect ? '<div class="status-bad">redirected to login</div>' : ''}</td><td>${samples.length}</td><td>${avg(browser).toFixed(1)} ms</td><td>${server.length ? avg(server).toFixed(1) + ' ms' : 'n/a'}</td><td>${server.length ? percentile(server, .95).toFixed(1) + ' ms' : 'n/a'}</td><td>${Math.round(avg(bytes)).toLocaleString()}</td><td>${statuses}</td>`;
+        tbody.appendChild(tr);
+      }
+      state.textContent = `Completed ${paths.length * rounds} measured requests plus ${paths.length} warm-ups. Refresh this page to inspect the new server evidence.`;
+    } catch (error) {
+      state.textContent = `Probe failed: ${error}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

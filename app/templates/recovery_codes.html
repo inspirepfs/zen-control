@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <title>Recovery codes · ZEN Control</title>
+</head>
+<body class="login-bg">
+  <main class="login-card recovery-card">
+    <div class="brand">ZEN Control</div>
+    <h1>Save your recovery codes</h1>
+    <p class="muted">{{ reason }}. Each code works once. Store them somewhere the kids cannot access.</p>
+    <div class="recovery-code-grid">
+      {% for code in codes %}<code>{{ code }}</code>{% endfor %}
+    </div>
+    <div class="local-only-note"><strong>These codes are shown once.</strong> ZEN Control stores only keyed hashes, not the plaintext codes.</div>
+    <a class="button-link wide recovery-back" href="/?view=settings&amp;section=parents#settings/parents">I have saved them</a>
+  </main>
+</body>
+</html>

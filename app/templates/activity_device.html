@@ -1,0 +1,127 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Activity · {{device_label or client_ip}} · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · ACTIVITY</div>
+    <div class="brand">{{device_label or client_ip}}{% if managed %} <span class="muted">({{client_ip}})</span>{% endif %}</div>
+  </div>
+  <div class="activity-page-actions"><a class="button-link secondary back-link" href="/?view=activity&amp;section=devices#activity/devices">Back to Activity</a>{% if managed %}<a class="button-link" href="/devices/{{client_ip}}">Device 360</a><a class="button-link secondary" href="/policy/explain/{{client_ip}}">Why this state?</a><a class="button-link secondary" href="/?view=policies&amp;section=assignments&amp;focus=assignment:{{client_ip}}#policies/assignments">Policy</a>{% endif %}<a class="button-link secondary" href="/activity/analytics?period=7d&amp;client_ip={{client_ip}}">7-day history</a><a class="button-link secondary" href="/activity/policy-history?period=7d&amp;client_ip={{client_ip}}">Policy history</a></div>
+</header>
+<main>
+{% set page_help = zen_help('activity_devices') %}
+{% include "_context_help.jinja" %}
+  {% if error %}
+  <section class="card">
+    <h2>Telemetry unavailable</h2>
+    <div class="conflict-warning">{{error}}</div>
+  </section>
+  {% else %}
+  <section class="card">
+    <div class="card-heading">
+      <div>
+        <h2>Device usage</h2>
+        <p class="muted">Last {{hours}} hours · {% if managed %}managed device · {{client_ip}}{% else %}{{client_ip}}{% endif %}</p>
+      </div>
+    </div>
+    <div class="activity-kpis">
+      <div class="activity-kpi"><span>Download</span><strong>{{detail.download_bytes_human}}</strong></div>
+      <div class="activity-kpi"><span>Upload</span><strong>{{detail.upload_bytes_human}}</strong></div>
+      <div class="activity-kpi"><span>Total</span><strong>{{detail.total_bytes_human}}</strong></div>
+      <div class="activity-kpi"><span>Flows</span><strong>{{detail.flows}}</strong></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading">
+      <div><h2>Traffic timeline</h2><p class="muted">30-minute traffic buckets.</p></div>
+    </div>
+    <div class="traffic-bars">
+      {% for b in series %}
+      <div class="traffic-bar-item" title="{{b.bucket}} · ↓ {{b.download_human}} · ↑ {{b.upload_human}}">
+        <div class="traffic-bar" style="height:{{b.height}}%"></div>
+        <span>{{b.bucket[11:16] if b.bucket else ''}}</span>
+      </div>
+      {% else %}
+      <p class="muted">No flow history yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="grid two">
+    <div class="card">
+      <h2>Policy service activity</h2>
+      {% for s in policy_services if s.observed or s.blocked_by_profiles %}
+        <div class="activity-row">
+          <strong>{{s.name}}{% if s.kind == 'group' %} <span class="muted small">GROUP</span>{% endif %}</strong>
+          <span>{{s.total_bytes_human}}{% if s.blocked_by_profiles %} · policy: {{s.blocked_by_profiles|join(', ')}}{% endif %}</span>
+        </div>
+      {% else %}<p class="muted">No service attribution yet.</p>{% endfor %}
+    </div>
+
+    <div class="card">
+      <h2>Top destinations</h2>
+      <div class="activity-table-wrap">
+      <table class="activity-table">
+        <thead><tr><th>Destination</th><th>Service</th><th>Traffic</th></tr></thead>
+        <tbody>
+        {% for d in destinations %}
+        <tr>
+          <td>{{d.domain or d.remote_ip}}<div class="muted small">{{d.remote_ip if d.domain else ''}}</div></td>
+          <td>{{d.service or '—'}}</td>
+          <td>{{d.total_bytes_human}}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid two">
+    <div class="card">
+      <h2>Top DNS names</h2>
+      <div class="activity-table-wrap">
+      <table class="activity-table">
+        <thead><tr><th>Domain</th><th>Queries</th><th>Blocked</th></tr></thead>
+        <tbody>
+        {% for d in domains %}
+        <tr><td>{{d.domain}}</td><td>{{d.queries}}</td><td>{{d.blocked}}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Recent DNS</h2>
+      <div class="activity-table-wrap">
+      <table class="activity-table">
+        <thead><tr><th>Time</th><th>Domain</th><th>Service</th></tr></thead>
+        <tbody>
+        {% for d in dns %}
+        <tr>
+          <td>{{d.ts[11:19] if d.ts else ''}}</td>
+          <td>{{d.domain}}</td>
+          <td>{{d.service or '—'}}{% if d.blocked %} · BLOCKED{% endif %}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

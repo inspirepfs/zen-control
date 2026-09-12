@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Policy History · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/policy-history.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="analytics-header standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · HISTORICAL POLICY CORRELATION</div>
+    {% set display_name = report.device.name if report else selected_name %}
+    <div class="brand">{{display_name}}{% if selected_ip and display_name != selected_ip %} <span class="muted">({{selected_ip}})</span>{% endif %}</div>
+    <div class="muted small">Desired-policy checkpoints correlated with retained IPFIX/DNS evidence · {{timezone_name}}</div>
+  </div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="/?view=activity&amp;section=history#activity/history">Back to Activity</a>
+    {% if selected_ip %}<a class="button-link" href="/devices/{{selected_ip}}">Device 360</a><a class="button-link secondary" href="/policy/explain/{{selected_ip}}">Why this state now?</a>{% endif %}
+  </div>
+</header>
+<main class="policy-history-main">
+{% set page_help = zen_help('policy_history') %}
+{% include "_context_help.jinja" %}
+  <section class="card">
+    <form method="get" action="/activity/policy-history" class="policy-history-filter">
+      <label>Device
+        <select name="client_ip" required>
+          {% for ip,name in managed_names|dictsort(by='value') %}<option value="{{ip}}" {% if selected_ip == ip %}selected{% endif %}>{% if name %}{{name}} ({{ip}}){% else %}{{ip}}{% endif %}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Period
+        <select name="period">
+          {% for key,label in [('today','Today'),('yesterday','Yesterday'),('7d','7 days'),('30d','30 days'),('custom','Custom')] %}<option value="{{key}}" {% if period == key %}selected{% endif %}>{{label}}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Custom start <input type="date" name="start" value="{{custom_start}}"></label>
+      <label>Custom end <input type="date" name="end" value="{{custom_end}}"></label>
+      <button>Correlate</button>
+    </form>
+  </section>
+
+  {% if error %}<section class="card"><div class="conflict-warning">{{error}}</div></section>{% elif report %}
+  <section class="card">
+    <div class="card-heading"><div><h2>Evidence coverage</h2><p class="muted">v0.49 separates current-device identity, desired-policy checkpoints and retained telemetry. None of these is silently inferred from another.</p></div><span class="policy-badge {% if report.policy_evidence_complete and report.identity_evidence_complete %}enabled{% else %}staging{% endif %}">{{report.coverage_percent}}% POLICY</span></div>
+    <div class="policy-history-coverage"><span style="width:{{report.coverage_percent}}%"></span></div>
+    <div class="policy-history-kpis">
+      <div><span>Policy coverage</span><strong>{{report.coverage_percent}}%</strong></div>
+      <div><span>Identity coverage</span><strong>{{report.identity_coverage_percent}}%</strong></div>
+      <div><span>State changes</span><strong>{{report.state_changes}}</strong></div>
+      <div><span>Traffic evidence</span><strong>{{report.traffic_evidence_status|replace('_',' ')|upper}}</strong></div>
+      <div><span>DNS evidence</span><strong>{{report.dns_evidence_status|replace('_',' ')|upper}}</strong></div>
+      <div><span>RouterOS execution proof</span><strong>NOT RECORDED</strong></div>
+    </div>
+    {% if report.identity_unproven_intervals %}<div class="policy-history-gap identity-gap"><strong>IDENTITY UNPROVEN</strong><div class="muted small">{{report.identity_unproven_intervals}} interval{{'' if report.identity_unproven_intervals == 1 else 's'}} predate the current management identity. Traffic there remains IP-scoped evidence and is not attributed to {{report.device.name}} as continuous physical-device history.</div></div>{% endif %}
+    {% if not report.policy_evidence_complete %}<div class="policy-history-gap"><strong>Historical policy gap</strong><div class="muted small">Some selected time has no checkpoint for the current management identity. It remains UNKNOWN rather than being reconstructed from current settings or audit prose.</div></div>{% endif %}
+    {% if report.current_collection_status.availability != 'available' %}<div class="policy-history-gap telemetry-gap"><strong>Current telemetry collection: {{report.current_collection_status.availability|upper}}</strong><div class="muted small">This is current collector-health evidence only. It does not rewrite or erase retained evidence already stored for the selected historical intervals.</div></div>{% endif %}
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Policy × activity timeline</h2><p class="muted">Traffic is grouped by the effective desired policy ZEN actually observed during each interval.</p></div><span class="policy-badge enabled">{{report.intervals|length}} INTERVALS</span></div>
+    <div class="policy-history-list">
+      {% for item in report.intervals %}
+      {% set state = item.state or {} %}{% set usage = item.usage or {} %}
+      <div class="policy-history-row {% if not item.known %}unknown{% endif %}{% if not item.identity_known %} identity-unproven{% endif %}">
+        <div class="policy-history-time"><strong>{{item.local_start}}</strong><small class="muted">→ {{item.local_end[11:]}} · {{item.duration_minutes}} min</small></div>
+        {% if not item.identity_known %}
+        <div class="policy-history-policy"><strong>IDENTITY UNPROVEN</strong><small>This address predates the current management identity.</small></div>
+        <div class="policy-history-services"><small>Retained traffic remains IP-scoped and is not assigned to the current device.</small></div>
+        {% elif item.known %}
+        <div class="policy-history-policy"><strong class="policy-history-mode-{{state.desired_mode}}">{{state.desired_mode|upper}}</strong><small>{{state.mode_source or 'default'}}</small><small>{{state.bandwidth_preset|upper}} bandwidth{% if state.schedule_active %} · schedule active{% endif %}</small>{% if item.historical_name and item.historical_name != report.device.name %}<small>Known then as: {{item.historical_name}}</small>{% endif %}</div>
+        <div class="policy-history-services"><strong>{{state.blocked_services|length}} blocked service{{'' if state.blocked_services|length == 1 else 's'}}</strong><small>{{state.blocked_services|join(', ') if state.blocked_services else 'No service blocks'}}</small>{% if state.policy_groups %}<small>Groups: {{state.policy_groups|join(', ')}}</small>{% endif %}</div>
+        {% else %}
+        <div class="policy-history-policy"><strong>POLICY UNKNOWN</strong><small>Current identity is known, but no policy checkpoint existed yet.</small></div><div class="policy-history-services"><small>ZEN will not reconstruct this interval from current policy or audit prose.</small></div>
+        {% endif %}
+        <div class="policy-history-stat"><strong>{% if usage.traffic_evidence_status == 'unavailable' %}UNAVAILABLE{% else %}{{usage.total_bytes_human or '0 B'}}{% endif %}</strong><small class="muted">traffic · {{usage.traffic_evidence_status|default('no_evidence')|replace('_',' ')|upper}}</small></div>
+        <div class="policy-history-stat"><strong>{% if usage.classified_percent is not none %}{{usage.classified_percent}}%{% else %}{{usage.traffic_evidence_status|default('no_evidence')|replace('_',' ')|upper}}{% endif %}</strong><small class="muted">classified</small></div>
+        <div class="policy-history-stat"><strong>{% if usage.dns_evidence_status == 'unavailable' %}UNAVAILABLE{% else %}{{usage.dns_blocked|default(0, true)}}{% endif %}</strong><small class="muted">DNS blocked · {{usage.dns_evidence_status|default('no_evidence')|replace('_',' ')|upper}}</small></div>
+      </div>
+      {% else %}<p class="muted">No correlation intervals are available for this period.</p>{% endfor %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Interpretation boundary</h2></div></div>
+    <p class="muted policy-history-note">{{report.evidence_note}} IPFIX/DNS evidence is not browser history, foreground-app time or proof of user identity. RouterOS execution proof is <strong>NOT RECORDED</strong> for historical intervals, so a desired-policy checkpoint must never be read as proof that every desired RouterOS action executed successfully.</p>
+    <div class="policy-history-actions"><a class="button-link" href="/activity/analytics?period={{period}}&amp;client_ip={{selected_ip}}{% if period == 'custom' %}&amp;start={{custom_start}}&amp;end={{custom_end}}{% endif %}">Open traffic history</a><a class="button-link secondary" href="/api/activity/policy-history?period={{period}}&amp;client_ip={{selected_ip}}{% if period == 'custom' %}&amp;start={{custom_start}}&amp;end={{custom_end}}{% endif %}">Structured JSON</a></div>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

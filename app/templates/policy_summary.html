@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Policy Summary · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.53.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.53.0">
+</head>
+<body class="standalone-page">
+<header class="standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · POLICY</div>
+    <div class="brand">Policy summary</div>
+    <div class="muted small">Container-side desired policy across managed devices.</div>
+  </div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="/?view=dashboard&amp;section=overview#dashboard/overview">Back to Dashboard</a>
+    <a class="button-link" href="/?view=devices&amp;section=managed#devices/managed">Managed devices</a>
+    <a class="button-link secondary" href="/?view=policies&amp;section=assignments#policies/assignments">Assignments</a>
+    <a class="button-link secondary" href="/policy/quality">Policy quality</a>
+    <span class="policy-badge staging">CONFIG ONLY</span>
+  </div>
+</header>
+<main>
+{% set page_help = zen_help('policy_summary') %}
+{% include "_context_help.jinja" %}
+<section class="card">
+  <div class="discovery-table-wrap">
+    <table class="policy-table">
+      <thead><tr><th>Device</th><th>Profile</th><th>Category</th><th>Desired</th><th>Bandwidth</th><th>Services</th><th>Conflicts</th><th>Drill-down</th></tr></thead>
+      <tbody>
+      {% for row in summary %}
+        <tr>
+          <td><strong>{{row.name}}</strong><div class="muted small">{{row.ip}}</div></td>
+          <td>{{row.profile}}</td>
+          <td>{{row.category}}</td>
+          <td>{{row.desired_mode|upper}}<div class="muted small">{{row.mode_source}}</div></td>
+          <td>{{row.bandwidth}}</td>
+          <td>{{row.blocked_services|join(', ') if row.blocked_services else '—'}}</td>
+          <td>{% for c in row.conflicts %}<div class="conflict-warning">{{c}}</div>{% else %}—{% endfor %}</td>
+          <td><div class="policy-summary-actions"><a class="inline-context-link" href="/devices/{{row.ip}}">360</a><a class="inline-context-link" href="/policy/explain/{{row.ip}}">Explain</a><a class="inline-context-link" href="/?view=devices&amp;section=managed&amp;focus=device:{{row.ip}}#devices/managed">Device</a><a class="inline-context-link" href="/?view=policies&amp;section=assignments&amp;focus=assignment:{{row.ip}}#policies/assignments">Policy</a><a class="inline-context-link" href="/activity/device/{{row.ip}}">Activity</a></div></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8" class="muted">No managed devices are available for policy summary.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+</main>
+</body>
+</html>
