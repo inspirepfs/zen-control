@@ -372,7 +372,8 @@ class PolicyStore:
                     dismissed_by TEXT NOT NULL DEFAULT '',
                     resolved_at TEXT,
                     resolved_by TEXT NOT NULL DEFAULT '',
-                    resolution TEXT NOT NULL DEFAULT ''
+                    resolution TEXT NOT NULL DEFAULT '',
+                    attention_eligible_at TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_notifications_state_updated
@@ -714,6 +715,17 @@ class PolicyStore:
                 "summary_delivery_retry_limit": "3",
                 "summary_delivery_retention_days": "90",
                 "policy_history_retention_days": "365",
+                "notification_enabled": "1",
+                "notification_min_severity": "info",
+                "notification_quiet_hours_enabled": "0",
+                "notification_quiet_start": "22:00",
+                "notification_quiet_end": "07:00",
+                "notification_timezone": "Europe/London",
+                "notification_critical_bypass_quiet": "1",
+                "notification_cooldown_seconds": "300",
+                "notification_muted_sources": "[]",
+                "notification_muted_subjects": "[]",
+                "notification_disabled_events": "[]",
             }
             for key, value in defaults.items():
                 db.execute(
@@ -724,6 +736,10 @@ class PolicyStore:
             incident_cols = {row["name"] for row in db.execute("PRAGMA table_info(incidents)")}
             if "suppress_until_clear" not in incident_cols:
                 db.execute("ALTER TABLE incidents ADD COLUMN suppress_until_clear INTEGER NOT NULL DEFAULT 0")
+
+            notification_cols = {row["name"] for row in db.execute("PRAGMA table_info(notifications)")}
+            if "attention_eligible_at" not in notification_cols:
+                db.execute("ALTER TABLE notifications ADD COLUMN attention_eligible_at TEXT NOT NULL DEFAULT ''")
 
     @staticmethod
     def _operations_now_iso():
@@ -2113,6 +2129,248 @@ class PolicyStore:
     def _notification_row(row):
         return dict(row) if row is not None else None
 
+    @staticmethod
+    def _notification_json_list(value):
+        if isinstance(value, (list, tuple, set)):
+            raw = list(value)
+        else:
+            try:
+                raw = json.loads(str(value or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = []
+        if not isinstance(raw, list):
+            return []
+        result = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in result:
+                result.append(text[:160])
+        return result[:100]
+
+    @staticmethod
+    def _notification_source_family(source):
+        return str(source or "system").strip().lower().split(":", 1)[0] or "system"
+
+    def _notification_preferences_db(self, db):
+        keys = (
+            "notification_enabled", "notification_min_severity",
+            "notification_quiet_hours_enabled", "notification_quiet_start",
+            "notification_quiet_end", "notification_timezone",
+            "notification_critical_bypass_quiet", "notification_cooldown_seconds",
+            "notification_muted_sources", "notification_muted_subjects",
+            "notification_disabled_events",
+        )
+        placeholders = ",".join("?" for _ in keys)
+        rows = db.execute(
+            f"SELECT key, value FROM app_settings WHERE key IN ({placeholders})",
+            keys,
+        ).fetchall()
+        raw = {row["key"]: row["value"] for row in rows}
+        severity = str(raw.get("notification_min_severity", "info") or "info").lower()
+        if severity not in {"info", "warning", "critical"}:
+            severity = "info"
+        timezone_name = str(raw.get("notification_timezone", "Europe/London") or "Europe/London").strip()
+        try:
+            ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            timezone_name = "Europe/London"
+        try:
+            cooldown = int(raw.get("notification_cooldown_seconds", "300") or 300)
+        except (TypeError, ValueError):
+            cooldown = 300
+        cooldown = max(0, min(cooldown, 86400))
+        return {
+            "enabled": str(raw.get("notification_enabled", "1")) == "1",
+            "min_severity": severity,
+            "quiet_hours_enabled": str(raw.get("notification_quiet_hours_enabled", "0")) == "1",
+            "quiet_start": str(raw.get("notification_quiet_start", "22:00") or "22:00"),
+            "quiet_end": str(raw.get("notification_quiet_end", "07:00") or "07:00"),
+            "timezone": timezone_name,
+            "critical_bypass_quiet": str(raw.get("notification_critical_bypass_quiet", "1")) == "1",
+            "cooldown_seconds": cooldown,
+            "muted_sources": [item.lower() for item in self._notification_json_list(raw.get("notification_muted_sources"))],
+            "muted_subjects": [item.lower() for item in self._notification_json_list(raw.get("notification_muted_subjects"))],
+            "disabled_events": [item.lower() for item in self._notification_json_list(raw.get("notification_disabled_events"))],
+        }
+
+    def notification_preferences(self):
+        with self._db() as db:
+            return self._notification_preferences_db(db)
+
+    def notification_event_catalog(self):
+        labels = {
+            "security:incident": "Security posture incidents",
+            "reconciler:incident": "Reconciliation incidents",
+            "operations:incident": "Controller readiness incidents",
+            "bypass:incident": "Bypass-risk incidents",
+            "telemetry:incident": "Telemetry incidents",
+            "quota:incident": "Quota warnings and exhaustion",
+            "background:background_job_failed": "Background job failures",
+        }
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT DISTINCT source, event_type FROM notifications ORDER BY source, event_type"
+            ).fetchall()
+            prefs = self._notification_preferences_db(db)
+        for row in rows:
+            family = self._notification_source_family(row["source"])
+            event_type = str(row["event_type"] or "event").strip().lower() or "event"
+            key = f"{family}:{event_type}"
+            labels.setdefault(key, f"{family.replace('_', ' ').title()} · {event_type.replace('_', ' ')}")
+        for key in prefs["disabled_events"]:
+            labels.setdefault(key, key.replace(":", " · ", 1).replace("_", " ").title())
+        disabled = set(prefs["disabled_events"])
+        return [
+            {"key": key, "label": labels[key], "enabled": key not in disabled}
+            for key in sorted(labels)
+        ]
+
+    def save_notification_preferences(
+        self,
+        *,
+        enabled="1",
+        min_severity="info",
+        quiet_hours_enabled="0",
+        quiet_start="22:00",
+        quiet_end="07:00",
+        timezone_name="Europe/London",
+        critical_bypass_quiet="1",
+        cooldown_seconds="300",
+        muted_sources=None,
+        muted_subjects=None,
+        disabled_events=None,
+        actor="system:policy-store",
+    ):
+        enabled = "1" if str(enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
+        quiet_enabled = "1" if str(quiet_hours_enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
+        critical_bypass = "1" if str(critical_bypass_quiet).strip().lower() in {"1", "true", "yes", "on"} else "0"
+        min_severity = str(min_severity or "info").strip().lower()
+        if min_severity not in {"info", "warning", "critical"}:
+            raise ValueError("Notification minimum severity must be info, warning or critical")
+
+        def valid_clock(value, label):
+            text = str(value or "").strip()
+            try:
+                parsed = datetime.strptime(text, "%H:%M")
+            except ValueError as exc:
+                raise ValueError(f"{label} must use HH:MM") from exc
+            return parsed.strftime("%H:%M")
+
+        quiet_start = valid_clock(quiet_start, "Quiet-hours start")
+        quiet_end = valid_clock(quiet_end, "Quiet-hours end")
+        if quiet_enabled == "1" and quiet_start == quiet_end:
+            raise ValueError("Quiet-hours start and end must be different")
+
+        timezone_name = str(timezone_name or "").strip()
+        if not timezone_name or len(timezone_name) > 80:
+            raise ValueError("Notification timezone is required")
+        try:
+            ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Notification timezone must be a valid IANA timezone") from exc
+
+        try:
+            cooldown = int(cooldown_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Notification cooldown must be whole seconds") from exc
+        if cooldown not in {0, 60, 300, 900, 1800, 3600, 21600}:
+            raise ValueError("Notification cooldown must be 0, 60, 300, 900, 1800, 3600 or 21600 seconds")
+
+        muted_sources = sorted({
+            self._notification_source_family(item)
+            for item in (muted_sources or []) if str(item or "").strip()
+        })[:50]
+        muted_subjects = sorted({
+            str(item or "").strip()[:160]
+            for item in (muted_subjects or []) if str(item or "").strip()
+        }, key=str.lower)[:100]
+        disabled_events = sorted({
+            str(item or "").strip().lower()[:160]
+            for item in (disabled_events or [])
+            if ":" in str(item or "") and str(item or "").strip()
+        })[:100]
+        values = {
+            "notification_enabled": enabled,
+            "notification_min_severity": min_severity,
+            "notification_quiet_hours_enabled": quiet_enabled,
+            "notification_quiet_start": quiet_start,
+            "notification_quiet_end": quiet_end,
+            "notification_timezone": timezone_name,
+            "notification_critical_bypass_quiet": critical_bypass,
+            "notification_cooldown_seconds": str(cooldown),
+            "notification_muted_sources": json.dumps(muted_sources, separators=(",", ":")),
+            "notification_muted_subjects": json.dumps(muted_subjects, separators=(",", ":")),
+            "notification_disabled_events": json.dumps(disabled_events, separators=(",", ":")),
+        }
+        now = self._incident_now_iso()
+        with self._db() as db:
+            for key, value in values.items():
+                db.execute(
+                    """INSERT INTO app_settings (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                    (key, value),
+                )
+        return {**self.notification_preferences(), "updated_at": now, "updated_by": str(actor or "unknown")[:100]}
+
+    @staticmethod
+    def _notification_severity_rank(value):
+        return {"info": 0, "warning": 1, "critical": 2}.get(str(value or "warning").lower(), 1)
+
+    def _notification_policy_decision(self, row, prefs=None, now=None):
+        row = dict(row or {})
+        if prefs is None:
+            prefs = self.notification_preferences()
+        severity = self._incident_severity(row.get("severity"))
+        source_family = self._notification_source_family(row.get("source"))
+        event_type = str(row.get("event_type") or "event").strip().lower() or "event"
+        event_key = f"{source_family}:{event_type}"
+        subject = str(row.get("subject") or "").strip().lower()
+
+        if not prefs.get("enabled", True):
+            return {"suppressed": True, "reason": "notifications disabled", "event_key": event_key}
+        if self._notification_severity_rank(severity) < self._notification_severity_rank(prefs.get("min_severity")):
+            return {"suppressed": True, "reason": f"below {prefs.get('min_severity')} threshold", "event_key": event_key}
+        if source_family in set(prefs.get("muted_sources") or []):
+            return {"suppressed": True, "reason": f"{source_family} source muted", "event_key": event_key}
+        if subject and subject in set(prefs.get("muted_subjects") or []):
+            return {"suppressed": True, "reason": "device/subject muted", "event_key": event_key}
+        if event_key in set(prefs.get("disabled_events") or []):
+            return {"suppressed": True, "reason": "event disabled", "event_key": event_key}
+
+        eligible_at = str(row.get("attention_eligible_at") or "").strip()
+        now_utc = now or datetime.now(timezone.utc)
+        if eligible_at and severity != "critical":
+            try:
+                eligible_dt = datetime.fromisoformat(eligible_at)
+                if eligible_dt.tzinfo is None:
+                    eligible_dt = eligible_dt.replace(tzinfo=timezone.utc)
+                if eligible_dt > now_utc:
+                    return {
+                        "suppressed": True,
+                        "reason": "cooldown",
+                        "event_key": event_key,
+                        "eligible_at": eligible_at,
+                    }
+            except ValueError:
+                pass
+
+        if prefs.get("quiet_hours_enabled") and not (
+            severity == "critical" and prefs.get("critical_bypass_quiet", True)
+        ):
+            try:
+                local_now = now_utc.astimezone(ZoneInfo(str(prefs.get("timezone") or "Europe/London")))
+                current = local_now.hour * 60 + local_now.minute
+                start_h, start_m = (int(part) for part in str(prefs.get("quiet_start") or "22:00").split(":", 1))
+                end_h, end_m = (int(part) for part in str(prefs.get("quiet_end") or "07:00").split(":", 1))
+                start = start_h * 60 + start_m
+                end = end_h * 60 + end_m
+                quiet = (start <= current < end) if start < end else (current >= start or current < end)
+                if quiet:
+                    return {"suppressed": True, "reason": "quiet hours", "event_key": event_key}
+            except (TypeError, ValueError, ZoneInfoNotFoundError):
+                pass
+        return {"suppressed": False, "reason": "", "event_key": event_key}
+
     def _upsert_notification_db(
         self,
         db,
@@ -2150,8 +2408,9 @@ class PolicyStore:
             cur = db.execute(
                 """INSERT INTO notifications
                    (dedupe_key, source, event_type, subject, severity, state, title, detail,
-                    source_ref, target_url, created_at, first_seen_at, last_seen_at, updated_at, occurrences)
-                   VALUES (?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                    source_ref, target_url, created_at, first_seen_at, last_seen_at, updated_at, occurrences,
+                    attention_eligible_at)
+                   VALUES (?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, 1, '')""",
                 (
                     dedupe_key, source, event_type, subject, severity, title, detail,
                     source_ref, target_url, now, now, now, now,
@@ -2170,6 +2429,24 @@ class PolicyStore:
             reopen = bool(raise_attention and resolved)
             escalated_attention = bool(raise_attention and severity_escalated)
             next_state = "unread" if reopen or escalated_attention else state
+            next_eligible_at = str(row["attention_eligible_at"] or "")
+            if reopen:
+                next_eligible_at = ""
+                if severity != "critical":
+                    prefs = self._notification_preferences_db(db)
+                    cooldown = int(prefs.get("cooldown_seconds") or 0)
+                    if cooldown > 0 and row["resolved_at"]:
+                        try:
+                            resolved_dt = datetime.fromisoformat(str(row["resolved_at"]))
+                            if resolved_dt.tzinfo is None:
+                                resolved_dt = resolved_dt.replace(tzinfo=timezone.utc)
+                            eligible_dt = resolved_dt + timedelta(seconds=cooldown)
+                            if eligible_dt > datetime.now(timezone.utc):
+                                next_eligible_at = eligible_dt.isoformat(timespec="seconds")
+                        except ValueError:
+                            pass
+            if escalated_attention:
+                next_eligible_at = ""
             occurrence_sql = "occurrences=occurrences+1," if increment_occurrence else ""
             clear_attention = reopen or (state == "dismissed" and escalated_attention)
             reopen_sql = (
@@ -2180,14 +2457,14 @@ class PolicyStore:
             db.execute(
                 f"""UPDATE notifications
                     SET source=?, event_type=?, subject=?, severity=?, state=?, title=?, detail=?,
-                        source_ref=?, target_url=?, last_seen_at=?, updated_at=?,
+                        source_ref=?, target_url=?, last_seen_at=?, updated_at=?, attention_eligible_at=?,
                         {occurrence_sql} {reopen_sql}
                         read_at=CASE WHEN ?='unread' THEN NULL ELSE read_at END,
                         read_by=CASE WHEN ?='unread' THEN '' ELSE read_by END
                     WHERE id=?""",
                 (
                     source, event_type, subject, severity, next_state, title, detail, source_ref,
-                    target_url, now, now, next_state, next_state, notification_id,
+                    target_url, now, now, next_eligible_at, next_state, next_state, notification_id,
                 ),
             )
             action = "reopened" if reopen else ("escalated" if severity_escalated else "updated")
@@ -2221,26 +2498,42 @@ class PolicyStore:
                              updated_at DESC, id DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+            prefs = self._notification_preferences_db(db)
+        result = []
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            item = dict(row)
+            decision = self._notification_policy_decision(item, prefs=prefs, now=now)
+            item["attention_suppressed"] = bool(decision["suppressed"])
+            item["suppression_reason"] = str(decision.get("reason") or "")
+            item["event_key"] = str(decision.get("event_key") or "")
+            result.append(item)
+        return result
 
     def notification_counts(self):
         with self._db() as db:
-            rows = db.execute(
-                """SELECT state, severity, resolved_at, occurrences FROM notifications"""
-            ).fetchall()
+            rows = db.execute("SELECT * FROM notifications").fetchall()
+            prefs = self._notification_preferences_db(db)
         result = {
             "total": len(rows), "events": 0, "deduplicated": 0, "unread": 0,
-            "critical_unread": 0, "warning_unread": 0, "info_unread": 0,
-            "acknowledged": 0, "dismissed": 0, "resolved": 0, "unresolved": 0,
+            "unread_total": 0, "suppressed_unread": 0, "critical_unread": 0,
+            "warning_unread": 0, "info_unread": 0, "acknowledged": 0,
+            "dismissed": 0, "resolved": 0, "unresolved": 0,
         }
+        now = datetime.now(timezone.utc)
         for row in rows:
             state = self._notification_state(row["state"])
             severity = self._incident_severity(row["severity"])
             occurrences = max(1, int(row["occurrences"] or 1))
             result["events"] += occurrences
             if state == "unread":
-                result["unread"] += 1
-                result[f"{severity}_unread"] += 1
+                result["unread_total"] += 1
+                decision = self._notification_policy_decision(row, prefs=prefs, now=now)
+                if decision["suppressed"]:
+                    result["suppressed_unread"] += 1
+                else:
+                    result["unread"] += 1
+                    result[f"{severity}_unread"] += 1
             if state == "acknowledged":
                 result["acknowledged"] += 1
             if state == "dismissed":

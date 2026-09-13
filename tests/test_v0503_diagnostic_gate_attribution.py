@@ -14,7 +14,7 @@ class DiagnosticGateAttributionTests(unittest.TestCase):
     @staticmethod
     def inputs():
         return {
-            "version": "0.55.0",
+            "version": "0.55.1",
             "operations": {"ok": True, "issues": []},
             "startup": {"status": "ready", "issues": []},
             "diagnostics": {
@@ -174,11 +174,11 @@ class DiagnosticGateAttributionUxTests(unittest.TestCase):
         self.assertIn('("diagnostic_gate", "Diagnostic warning attribution & pre-HTTPS gate", "0.51.0")', self.release)
 
     def test_release_version_and_assets_are_current(self):
-        self.assertIn('version="0.55.0"', self.main)
-        self.assertIn('/static/diagnostics.css?v=0.55.0', self.template)
+        self.assertIn('version="0.55.1"', self.main)
+        self.assertIn('/static/diagnostics.css?v=0.55.1', self.template)
 
     def test_documentation_states_warning_identity_does_not_change_severity(self):
-        self.assertIn("v0.55.0", self.readme)
+        self.assertIn("v0.55.1", self.readme)
         self.assertIn("does not downgrade, acknowledge or suppress", self.readme)
 
 

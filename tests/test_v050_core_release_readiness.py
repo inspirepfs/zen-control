@@ -218,11 +218,12 @@ class ReleaseReadinessContractTests(unittest.TestCase):
         self.assertEqual("fail", row["state"])
         self.assertEqual("fail", result["state"])
 
-    def test_https_and_notifications_remain_deferred_and_do_not_block_core(self):
+    def test_https_remains_deferred_while_notification_centre_is_implemented_without_blocking_core(self):
         result = self.build(**self.inputs())
         deferred = {item["key"]: item for item in result["deferred"]}
         self.assertEqual("deferred", deferred["https_remote_access"]["state"])
-        self.assertEqual("deferred", deferred["notifications"]["state"])
+        self.assertNotIn("notifications", deferred)
+        self.assertTrue(any("Notification Centre is an implemented" in note for note in result["notes"]))
         self.assertEqual("pass", result["state"])
 
     def test_push_enablement_before_human_gate_breaks_pwa_safety_contract(self):

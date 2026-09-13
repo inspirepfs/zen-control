@@ -1,3 +1,16 @@
+## v0.55.1 — Notification Preferences & Noise Control
+
+- Adds first-class Notification Preferences with a global attention enable switch, minimum severity threshold, quiet hours, configurable timezone, critical quiet-hours bypass and bounded repeat/reopen cooldown.
+- Adds per-event enable/disable for Security, Reconciler, Operations, Bypass, Telemetry, Quota and Background Job notification families, while retaining every source incident/job as the owning durable truth.
+- Adds source-family muting and exact device/subject filters. Per-device quota sources collapse to the stable `quota` family so one policy can control all quota incidents while device-specific subject filters remain available.
+- Keeps muted events durable and inspectable instead of deleting or pretending they never happened. Bell/unread counts expose actionable attention separately from total unread and muted unread evidence.
+- Makes quiet-hours evaluation dynamic so attention resumes automatically when the window ends without needing a new source event. Critical events can bypass quiet hours and always bypass reopen cooldown.
+- Adds reopen cooldown evidence through `attention_eligible_at`: a source that clears and quickly reappears stays unresolved and visible but does not immediately re-alert unless severity becomes critical.
+- Extends `zen_notifications_v1` with current preference/event-catalog evidence and adds an authenticated Preferences UI. Preference writes are local attention configuration and deliberately do not increment the policy/config revision or create RouterOS write authority.
+- Removes the obsolete release-readiness statement that notification expansion is still behind a human gate; Notification Centre is now implemented while HTTPS/public-edge commissioning remains independently deferred.
+
+Authority boundary: notification preferences can only change whether durable notification evidence attracts attention. They cannot suppress the owning incident/background job, alter policy resolution, authorise RouterOS mutation or manufacture health/readiness evidence.
+
 ## v0.55.0 — Notification Centre foundation & operational event integration
 
 - Adds a durable `notifications` store with stable deduplication keys, severity, source/event provenance, subject/source references, unread/read/acknowledged/dismissed attention state, independent source-resolution state, occurrence counts and retained history.

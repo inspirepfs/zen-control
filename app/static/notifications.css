@@ -41,3 +41,16 @@
 .notification-history-row strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media(max-width:900px){.notification-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.notification-card{grid-template-columns:1fr}.notification-actions{justify-content:flex-start}.notification-history-row{grid-template-columns:1fr}}
 @media(max-width:600px){.notification-bell-label{display:none}.notification-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.notification-bell{padding:6px 8px}.notification-card{padding:6px}.notification-meta{gap:3px 6px}}
+.notification-muted{opacity:.7;border-left-style:dashed}
+.notification-muted-badge{color:#b4a6d8!important;border-color:#7c6d9f!important}
+.notification-preferences-card{display:grid;gap:8px}
+.notification-preferences-form{align-items:start}
+.notification-rule-fieldset{grid-column:1/-1;border:1px solid rgba(255,255,255,.07);border-radius:8px;padding:8px 10px;margin:0}
+.notification-rule-fieldset legend{padding:0 5px;font-size:.7rem;font-weight:800;color:#cbd6ef}
+.notification-rule-fieldset p{margin:0 0 7px}
+.notification-rule-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 12px}
+.notification-rule-row{margin:0!important;padding:5px 6px;border:1px solid rgba(255,255,255,.045);border-radius:6px;background:rgba(255,255,255,.015)}
+.notification-policy-summary{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:.64rem;color:#8f9dbc;border-top:1px solid rgba(255,255,255,.05);padding-top:7px}
+.notification-policy-summary strong{color:#dbe5fb}
+.notification-preferences-form textarea{min-height:88px;resize:vertical}
+@media(max-width:700px){.notification-rule-grid{grid-template-columns:1fr}}

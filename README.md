@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.55.0** — Notification Centre foundation: durable deduplicated attention events, unread/read/acknowledge/dismiss lifecycle, bell count and history, incident-source integration, terminal background-job failure/recovery notifications, and notification metrics. Notifications are read-side operational evidence only and add no RouterOS write authority.
+> Current release: **v0.55.1** — Notification Preferences & Noise Control: minimum severity, quiet hours, critical quiet-hours bypass, repeat/reopen cooldowns, per-event enable/disable, source-family muting, exact device/subject filters, and truthful muted-evidence counters. Preferences change attention only; incidents, worker evidence and RouterOS authority remain untouched.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -36,6 +36,7 @@ ZEN currently provides:
 - Historical desired-policy checkpoints correlated with retained network evidence.
 - IPFIX and Pi-hole-backed activity/classification reporting.
 - Operational diagnostics, incidents, audit evidence and release-readiness checks.
+- Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls and cooldown-based noise suppression.
 - TOTP parent authentication, recovery codes and shared-display locking.
 - Progressive Web App support for tablet/mobile use.
 - Cloudflare Access/Tunnel remote access and split-DNS local HTTPS.

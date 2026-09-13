@@ -36,10 +36,10 @@ Typical release:
 
 ```bash
 python3 scripts/release_patch.py \
-  --patch zen-control-v0.55.0-example.patch \
-  --message "Release v0.55.0 example" \
-  --expect-version 0.55.0 \
-  --tag v0.55.0
+  --patch zen-control-v0.55.1-example.patch \
+  --message "Release v0.55.1 example" \
+  --expect-version 0.55.1 \
+  --tag v0.55.1
 ```
 
 When a patch has already been applied intentionally, resume from the dirty release tree instead of applying it again:
@@ -47,7 +47,7 @@ When a patch has already been applied intentionally, resume from the dirty relea
 ```bash
 python3 scripts/release_patch.py \
   --resume \
-  --message "Fix v0.55.0 clean-runner CI qualification"
+  --message "Fix v0.55.1 clean-runner CI qualification"
 ```
 
 Use `--dry-run` to print the planned commands without modifying source, Git or containers. Run `python3 scripts/release_patch.py --help` for all workflow switches.

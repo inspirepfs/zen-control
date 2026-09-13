@@ -210,10 +210,10 @@ _TOPICS = {
     ),
     "notifications": _topic(
         "notifications", "Operations", "Notification centre",
-        "Notifications are ZEN's durable attention layer over existing incident and worker evidence. They can be read, acknowledged or dismissed without changing the underlying source state.",
-        does=("Shows unread, unresolved and historical attention events with deduplication and source links.", "Tracks notification volume, deduplication and acknowledgement timing from the first release."),
-        watch=("A notification never authorises a RouterOS write and never replaces the owning incident, worker or policy state.", "Dismissing a notification hides the attention item; it does not clear the underlying operational condition."),
-        related=(("Incident centre", "/?view=incidents&section=active#incidents/active"), ("Operations", "/?view=settings&section=operations#settings/operations")),
+        "Notifications are ZEN's durable attention layer over existing incident and worker evidence. They can be read, acknowledged, dismissed or muted by preference without changing the underlying source state.",
+        does=("Shows unread, unresolved and historical attention events with deduplication and source links.", "Supports minimum severity, quiet hours, repeat cooldowns, per-event enable/disable, source-family muting and exact device/subject filters.", "Tracks notification volume, muted unread evidence, deduplication and acknowledgement timing."),
+        watch=("A notification preference changes attention only; it never authorises a RouterOS write or suppresses the owning incident, worker or policy evidence.", "Quiet hours and filters retain the durable notification row so evidence can still be inspected.", "Critical events can be configured to bypass quiet hours, and critical severity always bypasses repeat cooldown."),
+        related=(("Incident centre", "/?view=incidents&section=active#incidents/active"), ("Notification preferences", "/?view=notifications&section=preferences#notifications/preferences"), ("Operations", "/?view=settings&section=operations#settings/operations")),
     ),
     "incidents": _topic(
         "incidents", "Operations", "Incident centre",
@@ -251,7 +251,7 @@ _TOPICS = {
         "settings_automation", "Settings", "Automation and reconciliation",
         "Automation controls bounded background workers such as reconciliation, incident monitoring and the already-built summary-delivery infrastructure.",
         does=("Automatic reconciliation applies the same validated desired-policy plan used by manual reconciliation."),
-        watch=("Notification/alert expansion remains deliberately deferred behind a human gate; existing summary-delivery infrastructure is not a mandate to add more alerts."),
+        watch=("Notification Centre is now implemented as a read-side attention layer; summary delivery remains a separate scheduled-reporting capability and does not imply push delivery."),
         related=(("Diagnostics", "/diagnostics"),),
     ),
     "settings_security": _topic(
@@ -272,7 +272,7 @@ _TOPICS = {
         "release_readiness", "Operations", "Final release readiness",
         "The v0.50 release gate composes existing runtime, diagnostics, performance, recovery and shared-display evidence without creating a second enforcement authority.",
         does=("Runs a non-destructive export/import/reopen smoke against a temporary policy database.", "Names bounded sanitized diagnostic warning/blocker identities directly in release evidence so a PENDING/FAIL dependency gate explains what requires review.", "Requires affirmative live performance and controlled-restart evidence before reporting PASS."),
-        watch=("PENDING is not PASS and missing evidence is never converted to healthy state.", "HTTPS/secure remote access remains post-core commissioning and notification expansion remains behind its human gate."),
+        watch=("PENDING is not PASS and missing evidence is never converted to healthy state.", "HTTPS/secure remote access remains post-core commissioning; Notification Centre attention remains separate from RouterOS authority and public-edge readiness."),
         related=(("Diagnostics", "/diagnostics"), ("Performance", "/performance"), ("Operations", "/?view=settings&section=operations#settings/operations")),
     ),
     "device_360": _topic(
@@ -403,6 +403,7 @@ _ROOT_CONTEXT = {
     ("activity", "summaries"): "activity_summaries",
     ("activity", "history"): "activity_history",
     ("notifications", "inbox"): "notifications",
+    ("notifications", "preferences"): "notifications",
     ("notifications", "history"): "notifications",
     ("incidents", "active"): "incidents",
     ("incidents", "history"): "incidents",

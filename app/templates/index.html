@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.55.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.55.0">
-  <link rel="stylesheet" href="/static/activity.css?v=0.55.0">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.55.0">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.0">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.55.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.55.1">
+  <link rel="stylesheet" href="/static/activity.css?v=0.55.1">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.55.1">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.1">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.1">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -2106,7 +2106,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
 {% endif %}
 {% if active_view == 'notifications' %}
 <div class="tab-panel active" data-panel="notifications">
-  <section class="card notification-hero-card" data-ux-groups="inbox history">
+  <section class="card notification-hero-card" data-ux-groups="inbox preferences history">
     <div class="card-heading">
       <div>
         <h2>Notification centre</h2>
@@ -2127,6 +2127,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       <div><span class="muted small">Acknowledged</span><strong>{{ notification_counts.acknowledged }}</strong></div>
       <div><span class="muted small">Events</span><strong>{{ notification_counts.events }}</strong></div>
       <div><span class="muted small">Deduplicated</span><strong>{{ notification_counts.deduplicated }}</strong></div>
+      <div><span class="muted small">Muted unread</span><strong>{{ notification_counts.suppressed_unread or 0 }}</strong></div>
     </div>
     <div class="notification-stat-strip">
       <span>Resolved <strong>{{ notification_counts.resolved }}</strong></span>
@@ -2151,11 +2152,12 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     </div>
     <div class="notification-list">
       {% for notification in notifications_inbox %}
-      <article class="notification-card notification-severity-{{ notification.severity }} notification-state-{{ notification.state }}{% if notification.resolved_at %} notification-resolved{% endif %}">
+      <article class="notification-card notification-severity-{{ notification.severity }} notification-state-{{ notification.state }}{% if notification.resolved_at %} notification-resolved{% endif %}{% if notification.attention_suppressed %} notification-muted{% endif %}">
         <div class="notification-card-main">
           <div class="notification-card-heading">
             <span class="notification-severity-badge">{{ notification.severity|upper }}</span>
             {% if notification.state == 'unread' %}<span class="policy-badge active">UNREAD</span>{% elif notification.state == 'acknowledged' %}<span class="policy-badge staging">ACKNOWLEDGED</span>{% else %}<span class="policy-badge">{{ notification.state|upper }}</span>{% endif %}
+            {% if notification.attention_suppressed %}<span class="policy-badge notification-muted-badge">MUTED · {{ notification.suppression_reason|upper }}</span>{% endif %}
             {% if notification.resolved_at %}<span class="policy-badge">SOURCE RESOLVED</span>{% endif %}
             <strong>{{ notification.title }}</strong>
           </div>
@@ -2185,6 +2187,82 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       {% else %}
         <div class="notification-clear-state"><strong>Inbox clear</strong><span class="muted">No unread or unresolved notifications need attention.</span></div>
       {% endfor %}
+    </div>
+  </section>
+
+  <section class="card notification-preferences-card" data-ux-group="preferences">
+    <div class="card-heading">
+      <div>
+        <h2>Notification preferences</h2>
+        <p class="muted">Control attention without changing source truth. Muted events remain durable and inspectable; these settings never suppress incidents, background-job evidence or RouterOS safety gates.</p>
+      </div>
+      {% if notification_preferences.enabled %}<span class="policy-badge enabled">ATTENTION ENABLED</span>{% else %}<span class="policy-badge">ATTENTION MUTED</span>{% endif %}
+    </div>
+    {% if user.role in ['admin','operator'] %}
+    <form method="post" action="/local/notifications/preferences" class="schedule-form-grid notification-preferences-form">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label class="checkbox-row"><input type="checkbox" name="enabled" value="1" {% if notification_preferences.enabled %}checked{% endif %}> Enable notification attention</label>
+      <label>Minimum severity
+        <select name="min_severity">
+          {% for value,label in [('info','INFO and above'),('warning','WARNING and above'),('critical','CRITICAL only')] %}
+          <option value="{{ value }}" {% if notification_preferences.min_severity == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <span class="muted small">Events below this level are retained but do not light the bell.</span>
+      </label>
+      <label>Repeat/reopen cooldown
+        <select name="cooldown_seconds">
+          {% for value,label in [(0,'None'),(60,'1 minute'),(300,'5 minutes'),(900,'15 minutes'),(1800,'30 minutes'),(3600,'1 hour'),(21600,'6 hours')] %}
+          <option value="{{ value }}" {% if notification_preferences.cooldown_seconds == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <span class="muted small">A source that clears then reappears inside this window is retained but temporarily muted. Critical events bypass cooldown.</span>
+      </label>
+      <label class="checkbox-row"><input type="checkbox" name="quiet_hours_enabled" value="1" {% if notification_preferences.quiet_hours_enabled %}checked{% endif %}> Enable quiet hours</label>
+      <label>Quiet from<input type="time" name="quiet_start" value="{{ notification_preferences.quiet_start }}"></label>
+      <label>Quiet until<input type="time" name="quiet_end" value="{{ notification_preferences.quiet_end }}"></label>
+      <label>Notification timezone<input name="timezone_name" value="{{ notification_preferences.timezone }}" required><span class="muted small">IANA timezone, for example Europe/London.</span></label>
+      <label class="checkbox-row"><input type="checkbox" name="critical_bypass_quiet" value="1" {% if notification_preferences.critical_bypass_quiet %}checked{% endif %}> Critical notifications bypass quiet hours</label>
+
+      <fieldset class="notification-rule-fieldset">
+        <legend>Event types</legend>
+        <p class="muted small">Disable noisy event families without disabling their owning incident or worker evidence.</p>
+        <div class="notification-rule-grid">
+          {% for event in notification_event_catalog %}
+          <label class="checkbox-row notification-rule-row">
+            <input type="hidden" name="all_events" value="{{ event.key }}">
+            <input type="checkbox" name="enabled_events" value="{{ event.key }}" {% if event.enabled %}checked{% endif %}>
+            <span>{{ event.label }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </fieldset>
+
+      <fieldset class="notification-rule-fieldset">
+        <legend>Muted source families</legend>
+        <div class="notification-rule-grid">
+          {% for source in notification_source_catalog %}
+          <label class="checkbox-row notification-rule-row"><input type="checkbox" name="muted_sources" value="{{ source.key }}" {% if source.muted %}checked{% endif %}> <span>{{ source.label }}</span></label>
+          {% endfor %}
+        </div>
+      </fieldset>
+
+      <label>Muted devices / subjects
+        <textarea name="muted_subjects_text" rows="4" placeholder="192.168.2.26&#10;192.168.2.102">{{ notification_preferences.muted_subjects|join('\n') }}</textarea>
+        <span class="muted small">One exact subject per line (or comma separated). Device notifications normally use the managed-device IP as the subject.</span>
+      </label>
+      <button class="primary">Save notification preferences</button>
+    </form>
+    {% else %}
+      <p class="muted">Viewer accounts can inspect current notification policy but cannot change it.</p>
+    {% endif %}
+    <div class="notification-policy-summary">
+      <span>Minimum <strong>{{ notification_preferences.min_severity|upper }}</strong></span>
+      <span>Cooldown <strong>{{ notification_preferences.cooldown_seconds }}s</strong></span>
+      <span>Quiet <strong>{% if notification_preferences.quiet_hours_enabled %}{{ notification_preferences.quiet_start }}–{{ notification_preferences.quiet_end }} {{ notification_preferences.timezone }}{% else %}OFF{% endif %}</strong></span>
+      <span>Muted sources <strong>{{ notification_preferences.muted_sources|length }}</strong></span>
+      <span>Muted subjects <strong>{{ notification_preferences.muted_subjects|length }}</strong></span>
+      <span>Disabled events <strong>{{ notification_preferences.disabled_events|length }}</strong></span>
     </div>
   </section>
 
@@ -3258,6 +3336,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     ],
     notifications: [
       { key: 'inbox', label: 'Inbox', match: ['Notification centre', 'Inbox'] },
+      { key: 'preferences', label: 'Preferences', match: ['Notification preferences'] },
       { key: 'history', label: 'History', match: ['Notification history'] },
     ],
     incidents: [

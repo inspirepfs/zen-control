@@ -484,12 +484,6 @@ def build_release_readiness(
                 "live_external_validation": transport.get("live_external_validation", "not_run"),
             },
         },
-        {
-            "key": "notifications",
-            "label": "Notification expansion",
-            "state": "deferred",
-            "summary": "Human gate remains required; notification expansion is outside the core closure release.",
-        },
     ]
 
     return {
@@ -520,6 +514,6 @@ def build_release_readiness(
             "The final application release gate contains exactly eight current checks; all eight must PASS.",
             "Formal performance acceptance includes latency, coherent RouterOS connection budgets and runtime observability evidence.",
             "HTTPS/remote access remains a separate public-release commissioning gate, does not alter the core PASS/PENDING/FAIL count, and does not alter the eight application checks.",
-            "Notification expansion remains behind its explicit human gate.",
+            "Notification Centre is an implemented read-side attention capability and does not alter the eight application readiness checks.",
         ],
     }

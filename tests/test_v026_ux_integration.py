@@ -125,8 +125,8 @@ class UxIntegrationSourceTests(unittest.TestCase):
         cls.layout = (ROOT / "app/static/layout.css").read_text()
 
     def test_release_is_v026_and_assets_are_cache_busted(self):
-        self.assertIn('version="0.55.0"', self.main)
-        self.assertIn('/static/app.css?v=0.55.0', self.index)
+        self.assertIn('version="0.55.1"', self.main)
+        self.assertIn('/static/app.css?v=0.55.1', self.index)
         self.assertNotIn('v=0.26.0', self.index)
 
     def test_dashboard_has_connected_health_and_exact_drilldowns(self):

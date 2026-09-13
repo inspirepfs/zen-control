@@ -63,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.55.0")
+app = FastAPI(title="ZEN Control", version="0.55.1")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -463,7 +463,7 @@ ROOT_VIEW_SECTIONS = {
     "policies": ("profiles", "assignments", "services", "bandwidth", "tools"),
     "schedules": ("planner", "exceptions", "templates", "router"),
     "activity": ("overview", "devices", "services", "classification", "dns", "summaries", "history"),
-    "notifications": ("inbox", "history"),
+    "notifications": ("inbox", "preferences", "history"),
     "incidents": ("active", "history"),
     "audit": ("recent",),
     "settings": ("parents", "policy", "automation", "security", "operations"),
@@ -2351,6 +2351,9 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     notifications_inbox = []
     notifications_history = []
     notification_stats = {}
+    notification_preferences = policy_store.notification_preferences()
+    notification_event_catalog = []
+    notification_source_catalog = []
     incidents_active = []
     incidents_history = []
     connected_overview = {
@@ -2745,6 +2748,13 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         notifications_inbox = policy_store.list_notifications(archived=False, limit=120)
         notifications_history = policy_store.list_notifications(archived=True, limit=80)
         notification_stats = policy_store.notification_stats()
+        notification_preferences = policy_store.notification_preferences()
+        notification_event_catalog = policy_store.notification_event_catalog()
+        muted_sources = set(notification_preferences.get("muted_sources") or [])
+        notification_source_catalog = [
+            {"key": key, "label": key.replace("_", " ").title(), "muted": key in muted_sources}
+            for key in sorted({item["key"].split(":", 1)[0] for item in notification_event_catalog})
+        ]
         for item in notifications_inbox + notifications_history:
             item["context_link"] = notification_destination(
                 item.get("source", ""),
@@ -2870,6 +2880,9 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "notifications_inbox": notifications_inbox,
             "notifications_history": notifications_history,
             "notification_stats": notification_stats,
+            "notification_preferences": notification_preferences,
+            "notification_event_catalog": notification_event_catalog,
+            "notification_source_catalog": notification_source_catalog,
             "incidents_active": incidents_active,
             "incidents_history": incidents_history,
             "connected_overview": connected_overview,
@@ -5310,8 +5323,69 @@ def api_notifications(
         "schema": "zen_notifications_v1",
         "counts": policy_store.notification_counts(),
         "stats": policy_store.notification_stats(),
+        "preferences": policy_store.notification_preferences(),
+        "event_catalog": policy_store.notification_event_catalog(),
         "notifications": policy_store.list_notifications(archived=archived, limit=limit),
     }
+
+
+@app.post("/local/notifications/preferences")
+def local_notification_preferences(
+    request: Request,
+    csrf: str = Form(...),
+    enabled: str = Form("0"),
+    min_severity: str = Form("info"),
+    quiet_hours_enabled: str = Form("0"),
+    quiet_start: str = Form("22:00"),
+    quiet_end: str = Form("07:00"),
+    timezone_name: str = Form("Europe/London"),
+    critical_bypass_quiet: str = Form("0"),
+    cooldown_seconds: str = Form("300"),
+    muted_sources: list[str] = Form([]),
+    muted_subjects_text: str = Form(""),
+    all_events: list[str] = Form([]),
+    enabled_events: list[str] = Form([]),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/preferences", "CSRF validation failed")
+    muted_subjects = [
+        item.strip()
+        for line in str(muted_subjects_text or "").replace(",", "\n").splitlines()
+        for item in [line]
+        if item.strip()
+    ]
+    known = {str(item).strip().lower() for item in all_events if str(item).strip()}
+    selected = {str(item).strip().lower() for item in enabled_events if str(item).strip()}
+    disabled_events = sorted(known - selected)
+    try:
+        saved = policy_store.save_notification_preferences(
+            enabled=enabled,
+            min_severity=min_severity,
+            quiet_hours_enabled=quiet_hours_enabled,
+            quiet_start=quiet_start,
+            quiet_end=quiet_end,
+            timezone_name=timezone_name,
+            critical_bypass_quiet=critical_bypass_quiet,
+            cooldown_seconds=cooldown_seconds,
+            muted_sources=muted_sources,
+            muted_subjects=muted_subjects,
+            disabled_events=disabled_events,
+            actor=user["username"],
+        )
+    except ValueError as exc:
+        return redirect_error("notifications/preferences", str(exc))
+    audit(
+        "NOTIFICATION_PREFERENCES_UPDATED",
+        user["username"],
+        (
+            f"enabled={saved['enabled']} min_severity={saved['min_severity']} "
+            f"quiet={saved['quiet_hours_enabled']} cooldown={saved['cooldown_seconds']}s "
+            f"muted_sources={len(saved['muted_sources'])} muted_subjects={len(saved['muted_subjects'])} "
+            f"disabled_events={len(saved['disabled_events'])}"
+        ),
+    )
+    return redirect_ok("notifications/preferences", "Notification preferences updated")
 
 
 @app.post("/local/notifications/read-all")
