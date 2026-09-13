@@ -26,6 +26,7 @@ from app.activity import (
 )
 from app.parent_summary import build_parent_device_summary, summarize_parent_household
 from app.summary_delivery import SummaryDeliveryService
+from app.push_delivery import PushDeliveryService, VapidIdentity
 from app.policy_engine import build_device_policy_plan, PolicyPlanError
 from app.policy_explain import build_policy_explanation
 from app.device360 import build_device_360_snapshot, filter_related_records
@@ -63,7 +64,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.55.1")
+app = FastAPI(title="ZEN Control", version="0.55.2")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -1419,6 +1420,15 @@ summary_delivery = SummaryDeliveryService(
     summary_builder=lambda period: _build_parent_summary(period),
     audit=audit,
 )
+push_delivery = PushDeliveryService(
+    policy_store=policy_store,
+    audit=audit,
+    identity=VapidIdentity(
+        key_file=os.getenv("ZEN_PUSH_VAPID_KEY_FILE")
+        or os.path.join(os.path.dirname(policy_store.path) or ".", "zen-push-vapid-private.pem"),
+        subject=os.getenv("ZEN_PUSH_VAPID_SUBJECT") or None,
+    ),
+)
 
 operational_diagnostics = OperationalDiagnostics(
     app_version=app.version,
@@ -1537,10 +1547,12 @@ def start_auto_reconciler():
     auto_reconciler.start()
     incident_monitor.start()
     summary_delivery.start()
+    push_delivery.start()
 
 
 @app.on_event("shutdown")
 def stop_auto_reconciler():
+    push_delivery.stop()
     summary_delivery.stop()
     background_worker.stop()
     incident_monitor.stop()
@@ -1576,7 +1588,15 @@ def pwa_icon(size: int):
 @app.get("/api/pwa/status")
 def pwa_status(user=Depends(require_role("admin", "operator", "viewer"))):
     """Document the server-side PWA/security contract for the installed client."""
-    return status_contract(app.version)
+    return {
+        **status_contract(app.version),
+        "push": {
+            "available": True,
+            "configured": True,
+            "public_key": push_delivery.identity.public_key,
+            "worker_running": bool(push_delivery.snapshot(username=user["username"])["worker_running"]),
+        },
+    }
 
 
 @app.get("/api/security/transport")
@@ -2352,6 +2372,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     notifications_history = []
     notification_stats = {}
     notification_preferences = policy_store.notification_preferences()
+    notification_push_status = {}
     notification_event_catalog = []
     notification_source_catalog = []
     incidents_active = []
@@ -2749,6 +2770,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         notifications_history = policy_store.list_notifications(archived=True, limit=80)
         notification_stats = policy_store.notification_stats()
         notification_preferences = policy_store.notification_preferences()
+        notification_push_status = push_delivery.snapshot(username=user["username"])
         notification_event_catalog = policy_store.notification_event_catalog()
         muted_sources = set(notification_preferences.get("muted_sources") or [])
         notification_source_catalog = [
@@ -2881,6 +2903,7 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "notifications_history": notifications_history,
             "notification_stats": notification_stats,
             "notification_preferences": notification_preferences,
+            "notification_push_status": notification_push_status,
             "notification_event_catalog": notification_event_catalog,
             "notification_source_catalog": notification_source_catalog,
             "incidents_active": incidents_active,
@@ -5327,6 +5350,96 @@ def api_notifications(
         "event_catalog": policy_store.notification_event_catalog(),
         "notifications": policy_store.list_notifications(archived=archived, limit=limit),
     }
+
+
+@app.get("/api/notifications/push")
+def api_notification_push_status(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    snapshot = push_delivery.snapshot(username=user["username"])
+    return {
+        "schema": "zen_notification_push_v1",
+        "secure_context_required": True,
+        "public_key": push_delivery.identity.public_key,
+        "worker_running": snapshot["worker_running"],
+        "subscriptions": snapshot["subscriptions"],
+        "deliveries": snapshot["deliveries"],
+        "authority": "notification-delivery-only",
+    }
+
+
+@app.post("/api/notifications/push/subscriptions")
+async def api_notification_push_subscribe(
+    request: Request,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    token = str(request.headers.get("X-ZEN-CSRF") or "")
+    if not csrf_ok(request, token):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Push subscription body must be JSON") from exc
+    subscription = payload.get("subscription") if isinstance(payload, dict) else None
+    if not isinstance(subscription, dict):
+        subscription = payload if isinstance(payload, dict) else {}
+    keys = subscription.get("keys") if isinstance(subscription.get("keys"), dict) else {}
+    try:
+        saved = policy_store.register_push_subscription(
+            username=user["username"],
+            endpoint=subscription.get("endpoint"),
+            p256dh=keys.get("p256dh"),
+            auth=keys.get("auth"),
+            user_agent=str(request.headers.get("User-Agent") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit(
+        "NOTIFICATION_PUSH_SUBSCRIBED",
+        user["username"],
+        f"subscription={saved['id']} endpoint_hash={saved['endpoint_hash'][:16]}",
+    )
+    return {"schema": "zen_notification_push_subscription_v1", "subscription": saved}
+
+
+@app.post("/api/notifications/push/unsubscribe")
+async def api_notification_push_unsubscribe(
+    request: Request,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    token = str(request.headers.get("X-ZEN-CSRF") or "")
+    if not csrf_ok(request, token):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Push unsubscribe body must be JSON") from exc
+    endpoint = str((payload or {}).get("endpoint") or "") if isinstance(payload, dict) else ""
+    changed = policy_store.disable_push_subscription(username=user["username"], endpoint=endpoint)
+    if changed:
+        audit("NOTIFICATION_PUSH_UNSUBSCRIBED", user["username"], "Browser subscription disabled")
+    return {"schema": "zen_notification_push_unsubscribe_v1", "disabled": bool(changed)}
+
+
+@app.post("/api/notifications/push/test")
+def api_notification_push_test(
+    request: Request,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    token = str(request.headers.get("X-ZEN-CSRF") or "")
+    if not csrf_ok(request, token):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    try:
+        queued = policy_store.enqueue_notification_push_test(username=user["username"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    push_delivery.wake()
+    audit(
+        "NOTIFICATION_PUSH_TEST_QUEUED",
+        user["username"],
+        f"queued={queued['queued']}",
+    )
+    return {"schema": "zen_notification_push_test_v1", **queued}
 
 
 @app.post("/local/notifications/preferences")

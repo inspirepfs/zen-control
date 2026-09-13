@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.55.1** — Notification Preferences & Noise Control: minimum severity, quiet hours, critical quiet-hours bypass, repeat/reopen cooldowns, per-event enable/disable, source-family muting, exact device/subject filters, and truthful muted-evidence counters. Preferences change attention only; incidents, worker evidence and RouterOS authority remain untouched.
+> Current release: **v0.55.2** — PWA / Browser Push Delivery: standard encrypted Web Push, persistent self-hosted VAPID identity, per-browser subscriptions, durable delivery/retry evidence, stale-subscription retirement, test delivery and click-through into ZEN. Push inherits the v0.55.1 attention policy and creates no RouterOS authority.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -38,7 +38,7 @@ ZEN currently provides:
 - Operational diagnostics, incidents, audit evidence and release-readiness checks.
 - Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls and cooldown-based noise suppression.
 - TOTP parent authentication, recovery codes and shared-display locking.
-- Progressive Web App support for tablet/mobile use.
+- Progressive Web App support for tablet/mobile use, including standard encrypted browser/PWA push notifications that respect ZEN attention preferences.
 - Cloudflare Access/Tunnel remote access and split-DNS local HTTPS.
 - Controlled migration from MikroTik Kid Control with guarded cutover and rollback.
 - Revisioned configuration state, optimistic concurrency, a transactional outbox and durable read-side background jobs.

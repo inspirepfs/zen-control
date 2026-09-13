@@ -14,3 +14,6 @@ tzdata>=2025.2
 # R14 parent authentication / encrypted TOTP enrollment
 cryptography>=46,<47
 qrcode[pil]>=8,<9
+
+# v0.55.2 standard browser/PWA Web Push delivery
+pywebpush>=2.0,<3

@@ -383,6 +383,52 @@ class PolicyStore:
                 CREATE INDEX IF NOT EXISTS idx_notifications_resolved_updated
                     ON notifications(resolved_at, updated_at DESC);
 
+                CREATE TABLE IF NOT EXISTS notification_push_subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    endpoint TEXT NOT NULL UNIQUE,
+                    endpoint_hash TEXT NOT NULL UNIQUE,
+                    p256dh TEXT NOT NULL,
+                    auth TEXT NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    user_agent TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    last_success_at TEXT NOT NULL DEFAULT '',
+                    last_failure_at TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    failures INTEGER NOT NULL DEFAULT 0,
+                    disabled_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_notification_push_subscriptions_user
+                    ON notification_push_subscriptions(username, enabled, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS notification_push_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    notification_id INTEGER NOT NULL DEFAULT 0,
+                    subscription_id INTEGER NOT NULL,
+                    occurrence INTEGER NOT NULL DEFAULT 1,
+                    kind TEXT NOT NULL DEFAULT 'notification',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    available_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL DEFAULT '',
+                    sent_at TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    UNIQUE(notification_id, subscription_id, occurrence, kind)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_notification_push_deliveries_claim
+                    ON notification_push_deliveries(status, available_at, id);
+                CREATE INDEX IF NOT EXISTS idx_notification_push_deliveries_notification
+                    ON notification_push_deliveries(notification_id, status, id);
+
                 CREATE TABLE IF NOT EXISTS reward_accounts (
                     ip TEXT PRIMARY KEY,
                     balance_minutes INTEGER NOT NULL DEFAULT 0,
@@ -2470,11 +2516,345 @@ class PolicyStore:
             action = "reopened" if reopen else ("escalated" if severity_escalated else "updated")
 
         result = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+        if raise_attention and action in {"created", "reopened", "escalated"}:
+            self._queue_notification_push_db(db, dict(result))
         return {**dict(result), "action": action}
 
     def upsert_notification(self, **kwargs):
         with self._db() as db:
             return self._upsert_notification_db(db, **kwargs)
+
+    @staticmethod
+    def _push_endpoint_hash(endpoint):
+        return hashlib.sha256(str(endpoint or "").encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _safe_push_subscription(row, *, include_secret=False):
+        if row is None:
+            return None
+        item = dict(row)
+        item["enabled"] = bool(item.get("enabled"))
+        if not include_secret:
+            item.pop("endpoint", None)
+            item.pop("p256dh", None)
+            item.pop("auth", None)
+        return item
+
+    def register_push_subscription(self, *, username, endpoint, p256dh, auth, user_agent=""):
+        username = str(username or "").strip()[:100]
+        endpoint = str(endpoint or "").strip()
+        p256dh = str(p256dh or "").strip()
+        auth = str(auth or "").strip()
+        user_agent = str(user_agent or "").strip()[:500]
+        if not username:
+            raise ValueError("Push subscription username is required")
+        if not endpoint.startswith("https://") or len(endpoint) > 2400:
+            raise ValueError("Push subscription endpoint must be a bounded https:// URL")
+        if not p256dh or len(p256dh) > 500 or not auth or len(auth) > 500:
+            raise ValueError("Push subscription browser keys are required")
+        now = self._incident_now_iso()
+        endpoint_hash = self._push_endpoint_hash(endpoint)
+        with self._db() as db:
+            db.execute(
+                """INSERT INTO notification_push_subscriptions
+                   (endpoint, endpoint_hash, p256dh, auth, username, user_agent, enabled,
+                    created_at, updated_at, last_seen_at, last_success_at, last_failure_at,
+                    last_error, failures, disabled_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, '', '', '', 0, '')
+                   ON CONFLICT(endpoint) DO UPDATE SET
+                     endpoint_hash=excluded.endpoint_hash, p256dh=excluded.p256dh,
+                     auth=excluded.auth, username=excluded.username, user_agent=excluded.user_agent,
+                     enabled=1, updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at,
+                     last_error='', failures=0, disabled_at=''""",
+                (endpoint, endpoint_hash, p256dh, auth, username, user_agent, now, now, now),
+            )
+            row = db.execute(
+                "SELECT * FROM notification_push_subscriptions WHERE endpoint=?", (endpoint,)
+            ).fetchone()
+        return self._safe_push_subscription(row)
+
+    def disable_push_subscription(self, *, username, endpoint):
+        username = str(username or "").strip()[:100]
+        endpoint = str(endpoint or "").strip()
+        now = self._incident_now_iso()
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM notification_push_subscriptions WHERE endpoint=? AND username=?",
+                (endpoint, username),
+            ).fetchone()
+            if row is None:
+                return False
+            db.execute(
+                """UPDATE notification_push_subscriptions
+                   SET enabled=0, updated_at=?, disabled_at=? WHERE id=?""",
+                (now, now, row["id"]),
+            )
+            db.execute(
+                """UPDATE notification_push_deliveries SET status='cancelled', updated_at=?,
+                   error='Subscription disabled before delivery'
+                   WHERE subscription_id=? AND status IN ('pending','sending')""",
+                (now, row["id"]),
+            )
+        return True
+
+    def get_push_subscription(self, subscription_id, *, include_secret=False):
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM notification_push_subscriptions WHERE id=?", (int(subscription_id),)
+            ).fetchone()
+        return self._safe_push_subscription(row, include_secret=include_secret)
+
+    def list_push_subscriptions(self, *, username=None, include_disabled=False):
+        where = []
+        params = []
+        if username is not None:
+            where.append("username=?")
+            params.append(str(username or "").strip()[:100])
+        if not include_disabled:
+            where.append("enabled=1")
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        with self._db() as db:
+            rows = db.execute(
+                f"SELECT * FROM notification_push_subscriptions {clause} ORDER BY updated_at DESC, id DESC",
+                params,
+            ).fetchall()
+        return [self._safe_push_subscription(row) for row in rows]
+
+    def push_subscription_stats(self, *, username=None):
+        where = "WHERE username=?" if username is not None else ""
+        params = (str(username or "").strip()[:100],) if username is not None else ()
+        with self._db() as db:
+            rows = db.execute(
+                f"SELECT enabled, failures, last_success_at, last_failure_at FROM notification_push_subscriptions {where}",
+                params,
+            ).fetchall()
+        return {
+            "total": len(rows),
+            "enabled": sum(1 for row in rows if int(row["enabled"] or 0)),
+            "disabled": sum(1 for row in rows if not int(row["enabled"] or 0)),
+            "with_failures": sum(1 for row in rows if int(row["failures"] or 0) > 0),
+            "last_success_at": max((str(row["last_success_at"] or "") for row in rows), default=""),
+            "last_failure_at": max((str(row["last_failure_at"] or "") for row in rows), default=""),
+        }
+
+    def _push_payload_for_notification(self, row):
+        target = str(row.get("target_url") or "").strip()
+        if not target.startswith("/") or target.startswith("//"):
+            target = "/?view=notifications&section=inbox#notifications/inbox"
+        detail = str(row.get("detail") or "").strip()
+        return {
+            "schema": "zen_push_notification_v1",
+            "notification_id": int(row.get("id") or 0),
+            "severity": self._incident_severity(row.get("severity")),
+            "title": str(row.get("title") or "ZEN Control")[:160],
+            "body": (detail[:240] if detail else str(row.get("source") or "ZEN Control")[:240]),
+            "url": target,
+            "tag": f"zen-{str(row.get('dedupe_key') or row.get('id') or 'event')[:160]}",
+            "timestamp": str(row.get("updated_at") or self._incident_now_iso()),
+        }
+
+    def _queue_notification_push_db(self, db, notification):
+        row = dict(notification or {})
+        if not row or self._notification_state(row.get("state")) != "unread" or row.get("resolved_at"):
+            return 0
+        prefs = self._notification_preferences_db(db)
+        decision = self._notification_policy_decision(row, prefs=prefs, now=datetime.now(timezone.utc))
+        subscriptions = db.execute(
+            "SELECT id FROM notification_push_subscriptions WHERE enabled=1 ORDER BY id"
+        ).fetchall()
+        if not subscriptions:
+            return 0
+        now = self._incident_now_iso()
+        status = "suppressed" if decision.get("suppressed") else "pending"
+        error = str(decision.get("reason") or "")[:500] if status == "suppressed" else ""
+        payload = self._bounded_json(self._push_payload_for_notification(row))
+        occurrence = max(1, int(row.get("occurrences") or 1))
+        inserted = 0
+        for subscription in subscriptions:
+            cur = db.execute(
+                """INSERT OR IGNORE INTO notification_push_deliveries
+                   (notification_id, subscription_id, occurrence, kind, status, attempts,
+                    max_attempts, available_at, payload_json, created_at, updated_at, error)
+                   VALUES (?, ?, ?, 'notification', ?, 0, 3, ?, ?, ?, ?, ?)""",
+                (
+                    int(row.get("id") or 0), int(subscription["id"]), occurrence, status,
+                    now, payload, now, now, error,
+                ),
+            )
+            inserted += int(cur.rowcount or 0)
+        return inserted
+
+    def enqueue_notification_push_test(self, *, username):
+        username = str(username or "").strip()[:100]
+        if not username:
+            raise ValueError("Push test username is required")
+        now = self._incident_now_iso()
+        occurrence = int(datetime.now(timezone.utc).timestamp() * 1000)
+        payload = self._bounded_json({
+            "schema": "zen_push_notification_v1",
+            "notification_id": 0,
+            "severity": "info",
+            "title": "ZEN Control push test",
+            "body": "Browser/PWA push delivery is working.",
+            "url": "/?view=notifications&section=preferences#notifications/preferences",
+            "tag": f"zen-push-test-{occurrence}",
+            "timestamp": now,
+        })
+        with self._db() as db:
+            subscriptions = db.execute(
+                "SELECT id FROM notification_push_subscriptions WHERE username=? AND enabled=1 ORDER BY id",
+                (username,),
+            ).fetchall()
+            if not subscriptions:
+                raise ValueError("This account has no enabled browser push subscription")
+            created = []
+            for subscription in subscriptions:
+                cur = db.execute(
+                    """INSERT INTO notification_push_deliveries
+                       (notification_id, subscription_id, occurrence, kind, status, attempts,
+                        max_attempts, available_at, payload_json, created_at, updated_at, error)
+                       VALUES (0, ?, ?, 'test', 'pending', 0, 3, ?, ?, ?, ?, '')""",
+                    (int(subscription["id"]), occurrence, now, payload, now, now),
+                )
+                created.append(int(cur.lastrowid))
+        return {"queued": len(created), "delivery_ids": created}
+
+    def recover_notification_push_deliveries(self):
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        stale = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
+        with self._db() as db:
+            cur = db.execute(
+                """UPDATE notification_push_deliveries SET status='pending', available_at=?,
+                   updated_at=?, error='Recovered interrupted push delivery'
+                   WHERE status='sending' AND claimed_at<>'' AND claimed_at<=?""",
+                (now, now, stale),
+            )
+        return int(cur.rowcount or 0)
+
+    def claim_notification_push_deliveries(self, *, limit=20):
+        limit = max(1, min(int(limit), 100))
+        now = self._incident_now_iso()
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT * FROM notification_push_deliveries
+                   WHERE status='pending' AND available_at<=?
+                   ORDER BY id LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                cur = db.execute(
+                    """UPDATE notification_push_deliveries
+                       SET status='sending', attempts=attempts+1, claimed_at=?, updated_at=?
+                       WHERE id=? AND status='pending'""",
+                    (now, now, row["id"]),
+                )
+                if cur.rowcount == 1:
+                    claimed.append(db.execute(
+                        "SELECT * FROM notification_push_deliveries WHERE id=?", (row["id"],)
+                    ).fetchone())
+        return [dict(row) for row in claimed]
+
+    def complete_notification_push_delivery(self, delivery_id):
+        now = self._incident_now_iso()
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM notification_push_deliveries WHERE id=?", (int(delivery_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Push delivery does not exist")
+            db.execute(
+                """UPDATE notification_push_deliveries SET status='sent', sent_at=?, updated_at=?,
+                   error='' WHERE id=?""",
+                (now, now, int(delivery_id)),
+            )
+            db.execute(
+                """UPDATE notification_push_subscriptions SET last_success_at=?, updated_at=?,
+                   failures=0, last_error='' WHERE id=?""",
+                (now, now, int(row["subscription_id"])),
+            )
+        return True
+
+    def fail_notification_push_delivery(self, delivery_id, error, *, disable_subscription=False):
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        error = str(error or "Push delivery failed")[:500]
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM notification_push_deliveries WHERE id=?", (int(delivery_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Push delivery does not exist")
+            attempts = int(row["attempts"] or 0)
+            terminal = bool(disable_subscription or attempts >= int(row["max_attempts"] or 3))
+            delay = {1: 5, 2: 30}.get(attempts, 120)
+            available = (now_dt + timedelta(seconds=delay)).isoformat(timespec="seconds")
+            status = "failed" if terminal else "pending"
+            db.execute(
+                """UPDATE notification_push_deliveries SET status=?, available_at=?, updated_at=?,
+                   claimed_at='', error=? WHERE id=?""",
+                (status, available, now, error, int(delivery_id)),
+            )
+            db.execute(
+                """UPDATE notification_push_subscriptions SET failures=failures+1,
+                   last_failure_at=?, last_error=?, updated_at=? WHERE id=?""",
+                (now, error, now, int(row["subscription_id"])),
+            )
+            if disable_subscription:
+                db.execute(
+                    """UPDATE notification_push_subscriptions SET enabled=0, disabled_at=?, updated_at=?
+                       WHERE id=?""",
+                    (now, now, int(row["subscription_id"])),
+                )
+            result = db.execute(
+                "SELECT * FROM notification_push_deliveries WHERE id=?", (int(delivery_id),)
+            ).fetchone()
+        return dict(result)
+
+    def cancel_notification_push_delivery(self, delivery_id, reason="Cancelled"):
+        now = self._incident_now_iso()
+        with self._db() as db:
+            db.execute(
+                """UPDATE notification_push_deliveries SET status='cancelled', updated_at=?,
+                   error=? WHERE id=? AND status IN ('pending','sending')""",
+                (now, str(reason or "Cancelled")[:500], int(delivery_id)),
+            )
+        return True
+
+    def _cancel_notification_push_for_notification_db(self, db, notification_id, reason):
+        now = self._incident_now_iso()
+        db.execute(
+            """UPDATE notification_push_deliveries SET status='cancelled', updated_at=?, error=?
+               WHERE notification_id=? AND status IN ('pending','sending')""",
+            (now, str(reason or "Notification no longer needs push attention")[:500], int(notification_id)),
+        )
+
+    def notification_push_delivery_stats(self):
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT status, COUNT(*) AS count FROM notification_push_deliveries GROUP BY status"
+            ).fetchall()
+            totals = db.execute(
+                """SELECT COUNT(*) AS total,
+                          COALESCE(SUM(CASE WHEN kind='test' THEN 1 ELSE 0 END),0) AS tests,
+                          COALESCE(MAX(sent_at),'') AS last_sent_at,
+                          COALESCE(MAX(CASE WHEN status='failed' THEN updated_at ELSE '' END),'') AS last_failed_at
+                   FROM notification_push_deliveries"""
+            ).fetchone()
+        counts = {str(row["status"]): int(row["count"] or 0) for row in rows}
+        return {
+            "total": int(totals["total"] or 0),
+            "pending": counts.get("pending", 0),
+            "sending": counts.get("sending", 0),
+            "sent": counts.get("sent", 0),
+            "failed": counts.get("failed", 0),
+            "suppressed": counts.get("suppressed", 0),
+            "cancelled": counts.get("cancelled", 0),
+            "tests": int(totals["tests"] or 0),
+            "last_sent_at": str(totals["last_sent_at"] or ""),
+            "last_failed_at": str(totals["last_failed_at"] or ""),
+        }
 
     def get_notification(self, notification_id):
         with self._db() as db:
@@ -2601,6 +2981,9 @@ class PolicyStore:
                        dismissed_by=?, updated_at=? WHERE id=?""",
                     (now, actor, now, actor, now, notification_id),
                 )
+            self._cancel_notification_push_for_notification_db(
+                db, notification_id, f"Notification marked {state}"
+            )
             result = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
         return dict(result)
 
@@ -2617,20 +3000,34 @@ class PolicyStore:
         actor = str(actor or "unknown").strip()[:100]
         now = self._incident_now_iso()
         with self._db() as db:
+            unread = [int(row["id"]) for row in db.execute(
+                "SELECT id FROM notifications WHERE state='unread'"
+            ).fetchall()]
             cur = db.execute(
                 """UPDATE notifications SET state='read', read_at=?, read_by=?, updated_at=?
                    WHERE state='unread'""",
                 (now, actor, now),
             )
+            for notification_id in unread:
+                self._cancel_notification_push_for_notification_db(
+                    db, notification_id, "Notification marked read before push delivery"
+                )
         return int(cur.rowcount or 0)
 
     def _resolve_notification_db(self, db, *, dedupe_key, actor="system", resolution="Signal cleared"):
         now = self._incident_now_iso()
+        row = db.execute(
+            "SELECT id FROM notifications WHERE dedupe_key=?", (str(dedupe_key),)
+        ).fetchone()
         db.execute(
             """UPDATE notifications SET resolved_at=COALESCE(resolved_at, ?), resolved_by=?,
                resolution=?, updated_at=? WHERE dedupe_key=?""",
             (now, str(actor or "system")[:100], str(resolution or "Signal cleared")[:500], now, str(dedupe_key)),
         )
+        if row is not None:
+            self._cancel_notification_push_for_notification_db(
+                db, int(row["id"]), "Source notification resolved before push delivery"
+            )
 
     def resolve_notification(self, dedupe_key, actor="system", resolution="Signal cleared"):
         with self._db() as db:

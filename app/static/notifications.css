@@ -54,3 +54,6 @@
 .notification-policy-summary strong{color:#dbe5fb}
 .notification-preferences-form textarea{min-height:88px;resize:vertical}
 @media(max-width:700px){.notification-rule-grid{grid-template-columns:1fr}}
+.notification-push-card{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px 14px;align-items:center;padding:9px 10px;border:1px solid rgba(110,151,220,.22);border-radius:9px;background:rgba(73,109,169,.055)}
+.notification-push-copy{display:grid;gap:3px}.notification-push-copy p{margin:0}.notification-push-actions{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.notification-push-stats{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px 14px;padding-top:6px;border-top:1px solid rgba(255,255,255,.05);font-size:.64rem;color:#8f9dbc}.notification-push-stats strong{color:#dbe5fb}.notification-push-card [data-push-state][data-state="subscribed"]{border-color:#4b9b75;color:#89d8ad}.notification-push-card [data-push-state][data-state="error"],.notification-push-card [data-push-state][data-state="blocked"]{border-color:#a84d5b;color:#ef7a88}
+@media(max-width:700px){.notification-push-card{grid-template-columns:1fr}.notification-push-actions{justify-content:flex-start}}

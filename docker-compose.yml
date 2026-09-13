@@ -37,6 +37,11 @@ services:
       SUMMARY_WEBHOOK_TOKEN: ${SUMMARY_WEBHOOK_TOKEN:-}
       SUMMARY_DELIVERY_POLL_SECONDS: "${SUMMARY_DELIVERY_POLL_SECONDS:-30}"
 
+      # v0.55.2 standard encrypted browser/PWA Web Push. The VAPID private
+      # key is generated once in /data and never exposed to the browser.
+      ZEN_PUSH_VAPID_SUBJECT: "${ZEN_PUSH_VAPID_SUBJECT:-mailto:zen-control@example.invalid}"
+      ZEN_PUSH_POLL_SECONDS: "${ZEN_PUSH_POLL_SECONDS:-5}"
+
       # v0.30 performance gathering. Metrics are bounded and memory-only.
       ZEN_PERF_ENABLED: "${ZEN_PERF_ENABLED:-1}"
       ZEN_PERF_SAMPLE_LIMIT: "${ZEN_PERF_SAMPLE_LIMIT:-500}"

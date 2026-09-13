@@ -21,13 +21,13 @@ class ProgressiveWebAppContractTests(unittest.TestCase):
         cls.templates = list((ROOT / "app" / "templates").glob("*.html"))
 
     def test_release_and_shared_pwa_head_are_current(self):
-        self.assertIn('version="0.55.1"', self.main)
+        self.assertIn('version="0.55.2"', self.main)
         for template in self.templates:
             self.assertIn('{% include "_pwa_head.jinja" %}', template.read_text(), template.name)
         for token in (
-            '/static/manifest.webmanifest?v=0.55.1',
-            '/static/pwa.css?v=0.55.1',
-            '/static/pwa.js?v=0.55.1',
+            '/static/manifest.webmanifest?v=0.55.2',
+            '/static/pwa.css?v=0.55.2',
+            '/static/pwa.js?v=0.55.2',
             'apple-mobile-web-app-capable',
             'theme-color',
         ):
@@ -60,8 +60,12 @@ class ProgressiveWebAppContractTests(unittest.TestCase):
         # No offline mutation machinery is registered.
         self.assertNotIn("sync'", self.worker)
         self.assertNotIn('addEventListener("sync"', self.worker)
-        self.assertNotIn("push'", self.worker)
-        self.assertNotIn('addEventListener("push"', self.worker)
+        # v0.55.2 adds user-visible Web Push, but still no offline mutation/cache path.
+        self.assertIn("push'", self.worker)
+        self.assertIn('showNotification', self.worker)
+        self.assertIn("notificationclick", self.worker)
+        self.assertNotIn("indexedDB", self.worker)
+        self.assertNotIn("localStorage", self.worker)
 
     def test_dynamic_server_responses_are_private_no_store(self):
         self.assertIn("private_dynamic_cache_headers", self.main)
@@ -103,14 +107,14 @@ class ProgressiveWebAppContractTests(unittest.TestCase):
 
     def test_pwa_server_status_contract_is_security_explicit(self):
         self.assertIn('@app.get("/api/pwa/status")', self.main)
-        self.assertIn("return status_contract(app.version)", self.main)
+        self.assertIn("**status_contract(app.version)", self.main)
         for token in (
             '"schema": "zen_pwa_status_v1"',
             '"mode": "online_first"',
             '"cached_private_data": False',
             '"offline_mutations": False',
             '"background_sync": False',
-            '"push_notifications": False',
+            '"push_notifications": True',
             '"server_auth_required": True',
             '"shared_display_lock_server_enforced": True',
         ):

@@ -1,3 +1,16 @@
+## v0.55.2 — PWA / Browser Push Delivery
+
+- Adds standard encrypted Web Push delivery for the existing Notification Centre, using the browser/PWA Push API and service worker rather than a ZEN-specific cloud notification provider.
+- Generates and persists a local P-256 VAPID identity beside `policy.db`; the private key stays on the ZEN host while authenticated browsers receive only the public application-server key needed to subscribe.
+- Adds durable per-account browser push subscriptions without exposing endpoint URLs or browser encryption keys through normal API/UI status surfaces. Stale provider subscriptions returning HTTP 404/410 are automatically disabled.
+- Adds a durable push-delivery outbox with pending/sending/sent/failed/suppressed/cancelled truth, bounded retries/backoff, restart recovery, test delivery and aggregate delivery/subscription statistics.
+- Evaluates the complete v0.55.1 attention policy before push is queued. Quiet hours, minimum severity, cooldown, disabled event families and source/device filters therefore suppress both the bell and remote push without deleting the underlying notification evidence.
+- Cancels unsent push when the notification is read, acknowledged, dismissed or source-resolved, preventing stale attention from arriving after a parent has already handled it.
+- Extends the PWA service worker with transient push display and same-origin click-through into the owning ZEN context. Dynamic/private responses remain network-only and the service worker still stores no household data for offline use.
+- Adds Notification Preferences controls to enable/disable this browser and send a test push, plus worker/subscription/delivery evidence. Browser push correctly reports HTTPS REQUIRED when ZEN is opened over insecure HTTP.
+
+Authority boundary: the push worker has no RouterOS adapter. It can only deliver already-authorised notification attention to registered browser endpoints; it cannot create, resolve or enforce policy/incident state. Standard Web Push necessarily uses the browser vendor's encrypted push endpoint, but requires no separate ZEN SaaS account.
+
 ## v0.55.1 — Notification Preferences & Noise Control
 
 - Adds first-class Notification Preferences with a global attention enable switch, minimum severity threshold, quiet hours, configurable timezone, critical quiet-hours bypass and bounded repeat/reopen cooldown.

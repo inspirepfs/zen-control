@@ -221,10 +221,10 @@ class NotificationPreferenceSurfaceTests(unittest.TestCase):
         self.assertIn("quiet hours", self.help.lower())
 
     def test_release_identity_is_v0551(self):
-        self.assertIn('version="0.55.1"', self.main)
-        self.assertIn("Current release: **v0.55.1**", (ROOT / "README.md").read_text())
-        self.assertIn("## v0.55.1", (ROOT / "CHANGELOG.md").read_text())
-        self.assertIn('PWA_RELEASE = "0.55.1"', (ROOT / "app" / "pwa.py").read_text())
+        self.assertIn('version="0.55.2"', self.main)
+        self.assertIn("Current release: **v0.55.2**", (ROOT / "README.md").read_text())
+        self.assertIn("## v0.55.2", (ROOT / "CHANGELOG.md").read_text())
+        self.assertIn('PWA_RELEASE = "0.55.2"', (ROOT / "app" / "pwa.py").read_text())
 
 
 if __name__ == "__main__":

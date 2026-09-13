@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.55.1">
-  <link rel="stylesheet" href="/static/layout.css?v=0.55.1">
-  <link rel="stylesheet" href="/static/activity.css?v=0.55.1">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.55.1">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.1">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.55.2">
+  <link rel="stylesheet" href="/static/layout.css?v=0.55.2">
+  <link rel="stylesheet" href="/static/activity.css?v=0.55.2">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.55.2">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.2">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.2">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -2256,6 +2256,30 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     {% else %}
       <p class="muted">Viewer accounts can inspect current notification policy but cannot change it.</p>
     {% endif %}
+
+    <div class="notification-push-card">
+      <div class="notification-push-copy">
+        <div class="notification-card-heading"><strong>Browser / PWA push</strong><span class="policy-badge" data-push-state>CHECKING</span></div>
+        <p class="muted small" data-push-detail>Checking this browser's Web Push capability…</p>
+        <p class="muted small">Push follows the notification attention policy above. Quiet hours, severity thresholds, event/source/device filters and cooldowns are evaluated before a delivery is queued. Standard Web Push uses the browser vendor's encrypted push endpoint; ZEN requires no external SaaS account.</p>
+      </div>
+      <div class="notification-push-actions">
+        <button type="button" class="primary compact" data-push-enable disabled>Enable on this browser</button>
+        <button type="button" class="ghost compact" data-push-test disabled>Send test</button>
+        <button type="button" class="ghost compact" data-push-disable hidden>Disable this browser</button>
+      </div>
+      {% if notification_push_status %}
+      <div class="notification-push-stats">
+        <span>Worker <strong>{{ 'RUNNING' if notification_push_status.worker_running else 'STOPPED' }}</strong></span>
+        <span>Subscriptions <strong>{{ notification_push_status.subscriptions.enabled or 0 }}</strong></span>
+        <span>Sent <strong>{{ notification_push_status.deliveries.sent or 0 }}</strong></span>
+        <span>Pending <strong>{{ notification_push_status.deliveries.pending or 0 }}</strong></span>
+        <span>Suppressed <strong>{{ notification_push_status.deliveries.suppressed or 0 }}</strong></span>
+        <span>Failed <strong>{{ notification_push_status.deliveries.failed or 0 }}</strong></span>
+      </div>
+      {% endif %}
+    </div>
+
     <div class="notification-policy-summary">
       <span>Minimum <strong>{{ notification_preferences.min_severity|upper }}</strong></span>
       <span>Cooldown <strong>{{ notification_preferences.cooldown_seconds }}s</strong></span>

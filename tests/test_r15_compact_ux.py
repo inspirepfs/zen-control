@@ -12,7 +12,7 @@ class CompactUxTests(unittest.TestCase):
         self.main = (ROOT / "app/main.py").read_text()
 
     def test_version_bumped(self):
-        self.assertIn('version="0.55.1"', self.main)
+        self.assertIn('version="0.55.2"', self.main)
 
     def test_all_main_tabs_have_submenu_configuration(self):
         for name in ("dashboard", "devices", "policies", "schedules", "activity", "incidents", "settings"):

@@ -136,7 +136,7 @@ class ParentSummaryUxTests(unittest.TestCase):
         self.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_release_version_and_summary_subtab_are_present(self):
-        self.assertIn('version="0.55.1"', self.main)
+        self.assertIn('version="0.55.2"', self.main)
         self.assertIn("key: 'summaries', label: 'Summaries'", self.index)
         self.assertIn('data-ux-group="summaries"', self.index)
 
