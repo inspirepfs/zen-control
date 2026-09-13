@@ -103,7 +103,7 @@ class _FakeRouter:
         self.ready = ready
 
     def health(self):
-        return {"connected": True, "router": "ZEN", "host": "192.168.2.1"}
+        return {"connected": True, "router": "ZEN", "host": "192.0.2.1"}
 
     def get_security_posture(self):
         return {
