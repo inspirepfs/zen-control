@@ -216,8 +216,8 @@ class V054SourceContractTests(unittest.TestCase):
         main = (ROOT / "app/main.py").read_text()
         pwa = (ROOT / "app/pwa.py").read_text()
         changelog = (ROOT / "CHANGELOG.md").read_text()
-        self.assertIn('version="0.55.4.1"', main)
-        self.assertIn('PWA_RELEASE = "0.55.4.1"', pwa)
+        self.assertIn('version="0.55.4.2"', main)
+        self.assertIn('PWA_RELEASE = "0.55.4.2"', pwa)
         self.assertIn("## v0.55.2", changelog)
 
     def test_background_worker_has_no_routeros_dependency_and_is_started(self):

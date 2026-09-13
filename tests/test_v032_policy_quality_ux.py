@@ -177,7 +177,7 @@ class V032UXIntegrationTests(unittest.TestCase):
         cls.readme = (cls.root / "README.md").read_text() + "\n" + (cls.root / "CHANGELOG.md").read_text()
 
     def test_v032_routes_are_local_read_only_and_expose_stable_api(self):
-        self.assertIn('version="0.55.4.1"', self.main)
+        self.assertIn('version="0.55.4.2"', self.main)
         self.assertIn('@app.get("/policy/quality"', self.main)
         self.assertIn('@app.get("/api/policy/quality")', self.main)
         helper = self.main.split('def _policy_quality_snapshot():', 1)[1].split('@app.get("/policy/quality"', 1)[0]
@@ -222,7 +222,7 @@ class V032UXIntegrationTests(unittest.TestCase):
         for path in (self.root / "app/templates").glob("*.html"):
             text = path.read_text()
             self.assertNotIn("?v=0.31.0", text, path.name)
-        self.assertIn('/static/policy-quality.css?v=0.55.4.1', self.quality)
+        self.assertIn('/static/policy-quality.css?v=0.55.4.2', self.quality)
 
 
 if __name__ == "__main__":

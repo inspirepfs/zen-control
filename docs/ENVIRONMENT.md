@@ -29,7 +29,7 @@ ZEN uses these configuration classes:
 - **conditional** — required only when its owning feature is enabled;
 - **conditional-secret** — a secret required only for an enabled optional feature;
 - **internal** — container/runtime wiring with a safe bounded default or a hard-coded Compose value; not a host `.env` setting;
-- **deprecated** — retained temporarily for compatibility and reported explicitly by the validator. There are no deprecated entries in v0.55.4.1.
+- **deprecated** — retained temporarily for compatibility and reported explicitly by the validator. There are no deprecated entries in v0.55.4.2.
 
 The older `SUMMARY_*` variables remain **active**, not deprecated: they belong to Parent Summary delivery and are separate from the v0.55 external Notification Delivery adapters.
 

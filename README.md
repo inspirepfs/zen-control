@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.55.4.1** — Environment Configuration Contract & Drift Prevention: `.env.example`, Compose interpolation, application environment references and the live host `.env` are validated as one fail-closed release contract without exposing secret values. v0.55.4 external SMTP/webhook delivery remains unchanged.
+> Current release: **v0.55.4.2** — Notification Delivery Navigation Hotfix: exposes the already-implemented External Delivery surface in the Notifications sub-navigation while preserving the v0.55.4.1 environment contract and all v0.55.4 SMTP/webhook delivery semantics and authority boundaries.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 

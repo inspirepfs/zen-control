@@ -141,8 +141,8 @@ class SecureTransportSourceTests(unittest.TestCase):
         cls.script = (ROOT / "scripts/https_acceptance.py").read_text()
 
     def test_release_version_and_assets_are_current(self):
-        self.assertIn('version="0.55.4.1"', self.main)
-        self.assertIn('/static/app.css?v=0.55.4.1', self.index)
+        self.assertIn('version="0.55.4.2"', self.main)
+        self.assertIn('/static/app.css?v=0.55.4.2', self.index)
         self.assertIn("v0.55.2", self.readme)
 
     def test_session_secure_flag_is_configuration_driven(self):
@@ -269,7 +269,7 @@ class PostCoreReadinessSeparationTests(unittest.TestCase):
     def report(self, transport):
         from app.release_readiness import build_release_readiness
         return build_release_readiness(
-            version="0.55.4.1",
+            version="0.55.4.2",
             operations={"ok": True, "issues": []},
             startup={"status": "ready", "issues": []},
             diagnostics={"overall": "healthy", "counts": {"healthy": 15, "warning": 0, "critical": 0, "offline": 0}, "checks": []},

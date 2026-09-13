@@ -1,3 +1,11 @@
+## v0.55.4.2 — Notification Delivery Navigation Hotfix
+
+- Fixes the Notifications subsection navigation so the existing **Delivery** surface is actually exposed in the generated sub-navigation between Intelligence and History.
+- Keeps the v0.55.4 external-delivery routes, SMTP/webhook adapters, simulator profile, persistence and authority boundaries unchanged; this is a presentation/navigation repair only.
+- Adds a regression contract that requires the backend section allow-list, generated JavaScript sub-navigation, delivery section markup and delivery routes to agree on the `delivery` subsection.
+
+Authority boundary: no RouterOS, policy, worker-authority, database-schema or delivery-semantics change.
+
 ## v0.55.4.1 — Environment Configuration Contract & Drift Prevention
 
 - Adds `scripts/env_validate.py` as the fail-closed environment contract for `.env.example`, Compose host interpolation, source environment references and the deployment host `.env`; validator output never prints local values or secrets.

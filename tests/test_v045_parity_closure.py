@@ -220,7 +220,7 @@ class ParityUxClosureTests(unittest.TestCase):
         main = (ROOT / "app/main.py").read_text()
         simulation = (ROOT / "app/templates/simulation.html").read_text()
         device360 = (ROOT / "app/templates/device_360.html").read_text()
-        self.assertIn('version="0.55.4.1"', main)
+        self.assertIn('version="0.55.4.2"', main)
         self.assertIn("REPORTING ONLY", simulation)
         self.assertIn("unavailable", device360.lower())
 
