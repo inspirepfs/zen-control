@@ -6,7 +6,7 @@ ZEN does not own an arbitrary RouterOS configuration. Static critical firewall a
 
 ## Supported baseline
 
-- RouterOS 7.x.
+- RouterOS 7 on a vendor security-fixed release. For the September 2026 MikroTrick fix, use stable `7.24.2+` or long-term `7.23.4+` (or a later vendor-supported security-fixed release).
 - A LAN host running ZEN with stable/reserved IPv4 identity.
 - A RouterOS interface list named `WAN`, or an operator-reviewed equivalent reflected in the core template.
 - RouterOS API reachability from the ZEN host only.

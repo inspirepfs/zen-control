@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.59.0.4 — Public Release Framework & RouterOS Security Closure
+
+- Raises FastAPI to `0.141.1` and pins Starlette to `1.6.0`, moving ZEN off the pre-1.3.1 Starlette line affected by 2026 request/form parsing and request-URL security advisories.
+- Retains the `python-multipart==0.0.32` and `cryptography>=50.0.1,<51` security floors established by v0.59.0.3.
+- Tightens the public RouterOS prerequisite to a vendor security-fixed release: for the September 2026 MikroTrick advisory, stable `7.24.2+` or long-term `7.23.4+` (or a later vendor-supported security-fixed release).
+- Adds regression contracts for the framework dependency floor, RouterOS public documentation floor, application rebuild mapping, and unchanged runtime/PWA release identity.
+- This remains a publication-security hotfix only: application/PWA release stays `0.59.0`; RouterOS authority, policy semantics, telemetry and database schema are unchanged.
+
 ## v0.59.0.3 — Public Release Dependency Security Closure
 
 - Raises `python-multipart` to `0.0.32`, clearing the 2026 form-parser denial-of-service fixes while preserving FastAPI form handling.

@@ -62,11 +62,12 @@ Then use the normal release helper so backup/restore smoke, affected-service dep
 
 Before relying on the public release as an enforcement system:
 
-1. run `routeros/setup/99-verify.rsc`;
-2. confirm Settings → Security is enforcement-ready;
-3. confirm Operational Diagnostics has no unexplained critical failure;
-4. confirm FastTrack cannot bypass `Restricted_Devices`;
-5. retain Kid Control rollback state until you deliberately retire it in your own installation.
+1. confirm RouterOS is on a vendor security-fixed release; for the September 2026 MikroTrick advisory that means stable `7.24.2+` or long-term `7.23.4+` (or a later vendor-supported security-fixed release);
+2. run `routeros/setup/99-verify.rsc`;
+3. confirm Settings → Security is enforcement-ready;
+4. confirm Operational Diagnostics has no unexplained critical failure;
+5. confirm FastTrack cannot bypass `Restricted_Devices`;
+6. retain Kid Control rollback state until you deliberately retire it in your own installation.
 
 ## Explicitly open manual gate: Android / installed PWA
 

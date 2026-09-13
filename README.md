@@ -106,7 +106,7 @@ The consolidated RouterOS bootstrap/recovery templates live in [routeros/setup/]
 
 A typical deployment needs:
 
-- MikroTik RouterOS 7.x with API access from the ZEN host.
+- MikroTik RouterOS on a vendor security-fixed RouterOS 7 release with API access from the ZEN host. For the September 2026 MikroTrick fix, use stable `7.24.2+` or long-term `7.23.4+` (or a later vendor-supported security-fixed release).
 - Docker Engine with Docker Compose v2.
 - A Linux Docker host on the LAN.
 - A static/reserved address for the host.
