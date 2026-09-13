@@ -14,6 +14,7 @@ than replaces, credential rotation and manual review.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import re
 import subprocess
@@ -60,6 +61,13 @@ DEPLOYMENT_MARKER_KEYS = (
     "ZEN_PUBLIC_HOST",
     "ZEN_LAN_BIND_IP",
     "MIKROTIK_HOST",
+)
+
+DOCUMENTATION_NETWORKS = (
+    ipaddress.ip_network("192.0.2.0/24"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
+    ipaddress.ip_network("2001:db8::/32"),
 )
 
 
@@ -148,8 +156,13 @@ def secret_findings(text: str, location: str) -> list[str]:
             line = text.count("\n", 0, match.start()) + 1
             findings.append(f"{label} pattern: {location}:{line}")
 
-    suffix = Path(location.split("@", 1)[0].removeprefix("history:")).suffix.lower()
-    assignment_surface = suffix in {".env", ".yaml", ".yml", ".conf", ".cfg", ".ini", ".example"}
+    assignment_path = Path(location.split("@", 1)[0].removeprefix("history:"))
+    suffix = assignment_path.suffix.lower()
+    assignment_surface = (
+        assignment_path.name == ".env"
+        or assignment_path.name.startswith(".env.")
+        or suffix in {".yaml", ".yml", ".conf", ".cfg", ".ini", ".example"}
+    )
     if assignment_surface:
         for match in SECRET_ASSIGNMENT.finditer(text):
             key, value = match.group(1), match.group(2)
@@ -160,6 +173,61 @@ def secret_findings(text: str, location: str) -> list[str]:
             line = text.count("\n", 0, match.start()) + 1
             findings.append(f"literal secret-like assignment ({key}): {location}:{line}")
     return findings
+
+
+def _deployment_marker_value_is_concrete(key: str, value: str) -> bool:
+    """Return True only for a concrete deployment identity value.
+
+    The marker source is the ignored local .env. Canonical key names, shell
+    references and documentation-only addresses are configuration syntax, not
+    deployment identity. Ignoring them prevents the scanner from treating an
+    identifier such as MIKROTIK_HOST as private material while retaining exact
+    matching for real hostnames and LAN addresses.
+    """
+    value = value.strip()
+    if _placeholder(value):
+        return False
+
+    normalized = value.strip('"').strip("'").strip()
+    upper = normalized.upper()
+    key_upper = key.upper()
+    if upper in {key_upper, f"${key_upper}", f"${{{key_upper}}}"}:
+        return False
+    if re.fullmatch(r"\{\{\s*" + re.escape(key) + r"\s*\}\}", normalized, re.IGNORECASE):
+        return False
+
+    # RFC 5737 / RFC 3849 addresses are reserved for documentation and tests.
+    candidate = normalized.strip("[]")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        address = None
+    if address is not None and any(address in network for network in DOCUMENTATION_NETWORKS):
+        return False
+    return True
+
+
+def _deployment_marker_pattern(value: str) -> re.Pattern[str]:
+    """Build an exact literal matcher that cannot hit a longer host/address."""
+    escaped = re.escape(value)
+    candidate = value.strip("[]")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        address = None
+
+    if isinstance(address, ipaddress.IPv4Address):
+        return re.compile(r"(?<![0-9.])" + escaped + r"(?![0-9.])")
+    if isinstance(address, ipaddress.IPv6Address):
+        return re.compile(r"(?<![0-9A-Fa-f:])" + escaped + r"(?![0-9A-Fa-f:])", re.IGNORECASE)
+
+    # Hostnames are case-insensitive and must not match a longer DNS label/name.
+    if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value):
+        return re.compile(
+            r"(?<![A-Za-z0-9_.-])" + escaped + r"(?![A-Za-z0-9_.-])",
+            re.IGNORECASE,
+        )
+    return re.compile(escaped)
 
 
 def load_deployment_markers(path: Path) -> dict[str, str]:
@@ -173,7 +241,7 @@ def load_deployment_markers(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key in DEPLOYMENT_MARKER_KEYS and value and not _placeholder(value):
+        if key in DEPLOYMENT_MARKER_KEYS and _deployment_marker_value_is_concrete(key, value):
             parsed[key] = value
     return parsed
 
@@ -181,14 +249,15 @@ def load_deployment_markers(path: Path) -> dict[str, str]:
 def marker_findings(text: str, location: str, markers: dict[str, str]) -> list[str]:
     findings: list[str] = []
     for key, value in markers.items():
-        start = 0
-        while True:
-            pos = text.find(value, start)
-            if pos < 0:
-                break
-            line = text.count("\n", 0, pos) + 1
-            findings.append(f"deployment marker {key}: {location}:{line}")
-            start = pos + len(value)
+        # Revalidate caller-supplied markers as a defence-in-depth guard. Tests
+        # and future callers must not be able to turn a canonical key name into
+        # a deployment-value finding.
+        if not _deployment_marker_value_is_concrete(key, value):
+            continue
+        pattern = _deployment_marker_pattern(value)
+        for match in pattern.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            findings.append(f"deployment-value: {key}: {location}:{line}")
     return findings
 
 

@@ -148,14 +148,110 @@ class PublicReleaseClosureTests(unittest.TestCase):
         args = module.parse_args(["--history", "--deployment-markers"])
         self.assertTrue(args.history)
         self.assertTrue(args.deployment_markers)
-        findings = module.marker_findings("prefix private.example suffix", "README.md", {"ZEN_LOCAL_HOST": "private.example"})
-        self.assertEqual(findings, ["deployment marker ZEN_LOCAL_HOST: README.md:1"])
-        self.assertNotIn("private.example", findings[0])
+
+        value = "router.household.local"
+        findings = module.marker_findings(
+            f"prefix https://{value}:443 suffix",
+            "README.md",
+            {"ZEN_LOCAL_HOST": value},
+        )
+        self.assertEqual(findings, ["deployment-value: ZEN_LOCAL_HOST: README.md:1"])
+        self.assertNotIn(value, findings[0])
+
         with tempfile.TemporaryDirectory() as td:
             env = Path(td) / ".env"
-            env.write_text("ZEN_LOCAL_HOST=private.example\nSESSION_SECRET=do-not-read-this\n")
+            env.write_text(
+                "ZEN_LOCAL_HOST=router.household.local\n"
+                "ZEN_PUBLIC_HOST=${ZEN_PUBLIC_HOST}\n"
+                "ZEN_LAN_BIND_IP=192.0.2.44\n"
+                "MIKROTIK_HOST=MIKROTIK_HOST\n"
+                "SESSION_SECRET=do-not-read-this-secret-value\n"
+            )
             markers = module.load_deployment_markers(env)
-            self.assertEqual(markers, {"ZEN_LOCAL_HOST": "private.example"})
+            self.assertEqual(markers, {"ZEN_LOCAL_HOST": "router.household.local"})
+            self.assertNotIn("do-not-read-this-secret-value", repr(markers))
+
+    def test_deployment_marker_matching_is_exact_not_prefix_or_key_name(self):
+        spec = importlib.util.spec_from_file_location("zen_public_audit_exact", ROOT / "scripts/public_release_audit.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        markers = {"MIKROTIK_HOST": "192.168.50.1"}
+        self.assertEqual(
+            module.marker_findings(
+                "hosts=192.168.50.10,192.168.50.100 MIKROTIK_HOST=${MIKROTIK_HOST}",
+                "tests/example.py",
+                markers,
+            ),
+            [],
+        )
+        self.assertEqual(
+            module.marker_findings("host=192.168.50.1:8728", "config.txt", markers),
+            ["deployment-value: MIKROTIK_HOST: config.txt:1"],
+        )
+        self.assertEqual(
+            module.marker_findings(
+                'os.environ["MIKROTIK_HOST"]\nMIKROTIK_HOST=',
+                "app/config.py",
+                {"MIKROTIK_HOST": "MIKROTIK_HOST"},
+            ),
+            [],
+        )
+
+    def test_documentation_values_and_secret_values_are_never_deployment_markers(self):
+        spec = importlib.util.spec_from_file_location("zen_public_audit_examples", ROOT / "scripts/public_release_audit.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        for value in ("zen.example.com", "192.0.2.12", "198.51.100.8", "203.0.113.9", "2001:db8::12"):
+            with self.subTest(value=value):
+                self.assertFalse(module._deployment_marker_value_is_concrete("ZEN_LOCAL_HOST", value))
+
+        secret = "super-secret-value-that-must-not-be-printed"
+        findings = module.secret_findings(f"SESSION_SECRET={secret}\n", ".env")
+        self.assertTrue(findings)
+        self.assertTrue(all(secret not in item for item in findings))
+
+    def test_history_mode_finds_real_value_but_not_canonical_key_name(self):
+        spec = importlib.util.spec_from_file_location("zen_public_audit_history", ROOT / "scripts/public_release_audit.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        value = "router.household.local"
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "audit@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Audit Test"], check=True)
+            note = repo / "history.md"
+            note.write_text(f"legacy host={value}\n")
+            subprocess.run(["git", "-C", str(repo), "add", "history.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "historical value"], check=True)
+            note.write_text('key=ZEN_LOCAL_HOST\nos.environ["ZEN_LOCAL_HOST"]\n')
+            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "parameterize"], check=True)
+
+            old_root = module.ROOT
+            module.ROOT = repo
+            try:
+                blobs, problem = module.iter_git_history_text()
+            finally:
+                module.ROOT = old_root
+            self.assertIsNone(problem)
+            findings = [
+                finding
+                for location, text in blobs
+                for finding in module.marker_findings(
+                    text, location, {"ZEN_LOCAL_HOST": value}
+                )
+            ]
+            self.assertTrue(any("deployment-value: ZEN_LOCAL_HOST" in item for item in findings))
+            self.assertTrue(all(value not in item for item in findings))
+            self.assertEqual(
+                module.marker_findings(
+                    note.read_text(), "history.md", {"ZEN_LOCAL_HOST": value}
+                ),
+                [],
+            )
 
     def test_current_and_history_public_release_audits_pass(self):
         for args in ([], ["--history"]):
