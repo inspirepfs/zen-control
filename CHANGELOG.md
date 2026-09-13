@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.59.0.3 — Public Release Dependency Security Closure
+
+- Raises `python-multipart` to `0.0.32`, clearing the 2026 form-parser denial-of-service fixes while preserving FastAPI form handling.
+- Raises the `cryptography` line to `>=50.0.1,<51`, removing the vulnerable pre-50 ceiling and retaining a bounded major-version contract.
+- Adds a regression contract that fails if either dependency falls below the public-release security floor and proves that dependency changes rebuild `mikrotik-control`.
+- This is a publication-security hotfix only: the application/PWA release remains `0.59.0`, and RouterOS authority, policy semantics, telemetry and database schema are unchanged.
+
 ## v0.59.0 — Public Release Closure & RouterOS Setup Bundle
 
 - Consolidates the current RouterOS authority, mode, built-in service, known-DoH, FastTrack, API, IPFIX, local-DNS and DHCP-identity setup patterns under `routeros/setup/`, with fail-closed confirmation guards for deployment-specific mutating templates.

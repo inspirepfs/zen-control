@@ -1,7 +1,7 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 jinja2==3.1.6
-python-multipart==0.0.20
+python-multipart==0.0.32
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 itsdangerous==2.2.0
@@ -12,7 +12,7 @@ psycopg[binary]>=3.2,<4
 tzdata>=2025.2
 
 # R14 parent authentication / encrypted TOTP enrollment
-cryptography>=46,<47
+cryptography>=50.0.1,<51
 qrcode[pil]>=8,<9
 
 # v0.55.2 standard browser/PWA Web Push delivery
