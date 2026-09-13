@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.56.0** — Secure Transport & PWA Commissioning: separates local HTTPS from optional remote Access readiness, hardens secure-cookie/Host allowlist commissioning, adds host-side TLS/PWA prerequisite acceptance, and exposes sanitized commissioning state without adding RouterOS authority.
+> Current release: **v0.57.0** — Operational Resilience & Upgrade Safety: formalizes SQLite schema lineage, creates verified pre-migration recovery copies, adds historical upgrade/restore acceptance, and makes the normal release workflow prove backup, migration, restart and retained-state health before publication.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 

@@ -137,8 +137,8 @@ class FinalReleaseReadinessSourceTests(unittest.TestCase):
         main = (ROOT / "app/main.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn('version="0.56.0"', main)
-        self.assertIn("Current release: **v0.56.0**", readme)
+        self.assertIn('version="0.57.0"', main)
+        self.assertIn("Current release: **v0.57.0**", readme)
         self.assertIn("## v0.54.5 — Final release-readiness closure", changelog)
         self.assertIn("## v0.54.5.1 — RouterOS request-path decoupling", changelog)
 

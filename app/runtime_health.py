@@ -26,6 +26,7 @@ def build_runtime_health(
     reconciler: Any,
     incident_monitor: Any,
     summary_delivery: Any,
+    policy_store: Any | None = None,
 ) -> dict:
     """Return a minimal, non-secret post-startup worker-health contract.
 
@@ -78,10 +79,33 @@ def build_runtime_health(
         observers = 1
     observers = max(1, min(8, observers))
 
+    database = {
+        "available": False,
+        "healthy": False,
+        "schema_version": None,
+        "schema_target": None,
+        "upgrade_state": "unavailable",
+        "upgrade_backup": False,
+    }
+    if policy_store is not None:
+        try:
+            integrity = policy_store.database_integrity_report() or {}
+            database = {
+                "available": True,
+                "healthy": bool(integrity.get("ok")),
+                "schema_version": integrity.get("schema_version"),
+                "schema_target": integrity.get("schema_target"),
+                "upgrade_state": integrity.get("upgrade_state", "unknown"),
+                "upgrade_backup": bool(integrity.get("upgrade_backup")),
+            }
+        except Exception:
+            database = {**database, "available": True}
+
     ok = (
         all(row["available"] and row["alive"] for row in workers.values())
         and mutation_available
         and prepared_work_healthy
+        and (database["healthy"] if policy_store is not None else True)
     )
     return {
         "schema": "zen_runtime_health_v1",
@@ -89,6 +113,7 @@ def build_runtime_health(
         "status": "healthy" if ok else "degraded",
         "version": str(version or ""),
         "workers": workers,
+        "database": database,
         "background_read_models": {
             "durable_available": durable_available,
             "healthy": prepared_work_healthy,

@@ -65,7 +65,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.56.0")
+app = FastAPI(title="ZEN Control", version="0.57.0")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -1503,6 +1503,7 @@ def current_release_readiness() -> dict:
             reconciler=auto_reconciler,
             incident_monitor=incident_monitor,
             summary_delivery=summary_delivery,
+            policy_store=policy_store,
         )
     except Exception:
         runtime_health = {"schema": "zen_runtime_health_v1", "ok": False, "status": "degraded"}
@@ -1698,6 +1699,7 @@ def health_runtime():
         reconciler=auto_reconciler,
         incident_monitor=incident_monitor,
         summary_delivery=summary_delivery,
+        policy_store=policy_store,
     )
     if not report.get("ok"):
         return JSONResponse(status_code=503, content=report)

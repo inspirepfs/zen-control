@@ -155,8 +155,8 @@ class PolicySimulationUxTests(unittest.TestCase):
         cls.readme = (ROOT / "README.md").read_text() + "\n" + (ROOT / "CHANGELOG.md").read_text()
 
     def test_release_version_and_simulation_asset(self):
-        self.assertIn('version="0.56.0"', self.main)
-        self.assertIn('/static/policy-simulation.css?v=0.56.0', self.template)
+        self.assertIn('version="0.57.0"', self.main)
+        self.assertIn('/static/policy-simulation.css?v=0.57.0', self.template)
 
     def test_workbench_and_preview_routes_are_present(self):
         for route in (

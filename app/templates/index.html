@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.56.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.56.0">
-  <link rel="stylesheet" href="/static/activity.css?v=0.56.0">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.56.0">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.56.0">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.56.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.57.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.57.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.57.0">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.57.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.57.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.57.0">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -3342,6 +3342,8 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     <div class="security-summary-grid operations-summary-grid">
       <div><span class="muted small">Startup integrity</span><strong>{{ operations_startup.status|upper }}</strong></div>
       <div><span class="muted small">Policy database</span><strong>{{ 'OK' if database_integrity.ok else 'FAIL' }}</strong></div>
+      <div><span class="muted small">DB schema</span><strong>{{ database_integrity.schema_version }} / {{ database_integrity.schema_target }}</strong></div>
+      <div><span class="muted small">Upgrade state</span><strong>{{ database_integrity.upgrade_state|replace('_', ' ')|upper }}</strong>{% if database_integrity.upgrade_backup %}<span class="muted small"> · recovery copy retained</span>{% endif %}</div>
       <div><span class="muted small">Durable audit</span><strong>{{ audit_total }} events</strong></div>
       <div><span class="muted small">Snapshots retained</span><strong>{{ config_snapshots|length }}</strong></div>
     </div>

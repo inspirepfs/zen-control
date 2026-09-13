@@ -1,3 +1,15 @@
+## v0.57.0 — Operational Resilience & Upgrade Safety
+
+- Introduces formal policy-database schema lineage at schema **570**, recording the migration only after all existing additive compatibility migrations and data backfills succeed. Databases with a newer schema fail closed before mutation.
+- Adds a pre-migration SQLite safety boundary: existing databases must pass `quick_check`/foreign-key validation and receive a verified, deterministic recovery copy before `PolicyStore` performs any schema work. Interrupted retries reuse rather than overwrite that original recovery point.
+- Adds historical upgrade fixtures for v0.54-style state, v0.55 notification state, and an exact v0.56 schema dump with representative retained policy/notification data.
+- Adds `scripts/upgrade_acceptance.py`, which never modifies the supplied backup: it restores to a temporary copy, runs the current migration path, verifies retained row counts/integrity, reopens the result, and proves migration idempotency.
+- Extends `scripts/release_patch.py` so any release that rebuilds `mikrotik-control` first performs a SQLite online backup from the live Docker data volume into an external host backup directory, validates that backup, and runs the offline restore/upgrade smoke before container recreation.
+- Extends runtime/Operations evidence with sanitized schema target/current version, upgrade state and whether an automatic recovery copy was retained; runtime health fails if current database integrity/schema is not healthy.
+- Keeps upgrade safety outside RouterOS authority. It performs SQLite inspection/backup/migration evidence only and does not add a RouterOS client or mutation path.
+
+Authority boundary: backup, migration and restore acceptance are local SQLite/release operations only. RouterOS mutation authority, lock ordering and fresh-read/write/verify requirements are unchanged.
+
 ## v0.56.0 — Secure Transport & PWA Commissioning
 
 - Promotes local HTTPS/PWA commissioning from an implicit deployment detail to a first-class sanitized transport contract while keeping optional Cloudflare remote access separate.

@@ -147,7 +147,7 @@ Run the host-side local TLS/PWA prerequisite proof using the real local hostname
 ```bash
 python3 scripts/transport_acceptance.py \
   --local-url https://zen.example.com/ \
-  --expect-version 0.56.0 \
+  --expect-version 0.57.0 \
   --require-hsts
 ```
 
@@ -183,7 +183,7 @@ Or combine local and public proof in one report:
 python3 scripts/transport_acceptance.py \
   --local-url https://zen.example.com/ \
   --public-url https://zen-public.example.net/ \
-  --expect-version 0.56.0 \
+  --expect-version 0.57.0 \
   --require-hsts
 ```
 
@@ -203,4 +203,4 @@ Before relying on automatic enforcement:
 
 ## Backup and recovery
 
-Back up the Docker volumes and application configuration before major upgrades. Keep authentication secrets and tunnel credentials outside source control. A restored `policy.db` without the matching `OTP_ENCRYPTION_KEY` cannot decrypt enrolled authenticator secrets.
+The normal `scripts/release_patch.py` workflow now creates and validates an external SQLite backup before any release that rebuilds `mikrotik-control`, then runs an offline restore/upgrade smoke before container recreation. Backups default to `../zen-backups` and can be redirected with `--backup-dir`; `--skip-policy-backup` is an explicit emergency override and should not be used for routine releases. Keep authentication secrets and tunnel credentials outside source control. A restored `policy.db` without the matching `OTP_ENCRYPTION_KEY` cannot decrypt enrolled authenticator secrets.

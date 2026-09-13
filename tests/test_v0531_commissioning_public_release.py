@@ -89,8 +89,8 @@ class PublicRepositoryContractTests(unittest.TestCase):
     def test_release_version_is_0531(self):
         main = (ROOT / "app/main.py").read_text()
         pwa = (ROOT / "app/pwa.py").read_text()
-        self.assertIn('version="0.56.0"', main)
-        self.assertIn('PWA_RELEASE = "0.56.0"', pwa)
+        self.assertIn('version="0.57.0"', main)
+        self.assertIn('PWA_RELEASE = "0.57.0"', pwa)
 
     def test_readme_is_product_first_and_changelog_owns_release_history(self):
         readme = (ROOT / "README.md").read_text()

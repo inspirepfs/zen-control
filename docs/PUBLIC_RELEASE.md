@@ -22,7 +22,7 @@ This checklist is deliberately conservative because ZEN can control a real house
 
 ## Automated host release path
 
-The supported host-side orchestration helper is `scripts/release_patch.py`. It preserves the manual gates rather than hiding them: patch application rejects fuzz/offset/reversed evidence, source validation must pass, affected containers must rebuild, the pre-release Compose topology and embedded workers must recover, Git staging must be clean, the pushed commit must pass the selected GitHub Actions workflow, and only then may an annotated release tag be pushed.
+The supported host-side orchestration helper is `scripts/release_patch.py`. It preserves the manual gates rather than hiding them: patch application rejects fuzz/offset/reversed evidence, source validation must pass, a `mikrotik-control` rebuild first requires a verified external SQLite backup plus offline restore/upgrade smoke, affected containers must rebuild, the pre-release Compose topology and embedded workers/database schema must recover, Git staging must be clean, the pushed commit must pass the selected GitHub Actions workflow, and only then may an annotated release tag be pushed.
 
 Important switches include:
 

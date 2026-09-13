@@ -19,12 +19,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import shlex
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
+from datetime import datetime, timezone
 import urllib.request
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -39,7 +41,9 @@ SERVICE_PATH_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("zen-local-https", ("deploy/caddy/",)),
 )
 ONE_SHOT_SERVICES = {"flow-pipe-init"}
-
+POLICY_SERVICE = "mikrotik-control"
+POLICY_DB_CONTAINER_PATH = "/data/policy.db"
+POLICY_SCHEMA_VERSION = 570
 
 
 class WorkflowError(RuntimeError):
@@ -450,6 +454,113 @@ def apply_patch(path: Path, *, dry_run: bool = False) -> None:
             raise WorkflowError("patch application reported non-exact evidence")
 
 
+def validate_sqlite_backup(path: Path) -> dict:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise WorkflowError(f"policy backup missing or empty: {path}")
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0) as db:
+            quick = [str(row[0]) for row in db.execute("PRAGMA quick_check").fetchall()]
+            foreign = db.execute("PRAGMA foreign_key_check").fetchall()
+            version = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
+    except sqlite3.DatabaseError as exc:
+        raise WorkflowError(f"policy backup cannot be reopened: {exc}") from exc
+    if quick != ["ok"] or foreign:
+        raise WorkflowError(
+            f"policy backup integrity failed: quick_check={quick!r} foreign_key_violations={len(foreign)}"
+        )
+    return {
+        "ok": True,
+        "path": str(path),
+        "size_bytes": path.stat().st_size,
+        "schema_version": version,
+        "quick_check": quick,
+        "foreign_key_violations": len(foreign),
+    }
+
+
+def _json_line(output: str) -> dict:
+    for line in reversed((output or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise WorkflowError("policy backup helper did not return JSON evidence")
+
+
+def create_live_policy_backup(
+    *,
+    expected_version: str | None,
+    head_sha: str,
+    backup_dir: Path,
+    dry_run: bool = False,
+) -> Path | None:
+    """Create an online SQLite backup outside the Docker volume before rebuild."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    release = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(expected_version or "unknown"))
+    head = re.sub(r"[^A-Fa-f0-9]+", "", str(head_sha or ""))[:12] or "unknown"
+    filename = f"policy-pre-v{release}-{stamp}-{head}.db"
+    host_dir = backup_dir.expanduser().resolve()
+    host_path = host_dir / filename
+    if dry_run:
+        print(f"Policy backup: DRY-RUN · {host_path}", flush=True)
+        return host_path
+    host_dir.mkdir(parents=True, exist_ok=True)
+
+    helper_lines = [
+        "import json, os, sqlite3",
+        "from pathlib import Path",
+        f"src=Path({POLICY_DB_CONTAINER_PATH!r})",
+        f"dst=Path('/host-backup/{filename}')",
+        "tmp=Path(str(dst)+'.tmp')",
+        "if not src.exists() or src.stat().st_size == 0:\n print(json.dumps({'state':'absent'})); raise SystemExit(0)",
+        "s=sqlite3.connect(str(src), timeout=5.0); s.execute('PRAGMA busy_timeout=5000')",
+        "quick=[str(r[0]) for r in s.execute('PRAGMA quick_check').fetchall()]",
+        "foreign=s.execute('PRAGMA foreign_key_check').fetchall()",
+        "if quick != ['ok'] or foreign:\n print(json.dumps({'state':'invalid','quick_check':quick,'foreign_key_violations':len(foreign)})); raise SystemExit(4)",
+        "tmp.unlink(missing_ok=True)",
+        "d=sqlite3.connect(str(tmp)); s.backup(d); d.close(); s.close()",
+        "v=sqlite3.connect(str(tmp)); q=[str(r[0]) for r in v.execute('PRAGMA quick_check').fetchall()]; f=v.execute('PRAGMA foreign_key_check').fetchall(); ver=int(v.execute('PRAGMA user_version').fetchone()[0] or 0); v.close()",
+        "if q != ['ok'] or f:\n print(json.dumps({'state':'backup-invalid','quick_check':q,'foreign_key_violations':len(f)})); raise SystemExit(5)",
+        "os.replace(tmp,dst)",
+        "print(json.dumps({'state':'created','path':str(dst),'size_bytes':dst.stat().st_size,'schema_version':ver,'quick_check':q,'foreign_key_violations':len(f)}))",
+    ]
+    helper = "\n".join(helper_lines)
+    proc = run(
+        [
+            "docker", "compose", "run", "--rm", "--no-deps",
+            "-v", f"{host_dir}:/host-backup",
+            "--entrypoint", "python3", POLICY_SERVICE, "-c", helper,
+        ],
+        capture=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise WorkflowError(f"pre-upgrade policy backup failed ({proc.returncode})")
+    evidence = _json_line(proc.stdout)
+    if evidence.get("state") == "absent":
+        print("Policy backup: SKIP · no existing policy.db (fresh deployment)", flush=True)
+        return None
+    if evidence.get("state") != "created":
+        raise WorkflowError(f"pre-upgrade policy backup failed closed: {evidence.get('state')}")
+
+    validated = validate_sqlite_backup(host_path)
+    print(
+        f"Policy backup: PASS · bytes={validated['size_bytes']} schema={validated['schema_version']} file={host_path}",
+        flush=True,
+    )
+    run([
+        sys.executable, "scripts/upgrade_acceptance.py", str(host_path),
+        "--expect-schema", str(POLICY_SCHEMA_VERSION),
+    ])
+    print("Policy restore/upgrade smoke: PASS", flush=True)
+    return host_path
+
+
 def validate(*, dry_run: bool = False) -> None:
     app_files = sorted(str(path.relative_to(ROOT)) for path in (ROOT / "app").glob("*.py"))
     ingest_files = sorted(str(path.relative_to(ROOT)) for path in (ROOT / "telemetry/ingest").glob("*.py"))
@@ -636,6 +747,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-health-url", default="http://127.0.0.1:8080/health/runtime", help="Post-rebuild embedded-worker health URL.")
     parser.add_argument("--topology-timeout", type=int, default=90, help="Seconds to wait for the pre-existing Compose topology to recover.")
     parser.add_argument("--expect-version", help="Require this version in the JSON health responses.")
+    parser.add_argument("--backup-dir", default="../zen-backups", help="Host directory for verified pre-upgrade policy.db backups (default: ../zen-backups).")
+    parser.add_argument("--skip-policy-backup", action="store_true", help="Explicitly bypass the pre-rebuild policy.db backup/restore gate. Not recommended for normal releases.")
     parser.add_argument("--stage", action="append", default=[], metavar="PATH", help="Stage only this path; repeatable. Default: git add -A.")
     parser.add_argument("--skip-validate", action="store_true")
     parser.add_argument("--skip-rebuild", action="store_true")
@@ -764,6 +877,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     rebuild_all=args.rebuild_all,
                     configured_services=configured,
                 )
+                policy_impacted = args.rebuild_all or POLICY_SERVICE in services
+                if policy_impacted and not args.skip_policy_backup:
+                    create_live_policy_backup(
+                        expected_version=args.expect_version,
+                        head_sha=head_before,
+                        backup_dir=(ROOT / args.backup_dir) if not Path(args.backup_dir).is_absolute() else Path(args.backup_dir),
+                        dry_run=args.dry_run,
+                    )
+                elif policy_impacted:
+                    print("Policy backup: SKIPPED BY EXPLICIT OPERATOR OVERRIDE", flush=True)
                 rebuild(services, all_services=args.rebuild_all, no_deps=args.no_deps, dry_run=args.dry_run)
                 if not args.skip_health:
                     wait_for_health(args.health_url, args.health_timeout, args.expect_version, dry_run=args.dry_run)

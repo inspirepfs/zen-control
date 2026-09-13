@@ -34,6 +34,13 @@ from app.policy_groups import (
     policy_group_states,
     normalized_group_catalog,
 )
+from app.upgrade_safety import (
+    SCHEMA_NAME,
+    SCHEMA_RELEASE,
+    SCHEMA_VERSION,
+    finalize_upgrade_report,
+    prepare_policy_database_upgrade,
+)
 
 
 DEFAULT_SERVICES = [
@@ -86,7 +93,14 @@ class PolicyStore:
     def __init__(self, path: str):
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # v0.57: inspect and preserve the existing SQLite database before any
+        # CREATE/ALTER/UPDATE migration statement can run. Existing v0.56 and
+        # earlier databases have PRAGMA user_version=0 and are adopted into the
+        # formal schema-version contract only after the full migration succeeds.
+        preflight = prepare_policy_database_upgrade(self.path, target_version=SCHEMA_VERSION)
+        self.upgrade_report = dict(preflight)
         self._init_db()
+        self.upgrade_report = finalize_upgrade_report(preflight, self.path)
 
     @contextmanager
     def _db(self):
@@ -892,6 +906,25 @@ class PolicyStore:
                    )""",
                 (baseline_at,),
             )
+
+            # Formal schema lineage begins at v0.57. All older installations are
+            # first migrated through the additive compatibility logic above, then
+            # atomically marked current. Never advance user_version before those
+            # statements and data backfills have completed successfully.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS schema_migrations (
+                       version INTEGER PRIMARY KEY,
+                       release TEXT NOT NULL,
+                       name TEXT NOT NULL,
+                       applied_at TEXT NOT NULL
+                   )"""
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO schema_migrations
+                   (version, release, name, applied_at) VALUES (?, ?, ?, ?)""",
+                (SCHEMA_VERSION, SCHEMA_RELEASE, SCHEMA_NAME, baseline_at),
+            )
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @staticmethod
     def _operations_now_iso():
@@ -4525,6 +4558,21 @@ class PolicyStore:
             "safety_snapshot": safety["id"],
         }
 
+    def schema_status(self):
+        with self._db() as db:
+            version = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
+            rows = db.execute(
+                "SELECT version, release, name, applied_at FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        return {
+            "ok": version == SCHEMA_VERSION,
+            "version": version,
+            "target_version": SCHEMA_VERSION,
+            "release": SCHEMA_RELEASE,
+            "migrations": [dict(row) for row in rows],
+            "upgrade": dict(self.upgrade_report or {}),
+        }
+
     def database_integrity_report(self):
         required = {
             "profiles", "device_policy", "policy_templates", "bandwidth_presets",
@@ -4535,12 +4583,15 @@ class PolicyStore:
             "config_revision_state", "config_revisions", "outbox_events",
             "background_jobs", "background_scope_locks", "background_worker_metrics",
             "prepared_views", "reconciliation_requests", "notifications",
+            "schema_migrations",
         }
         try:
             with sqlite3.connect(self.path, timeout=5.0) as db:
                 db.row_factory = sqlite3.Row
                 db.execute("PRAGMA busy_timeout=5000")
                 quick = [row[0] for row in db.execute("PRAGMA quick_check").fetchall()]
+                foreign = db.execute("PRAGMA foreign_key_check").fetchall()
+                schema_version = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
                 tables = {
                     row[0] for row in db.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"
@@ -4552,12 +4603,23 @@ class PolicyStore:
                     counts[table] = int(
                         db.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
                     )
-            ok = quick == ["ok"] and not missing
+            ok = (
+                quick == ["ok"]
+                and not foreign
+                and not missing
+                and schema_version == SCHEMA_VERSION
+            )
             return {
                 "ok": ok,
                 "quick_check": quick,
+                "foreign_key_violations": len(foreign),
                 "missing_tables": missing,
                 "table_counts": counts,
+                "schema_version": schema_version,
+                "schema_target": SCHEMA_VERSION,
+                "schema_release": SCHEMA_RELEASE,
+                "upgrade_state": str((self.upgrade_report or {}).get("state") or "unknown"),
+                "upgrade_backup": bool((self.upgrade_report or {}).get("backup")),
                 "path": self.path,
                 "size_bytes": os.path.getsize(self.path) if os.path.exists(self.path) else 0,
             }
@@ -4565,8 +4627,14 @@ class PolicyStore:
             return {
                 "ok": False,
                 "quick_check": [],
+                "foreign_key_violations": -1,
                 "missing_tables": sorted(required),
                 "table_counts": {},
+                "schema_version": 0,
+                "schema_target": SCHEMA_VERSION,
+                "schema_release": SCHEMA_RELEASE,
+                "upgrade_state": str((self.upgrade_report or {}).get("state") or "unknown"),
+                "upgrade_backup": bool((self.upgrade_report or {}).get("backup")),
                 "path": self.path,
                 "size_bytes": os.path.getsize(self.path) if os.path.exists(self.path) else 0,
                 "error": str(exc),

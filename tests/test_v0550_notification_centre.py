@@ -286,8 +286,8 @@ class NotificationSurfaceContractTests(unittest.TestCase):
         self.assertIn("notification-history-row", self.css)
 
     def test_release_version_is_v0550(self):
-        self.assertIn('version="0.56.0"', self.main)
-        self.assertIn("Current release: **v0.56.0**", self.readme)
+        self.assertIn('version="0.57.0"', self.main)
+        self.assertIn("Current release: **v0.57.0**", self.readme)
         self.assertIn("## v0.55.2", (ROOT / "CHANGELOG.md").read_text())
 
 
