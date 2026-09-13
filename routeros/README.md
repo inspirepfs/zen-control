@@ -1,37 +1,42 @@
-# ZEN Control RouterOS Integration
+# RouterOS integration
 
-This directory contains **public, credential-free RouterOS inspection/verification helpers** and the documented authority assumptions used by ZEN.
-
-The v0.53.1 repository intentionally does not ship a blind "configure my firewall" script. Critical RouterOS rules are manually owned and ZEN's safety model depends on operators understanding that boundary. Future bootstrap scripts should be parameterized, idempotent and separately reviewable.
+ZEN Control keeps RouterOS as the enforcement authority. The application never exposes an arbitrary RouterOS command surface and does not silently repair malformed static critical firewall rules.
 
 ## Start read-only
 
-Upload/paste the commands in `inspect.rsc` to capture the router areas ZEN depends on. `verify.rsc` narrows the output to the principal ZEN authority namespaces.
+Run `inspect.rsc` first for a broad inventory and `verify.rsc` for the established restricted-device surfaces. Both are deliberately read-only.
 
-Both files are read-only: they contain `print`/`:put` commands only and do not add, set, move, remove, enable or disable configuration.
+For a new installation or disaster-recovery rebuild, use the consolidated [setup bundle](setup/README.md). It contains fail-closed operator templates for deployment-specific primitives plus idempotent current built-in service/DoH rules.
 
-## Core concepts
+## Static operator-owned authority
 
-ZEN expects a dedicated restricted-policy path with:
+ZEN validates, but does not runtime-create/repair, these critical concepts:
 
-- `Restricted_Devices` as the managed-device address list;
-- a restricted-web firewall chain and one `RW99 - Return` authority anchor;
-- the QUIC/HTTP3 restriction expected by the application;
-- deterministic app-owned `MC_*` / `MC|SVC|*` resources for approved custom services;
-- FastTrack disabled for, or explicitly excluding, restricted devices;
-- static DHCP identity for devices participating in controlled Kid Control migration.
+- global `MASTER - Block Restricted Internet` authority;
+- `MC - Per Device Block` authority;
+- `Restricted Devices - Web Policy` jump to `restricted-web`;
+- QUIC/HTTP3, DoT and DoQ restricted-device hardening;
+- `RW99 - Return` ordering;
+- global `Restricted Slow Internet` queue and named mode scripts;
+- built-in TLS/SNI classifier/drop rules;
+- a FastTrack posture that cannot bypass `Restricted_Devices`.
 
-Exact validation remains in the application. Do not "repair" a router simply by copying example output from documentation.
+App-owned dynamic lists/queues/schedulers use the documented `MC_*`/`MC-*` namespaces and remain bounded by the application write gate.
 
-## API account
+## Built-in services
 
-Use a dedicated RouterOS API account with only the permissions your deployment requires. Never store its password in `.rsc` files; put it in the host `.env` file, which is intentionally ignored by Git.
+The versioned setup bundle includes the concrete working contracts for:
+
+YouTube/GoogleVideo, ChatGPT, OpenAI, Netflix, Prime Video, BBC iPlayer, TikTok, Discord, Roblox, Steam, Xbox and PlayStation.
+
+These are TLS/SNI classifiers, not a claim that every protocol or endpoint used by those services is observable or blockable by SNI.
+
+## API and telemetry
+
+Use a dedicated RouterOS API account and restrict API reachability to the ZEN host. The current adapter uses the RouterOS API service on the configured `MIKROTIK_PORT` (8728 by default), so treat that path as trusted-LAN/management traffic.
+
+For retained network activity, RouterOS Traffic Flow/IPFIX can target the ZEN host on UDP/2055 where the bundled GoFlow2 service listens. See `setup/70-ipfix.template.rsc`.
 
 ## Kid Control
 
-During migration:
-
-- `/ip/kid-control` and `/ip/kid-control/device` are read as legacy source evidence;
-- `/ip/kid-control/device` remains write-forbidden;
-- the only bounded legacy authority mutation is the exact validated profile `disabled` flag during cutover/rollback;
-- legacy schedules/device membership are retained for rollback.
+Do not delete legacy Kid Control simply as part of RouterOS setup. ZEN's migration/cutover flow controls any authority transfer and may deliberately retain disabled legacy configuration as rollback evidence/safety net.

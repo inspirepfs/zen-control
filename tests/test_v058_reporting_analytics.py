@@ -173,7 +173,7 @@ class V058SourceContractTests(unittest.TestCase):
         cls.help = (ROOT / "app" / "help_content.py").read_text()
 
     def test_release_routes_ui_export_and_prepared_view_are_wired(self):
-        self.assertIn('version="0.58.0"', self.main)
+        self.assertIn('version="0.59.0"', self.main)
         self.assertIn('@app.get("/api/reporting/overview")', self.main)
         self.assertIn('@app.get("/reporting", response_class=HTMLResponse)', self.main)
         self.assertIn('@app.get("/reporting/export.csv")', self.main)

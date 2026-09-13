@@ -65,3 +65,13 @@ Keep a pull request coherent around one engineering objective. Explain:
 - whether a RouterOS mutation surface is added or widened.
 
 Do not include household-specific data, secrets or copied runtime databases.
+
+## License
+
+By submitting a contribution, you agree that it may be distributed under the project's **GNU AGPL v3.0 or later (`AGPL-3.0-or-later`)** license unless an explicit, accepted exception says otherwise.
+
+For public-release work also run:
+
+```bash
+python3 scripts/public_release_audit.py --history --deployment-markers
+```

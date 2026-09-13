@@ -217,8 +217,10 @@ services:
 
       FTLCONF_database_maxDBdays: "30"
 
+      # Keep split DNS declarative without embedding one household's identity.
+      # LAN clients resolve the configured ZEN hostname directly to this host.
       FTLCONF_dns_hosts: |-
-        192.168.2.247 zen.sykes.net.co
+        ${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set} ${ZEN_LOCAL_HOST:?ZEN_LOCAL_HOST must be set}
     ports:
       # DNS available on the LAN specifically through this host IP.
       - "${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set}:53:53/tcp"

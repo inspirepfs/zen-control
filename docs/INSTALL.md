@@ -83,7 +83,7 @@ A typical local simulation uses Mailpit at `mailpit:1025` with TLS disabled and 
 
 ## 3. RouterOS preparation
 
-Read [../routeros/README.md](../routeros/README.md) before enabling ZEN writes. Start with the supplied read-only inspection helpers and compare the router with the authority contract expected by the application.
+Read [../routeros/README.md](../routeros/README.md) before enabling ZEN writes. Start with the supplied read-only inspection helpers and compare the router with the authority contract expected by the application. For a new/rebuilt router, follow the reviewed [RouterOS setup bundle](../routeros/setup/README.md); its templates cover the exact current authority/service contracts without embedding household values.
 
 Do not paste credentials into RouterOS scripts or the repository.
 
@@ -116,7 +116,7 @@ ZEN_LAN_BIND_IP=192.168.1.10
 CADDY_CF_API_TOKEN=<DNS API token>
 ```
 
-Your LAN DNS should resolve `ZEN_LOCAL_HOST` directly to `ZEN_LAN_BIND_IP`. The DNS API token is passed only to Caddy; ZEN receives the local hostname and bind IP for sanitized commissioning status, never the token.
+Your LAN DNS should resolve `ZEN_LOCAL_HOST` directly to `ZEN_LAN_BIND_IP`. The DNS API token is passed only to Caddy; ZEN receives the local hostname and bind IP for sanitized commissioning status, never the token. The bundled Pi-hole service expresses that local host mapping declaratively from the same two environment values; no deployment-specific hostname or LAN IP is committed to Compose.
 
 Validate Caddy independently:
 
@@ -147,11 +147,11 @@ Run the host-side local TLS/PWA prerequisite proof using the real local hostname
 ```bash
 python3 scripts/transport_acceptance.py \
   --local-url https://zen.example.com/ \
-  --expect-version 0.58.0 \
+  --expect-version 0.59.0 \
   --require-hsts
 ```
 
-A local PASS proves the HTTPS health route, browser-security headers, HSTS, root-scope service worker and manifest prerequisites. It does **not** manufacture browser evidence. Open the HTTPS URL on the target Android/Chromium device and verify the PWA reports `READY`/`INSTALLED`, then enable browser push and send a push test from Notifications.
+A local PASS proves the HTTPS health route, browser-security headers, HSTS, root-scope service worker and manifest prerequisites. It does **not** manufacture browser evidence. For the initial public source release, Android/installed-PWA install, standalone and installed-PWA push evidence is explicitly **OPEN / DEFERRED** and non-blocking while representative device testing continues. Return to this gate later and close it only with real browser/device evidence.
 
 ## 6. Optional Cloudflare remote access
 
@@ -183,7 +183,7 @@ Or combine local and public proof in one report:
 python3 scripts/transport_acceptance.py \
   --local-url https://zen.example.com/ \
   --public-url https://zen-public.example.net/ \
-  --expect-version 0.58.0 \
+  --expect-version 0.59.0 \
   --require-hsts
 ```
 

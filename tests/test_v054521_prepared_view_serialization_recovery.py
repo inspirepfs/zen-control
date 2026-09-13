@@ -118,7 +118,7 @@ class RuntimePreparedWorkHealthTests(unittest.TestCase):
 
     def test_durable_worker_stats_failure_is_fail_closed(self):
         report = build_runtime_health(
-            version="0.58.0",
+            version="0.59.0",
             background_worker=_Snapshot({
                 "worker_alive": True,
                 "durable": {"available": False},

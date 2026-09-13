@@ -1,3 +1,13 @@
+# Changelog
+
+## v0.59.0 — Public Release Closure & RouterOS Setup Bundle
+
+- Consolidates the current RouterOS authority, mode, built-in service, known-DoH, FastTrack, API, IPFIX, local-DNS and DHCP-identity setup patterns under `routeros/setup/`, with fail-closed confirmation guards for deployment-specific mutating templates.
+- Selects `AGPL-3.0-or-later` for the project and documents contribution/publication expectations.
+- Parameterizes the Pi-hole split-DNS record using `ZEN_LAN_BIND_IP` + `ZEN_LOCAL_HOST` so no household hostname/IP is committed to Compose.
+- Extends `public_release_audit.py` with reachable-history secret scanning and optional local deployment-marker depersonalization checks that never print marker values.
+- Adds an operator guide and refreshes installation/public-release documentation. Screenshots are explicitly deferred; Android/installed-PWA manual install/standalone/push evidence remains OPEN / DEFERRED and is not falsely promoted to PASS.
+
 ## v0.58.0 — Reporting & Analytics
 
 - Adds a dedicated read-only Reporting & Analytics workbench with today/yesterday/7-day/30-day/custom windows.

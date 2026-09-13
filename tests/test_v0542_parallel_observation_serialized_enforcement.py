@@ -366,8 +366,8 @@ class V0542SourceContractTests(unittest.TestCase):
         self.assertIn("reconciler_status.router_mutation", template)
 
     def test_release_identity_is_v0542(self):
-        self.assertIn('version="0.58.0"', self.main)
-        self.assertIn("v0.58.0", (ROOT / "README.md").read_text())
+        self.assertIn('version="0.59.0"', self.main)
+        self.assertIn("v0.59.0", (ROOT / "README.md").read_text())
         self.assertIn("## v0.54.2 — Parallel observation / serialized enforcement", (ROOT / "CHANGELOG.md").read_text())
 
 

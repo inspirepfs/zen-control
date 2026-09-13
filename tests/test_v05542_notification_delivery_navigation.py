@@ -12,8 +12,8 @@ class NotificationDeliveryNavigationHotfixTests(unittest.TestCase):
         cls.readme = (ROOT / "README.md").read_text()
 
     def test_release_identity_is_v05542(self):
-        self.assertIn('version="0.58.0"', self.main)
-        self.assertIn("Current release: **v0.58.0**", self.readme)
+        self.assertIn('version="0.59.0"', self.main)
+        self.assertIn("Current release: **v0.59.0**", self.readme)
 
     def test_backend_allows_delivery_subsection(self):
         self.assertIn(

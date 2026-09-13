@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.58.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.58.0">
-  <link rel="stylesheet" href="/static/activity.css?v=0.58.0">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.58.0">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.58.0">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.59.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.59.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.59.0">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.59.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.59.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.59.0">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -66,6 +66,7 @@
   <a class="app-tab {{ 'active' if active_view == 'audit' else '' }}" data-tab="audit" href="/?view=audit&amp;section=recent#audit/recent">Audit</a>
   <a class="app-tab {{ 'active' if active_view == 'settings' else '' }}" data-tab="settings" href="/?view=settings&amp;section=parents#settings/parents">Settings</a>
   <a class="app-tab app-tab-help" data-tab="help" href="/help?topic={{ zen_help_for_context(active_view, active_section).key }}&amp;return_to={{ ('/?view=' ~ active_view ~ '&section=' ~ active_section ~ '#' ~ active_view ~ '/' ~ active_section)|urlencode }}">Help</a>
+  <a class="app-tab app-tab-source" href="https://github.com/inspirepfs/zen-control" target="_blank" rel="noopener noreferrer" aria-label="ZEN Control source code">Source</a>
 </nav>
 {% if flash_error %}<div class="flash flash-error">{{ flash_error }}</div>{% endif %}
 {% if flash_ok %}<div class="flash flash-ok">{{ flash_ok }}</div>{% endif %}

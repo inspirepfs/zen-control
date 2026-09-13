@@ -204,9 +204,9 @@ class NotificationIntelligenceSurfaceTests(unittest.TestCase):
         self.assertIn("never authorises a RouterOS write", self.help)
 
     def test_release_identity_is_v0553(self):
-        self.assertIn('version="0.58.0"', self.main)
-        self.assertIn('PWA_RELEASE = "0.58.0"', (ROOT / "app" / "pwa.py").read_text())
-        self.assertIn("const RELEASE = '0.58.0'", (ROOT / "app" / "static" / "service-worker.js").read_text())
+        self.assertIn('version="0.59.0"', self.main)
+        self.assertIn('PWA_RELEASE = "0.59.0"', (ROOT / "app" / "pwa.py").read_text())
+        self.assertIn("const RELEASE = '0.59.0'", (ROOT / "app" / "static" / "service-worker.js").read_text())
 
 
 if __name__ == "__main__":

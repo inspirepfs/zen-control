@@ -89,8 +89,8 @@ class PublicRepositoryContractTests(unittest.TestCase):
     def test_release_version_is_0531(self):
         main = (ROOT / "app/main.py").read_text()
         pwa = (ROOT / "app/pwa.py").read_text()
-        self.assertIn('version="0.58.0"', main)
-        self.assertIn('PWA_RELEASE = "0.58.0"', pwa)
+        self.assertIn('version="0.59.0"', main)
+        self.assertIn('PWA_RELEASE = "0.59.0"', pwa)
 
     def test_readme_is_product_first_and_changelog_owns_release_history(self):
         readme = (ROOT / "README.md").read_text()
@@ -147,7 +147,7 @@ class PublicRepositoryContractTests(unittest.TestCase):
         self.assertIn('"--others"', audit)
         self.assertIn('"--exclude-standard"', audit)
 
-    def test_public_release_audit_passes_with_license_as_manual_gate(self):
+    def test_public_release_audit_passes_with_selected_license(self):
         proc = subprocess.run(
             [sys.executable, "scripts/public_release_audit.py"],
             cwd=ROOT,
@@ -158,7 +158,11 @@ class PublicRepositoryContractTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("PUBLIC RELEASE AUDIT: PASS", proc.stdout)
-        self.assertIn("MANUAL GATE: choose an open-source license", proc.stdout)
+        self.assertNotIn("MANUAL GATE: choose an open-source license", proc.stdout)
+        license_text = (ROOT / "LICENSE").read_text()
+        self.assertIn("GNU AFFERO GENERAL PUBLIC LICENSE", license_text)
+        self.assertIn("Version 3, 19 November 2007", license_text)
+        self.assertIn("AGPL-3.0-or-later", (ROOT / "README.md").read_text())
 
 
 if __name__ == "__main__":

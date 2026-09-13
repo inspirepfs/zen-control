@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.59.0">
   <title>Sign in · ZEN Control</title>
 </head>
 <body class="login-bg">
@@ -51,6 +51,7 @@
     {% if login_mode != 'password' %}
       <p class="muted small auth-login-foot">{{ totp_count }} authenticator{{ '' if totp_count == 1 else 's' }} enrolled · {{ recovery_codes_remaining }} recovery code{{ '' if recovery_codes_remaining == 1 else 's' }} remaining.</p>
     {% endif %}
+    <p class="muted small auth-login-foot"><a href="https://github.com/inspirepfs/zen-control" target="_blank" rel="noopener noreferrer">Source code · AGPL-3.0-or-later</a></p>
   </main>
 </body>
 </html>

@@ -290,7 +290,7 @@ class ExternalDeliverySurfaceTests(unittest.TestCase):
         self.assertNotIn("RouterOSAdapter", external)
         self.assertIn("no RouterOS dependency", external)
         self.assertIn('authority": "notification-delivery-only-no-routeros-authority"', external)
-        self.assertIn('version="0.58.0"', self.main)
+        self.assertIn('version="0.59.0"', self.main)
 
 
 if __name__ == "__main__":

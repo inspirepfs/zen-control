@@ -4,7 +4,7 @@
  * network-only and are never queued for replay. Web Push payloads are shown
  * transiently by the browser and are not persisted by this service worker.
  */
-const RELEASE = '0.58.0';
+const RELEASE = '0.59.0';
 const CACHE_NAME = `zen-control-shell-${RELEASE}`;
 const OFFLINE_URL = '/static/offline.html';
 const SHELL_ASSETS = [

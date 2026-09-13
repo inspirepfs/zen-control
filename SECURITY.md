@@ -32,3 +32,9 @@ Particularly important reports include:
 ## Secret handling
 
 Never include `.env`, tunnel tokens, private keys, recovery codes, raw configuration exports or real household telemetry in an issue or pull request.
+
+## Public-source secret and depersonalization audit
+
+Before a public release run `python3 scripts/public_release_audit.py --history --deployment-markers`. The marker scan reads selected non-secret deployment identity values from the ignored local `.env` and reports only variable names plus source locations, never the values themselves. Current-tree identity leakage fails the gate; historical identity is surfaced for explicit review. High-confidence secret matches in reachable Git history fail the audit.
+
+Use a dedicated RouterOS API account, restrict the API service to the ZEN management path/host, and never publish a router administrator credential. The public RouterOS setup bundle contains placeholders/confirmation guards rather than deployment credentials.

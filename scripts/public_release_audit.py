@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """High-signal public-source hygiene checks for ZEN Control.
 
-This is intentionally conservative and deterministic. It is not a general
-secret scanner and does not replace manual review or credential rotation.
+The default scan checks exactly what Git could publish from the current tree.
+``--history`` additionally scans reachable Git blobs for high-confidence secret
+patterns. ``--deployment-markers`` loads selected non-secret identity values from
+the ignored local ``.env`` and checks that current source does not contain them;
+historical marker hits are reported as review warnings without printing values.
+
+This is intentionally conservative and deterministic. It complements, rather
+than replaces, credential rotation and manual review.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
@@ -33,12 +40,37 @@ SECRET_PATTERNS = (
     ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b")),
     ("openai-token", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{24,}\b")),
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("totp-uri", re.compile(r"otpauth://(?:totp|hotp)/[^\s]+", re.IGNORECASE)),
+    ("jwt-like-token", re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b")),
+)
+
+SECRET_ASSIGNMENT = re.compile(
+    r"(?m)^[ \t]*(?:export[ \t]+)?([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
+    r"[ \t]*[:=][ \t]*[\"']?([^\s\"'#]{8,})"
 )
 
 PLACEHOLDER_MARKERS = (
-    "replace-with-", "example.com", "example.net", "example.org", "<token>",
-    "<password>", "<dns api token>", "<dns-api-token>",
+    "replace-with-", "example.com", "example.net", "example.org", "example.invalid",
+    "example.test", "<token>", "<password>", "<dns api token>", "<dns-api-token>",
+    "documentation", "dummy", "fake", "changeme", "test-secret",
 )
+
+DEPLOYMENT_MARKER_KEYS = (
+    "ZEN_LOCAL_HOST",
+    "ZEN_PUBLIC_HOST",
+    "ZEN_LAN_BIND_IP",
+    "MIKROTIK_HOST",
+)
+
+
+def _run_git(args: list[str], *, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(ROOT), *args],
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
 
 def _git_visible_files(root: Path) -> list[Path] | None:
@@ -46,13 +78,7 @@ def _git_visible_files(root: Path) -> list[Path] | None:
     try:
         proc = subprocess.run(
             [
-                "git",
-                "-C",
-                str(root),
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
+                "git", "-C", str(root), "ls-files", "-z", "--cached", "--others",
                 "--exclude-standard",
             ],
             stdout=subprocess.PIPE,
@@ -76,17 +102,10 @@ def _git_visible_files(root: Path) -> list[Path] | None:
 
 
 def iter_files() -> list[Path]:
-    # In a working tree audit exactly what Git could publish: tracked files plus
-    # non-ignored untracked files. Local runtime material such as .env is
-    # intentionally excluded by .gitignore, while an accidentally tracked .env
-    # remains visible here and will still fail the checks below.
     git_files = _git_visible_files(ROOT)
     if git_files is not None:
         return git_files
 
-    # git archive/source-bundle fallback: there is no .git metadata, so inspect
-    # the supplied tree directly. Archives generated from Git should already
-    # contain source-visible files only.
     result: list[Path] = []
     for path in ROOT.rglob("*"):
         if not path.is_file():
@@ -98,16 +117,130 @@ def iter_files() -> list[Path]:
     return sorted(result)
 
 
-def is_text_candidate(path: Path) -> bool:
+def is_text_candidate(path: Path | str) -> bool:
+    path = Path(path)
     if path.name in {"Dockerfile", "Caddyfile", ".gitignore", ".dockerignore"}:
         return True
     return path.suffix.lower() in TEXT_SUFFIXES
 
 
-def main() -> int:
+def _placeholder(value: str) -> bool:
+    lowered = value.strip().lower()
+    return (
+        not lowered
+        or lowered.startswith("${")
+        or any(marker in lowered for marker in PLACEHOLDER_MARKERS)
+    )
+
+
+def secret_findings(text: str, location: str) -> list[str]:
+    findings: list[str] = []
+    for label, pattern in SECRET_PATTERNS:
+        for match in pattern.finditer(text):
+            matched = match.group(0)
+            # Source templates and tests legitimately construct/example OTP URIs;
+            # only a literal URI with embedded concrete material is a finding.
+            if label == "totp-uri" and (
+                "{" in matched or "%" in matched or "example" in matched.lower()
+                or location.startswith("tests/") or location.startswith("history:tests/")
+            ):
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            findings.append(f"{label} pattern: {location}:{line}")
+
+    suffix = Path(location.split("@", 1)[0].removeprefix("history:")).suffix.lower()
+    assignment_surface = suffix in {".env", ".yaml", ".yml", ".conf", ".cfg", ".ini", ".example"}
+    if assignment_surface:
+        for match in SECRET_ASSIGNMENT.finditer(text):
+            key, value = match.group(1), match.group(2)
+            if _placeholder(value):
+                continue
+            if value.startswith("/run/secrets/") or any(token in value for token in ("${", "{{", "}}")):
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            findings.append(f"literal secret-like assignment ({key}): {location}:{line}")
+    return findings
+
+
+def load_deployment_markers(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    parsed: dict[str, str] = {}
+    for raw in path.read_text(errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key in DEPLOYMENT_MARKER_KEYS and value and not _placeholder(value):
+            parsed[key] = value
+    return parsed
+
+
+def marker_findings(text: str, location: str, markers: dict[str, str]) -> list[str]:
+    findings: list[str] = []
+    for key, value in markers.items():
+        start = 0
+        while True:
+            pos = text.find(value, start)
+            if pos < 0:
+                break
+            line = text.count("\n", 0, pos) + 1
+            findings.append(f"deployment marker {key}: {location}:{line}")
+            start = pos + len(value)
+    return findings
+
+
+def iter_git_history_text() -> tuple[list[tuple[str, str]], str | None]:
+    """Return unique reachable historical text blobs as (location, text)."""
+    proc = _run_git(["rev-list", "--objects", "--all"])
+    if proc.returncode != 0:
+        return [], "Git history is unavailable"
+
+    blobs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in proc.stdout.decode(errors="replace").splitlines():
+        if not raw.strip():
+            continue
+        sha, _, rel = raw.partition(" ")
+        if not rel or sha in seen or not is_text_candidate(rel):
+            continue
+        seen.add(sha)
+        kind = _run_git(["cat-file", "-t", sha])
+        if kind.returncode != 0 or kind.stdout.strip() != b"blob":
+            continue
+        content = _run_git(["cat-file", "blob", sha])
+        if content.returncode != 0 or b"\x00" in content.stdout:
+            continue
+        try:
+            text = content.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        blobs.append((f"history:{rel}@{sha[:12]}", text))
+    return blobs, None
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--history", action="store_true", help="scan reachable Git history for high-confidence secret patterns")
+    parser.add_argument(
+        "--deployment-markers",
+        action="store_true",
+        help="load selected non-secret identity values from ignored .env and scan current source/history without printing values",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     failures: list[str] = []
     warnings: list[str] = []
     files = iter_files()
+    markers = load_deployment_markers(ROOT / ".env") if args.deployment_markers else {}
+
+    if args.deployment_markers and not (ROOT / ".env").exists():
+        warnings.append("deployment-marker scan requested but local .env is absent; current source still received static hygiene checks")
 
     for path in files:
         rel = path.relative_to(ROOT)
@@ -125,10 +258,8 @@ def main() -> int:
             text = path.read_text(errors="strict")
         except (UnicodeDecodeError, OSError):
             continue
-        for label, pattern in SECRET_PATTERNS:
-            for match in pattern.finditer(text):
-                line = text.count("\n", 0, match.start()) + 1
-                failures.append(f"{label} pattern: {rel}:{line}")
+        failures.extend(secret_findings(text, str(rel)))
+        failures.extend(marker_findings(text, str(rel), markers))
 
     env_example = ROOT / ".env.example"
     if not env_example.exists():
@@ -141,9 +272,7 @@ def main() -> int:
             key, value = stripped.split("=", 1)
             upper = key.upper()
             if any(word in upper for word in ("PASSWORD", "SECRET", "TOKEN", "KEY")) and value:
-                lowered = value.lower()
-                if not any(marker in lowered for marker in PLACEHOLDER_MARKERS):
-                    # Empty values are allowed; obvious sample defaults for non-secret identity are irrelevant.
+                if not _placeholder(value):
                     failures.append(f"non-placeholder secret-like example value: .env.example:{number} ({key})")
 
     readme = ROOT / "README.md"
@@ -151,27 +280,62 @@ def main() -> int:
         failures.append("README.md must start with the product overview, not release notes")
 
     required = [
-        "CHANGELOG.md", "SECURITY.md", "CONTRIBUTING.md",
+        "LICENSE", "CHANGELOG.md", "SECURITY.md", "CONTRIBUTING.md",
         "docs/ARCHITECTURE.md", "docs/INSTALL.md", "docs/PUBLIC_RELEASE.md",
-        "routeros/README.md", "routeros/inspect.rsc", "routeros/verify.rsc",
+        "docs/OPERATOR_GUIDE.md", "routeros/README.md", "routeros/inspect.rsc",
+        "routeros/verify.rsc", "routeros/setup/README.md",
+        "routeros/setup/10-core-authority.template.rsc",
+        "routeros/setup/20-global-mode.template.rsc",
+        "routeros/setup/30-built-in-services.rsc",
+        "routeros/setup/40-known-doh-hardening.rsc",
+        "routeros/setup/50-fasttrack.template.rsc",
+        "routeros/setup/60-api-user.template.rsc",
+        "routeros/setup/70-ipfix.template.rsc",
+        "routeros/setup/80-local-dns.template.rsc",
+        "routeros/setup/90-dhcp-reservation.template.rsc",
+        "routeros/setup/99-verify.rsc",
     ]
     for rel in required:
         if not (ROOT / rel).exists():
             failures.append(f"missing public-repository file: {rel}")
 
-    if not (ROOT / "LICENSE").exists() and not (ROOT / "LICENSE.md").exists():
-        warnings.append("MANUAL GATE: choose an open-source license before changing repository visibility to public")
+    source_repo = "https://github.com/inspirepfs/zen-control"
+    for rel in ("app/templates/login.html", "app/templates/index.html"):
+        if source_repo not in (ROOT / rel).read_text(errors="ignore"):
+            failures.append(f"AGPL network source link missing from {rel}")
+
+    compose = (ROOT / "docker-compose.yml").read_text(errors="ignore")
+    expected_split_dns = "${ZEN_LAN_BIND_IP:?ZEN_LAN_BIND_IP must be set} ${ZEN_LOCAL_HOST:?ZEN_LOCAL_HOST must be set}"
+    if expected_split_dns not in compose:
+        failures.append("Pi-hole split-DNS host record must use ZEN_LAN_BIND_IP + ZEN_LOCAL_HOST rather than deployment literals")
+
+    history_count = 0
+    if args.history:
+        blobs, problem = iter_git_history_text()
+        if problem:
+            warnings.append(problem)
+        else:
+            history_count = len(blobs)
+            for location, text in blobs:
+                failures.extend(secret_findings(text, location))
+                # Historical identity is a review/depersonalization signal rather
+                # than a secret. Report it without values so an operator can
+                # choose history rewrite or explicit acceptance before publish.
+                for item in marker_findings(text, location, markers):
+                    warnings.append("historical " + item)
 
     if failures:
         print("PUBLIC RELEASE AUDIT: FAIL")
-        for item in failures:
+        for item in sorted(set(failures)):
             print(f"FAIL: {item}")
-        for item in warnings:
+        for item in sorted(set(warnings)):
             print(f"WARN: {item}")
         return 1
 
-    print(f"PUBLIC RELEASE AUDIT: PASS · files={len(files)}")
-    for item in warnings:
+    suffix = f" · history_blobs={history_count}" if args.history else ""
+    marker_suffix = f" · deployment_markers={len(markers)}" if args.deployment_markers else ""
+    print(f"PUBLIC RELEASE AUDIT: PASS · files={len(files)}{suffix}{marker_suffix}")
+    for item in sorted(set(warnings)):
         print(f"WARN: {item}")
     return 0
 

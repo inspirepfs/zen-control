@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.58.0** — Reporting & Analytics: adds a read-only household reporting workbench with period comparisons, daily trends, device/service movers, classification quality, policy signals, notification/incident lifecycle trends and CSV export while preserving evidence boundaries.
+> Current release: **v0.59.0** — Public Release Closure: consolidates operator documentation and RouterOS setup templates, selects AGPL-3.0-or-later, parameterizes deployment-specific split DNS, and adds current-tree/history secret + depersonalization checks. Android/installed-PWA manual validation remains explicitly OPEN for later testing.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -94,19 +94,13 @@ ZEN deliberately does **not** own every RouterOS rule.
 
 If authority validation fails, automatic enforcement is held closed for the affected write path rather than guessing a repair.
 
-## Screenshots
+## Public-release status
 
-The repository intentionally does not ship household screenshots containing live device names, addresses or activity. Sanitized screenshots are planned before public launch; the capture checklist is in [docs/screenshots/README.md](docs/screenshots/README.md).
+The initial public source release is intentionally text-first. Screenshots are deferred until real product captures can be sanitized and reviewed; screenshot absence is **not** a release gate.
 
-Useful surfaces to show are:
+The Android/installed-PWA commissioning check is also deliberately **OPEN / DEFERRED** while representative device testing continues. Server-side HTTPS/PWA prerequisites are qualified, but install/standalone/push behaviour must not be presented as PASS until real-device evidence exists. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
 
-- Dashboard / connected system health
-- Managed devices and Device 360
-- Effective policy explainability
-- Policy Simulation
-- Classification Intelligence
-- Operational Diagnostics
-- MikroTik Kid Control migration/authority state
+The consolidated RouterOS bootstrap/recovery templates live in [routeros/setup/](routeros/setup/README.md). They cover core authority, global modes, all current built-in service classifiers, known-DoH hardening, FastTrack guidance, a dedicated API-user pattern, IPFIX, split DNS and DHCP identity.
 
 ## Requirements
 
@@ -289,6 +283,6 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## License
 
-A final open-source license is intentionally **not selected in v0.54.4**. The repository may be reviewed privately while the choice between a strong network copyleft license (AGPL-3.0) and a permissive license (Apache-2.0) is made. **Choose and add the root `LICENSE` file before changing the GitHub repository to public.**
+ZEN Control is licensed under **GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`)**. See [LICENSE](LICENSE) for the full license text. The network-copyleft model is deliberate for a self-hosted control plane: modified versions offered to users over a network must continue to make their corresponding source available under the AGPL terms.
 
-That is an explicit public-release gate, not an accidental omission. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
+The application exposes a **Source** link to this repository from both the sign-in surface and the authenticated main navigation. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md) for the release/compliance gate.
