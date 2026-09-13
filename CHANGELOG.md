@@ -1,3 +1,16 @@
+## v0.56.0 — Secure Transport & PWA Commissioning
+
+- Promotes local HTTPS/PWA commissioning from an implicit deployment detail to a first-class sanitized transport contract while keeping optional Cloudflare remote access separate.
+- Extends `zen_secure_transport_v2` with local HTTPS host/bind readiness, secure-cookie and Host allowlist hardening, optional remote Access readiness, and PWA secure-origin/browser-validation state.
+- Passes only non-secret local HTTPS identity (`ZEN_LOCAL_HOST`, `ZEN_LAN_BIND_IP`) into the application; the Cloudflare DNS API token remains isolated to Caddy and tunnel-token material remains isolated to cloudflared.
+- Adds `scripts/transport_acceptance.py`, a credential-free host probe that performs normal CA/hostname TLS validation, checks `/health/live`, required browser-security headers, HSTS when requested, root-scope service-worker delivery and the installable manifest; optional public probing reuses the existing unauthenticated Cloudflare Access challenge proof.
+- Tightens the environment contract so enabling Secure cookies requires an explicit Host allowlist covering the local HTTPS host and `127.0.0.1` release-health path; remote mode additionally requires the public host to be covered. Local HTTPS with insecure cookies remains a visible commissioning warning rather than being silently treated as complete.
+- Exposes local HTTPS, remote-access and PWA server-prerequisite states in Settings and `/api/pwa/status`, while keeping browser installability, service-worker control, notification permission and push subscription as explicit live browser evidence.
+- Emits HSTS for deliberately Secure-cookie HTTPS deployments whether remote access is enabled or not. Browsers ignore HSTS received over plain HTTP, so direct HTTP health access is not trusted as proof of HTTPS.
+- Keeps secure transport as post-core commissioning evidence: it cannot change the eight application readiness checks, policy state, RouterOS authority, notification evidence or enforcement behaviour.
+
+Authority boundary: transport/PWA commissioning is observation and browser-edge hardening only. It has no RouterOS adapter, no policy mutation path and no background enforcement authority.
+
 ## v0.55.4.2 — Notification Delivery Navigation Hotfix
 
 - Fixes the Notifications subsection navigation so the existing **Delivery** surface is actually exposed in the generated sub-navigation between Intelligence and History.

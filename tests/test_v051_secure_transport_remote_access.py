@@ -16,6 +16,8 @@ class SecureTransportConfigTests(unittest.TestCase):
             "ZEN_REMOTE_ACCESS_ENABLED": "0",
             "ZEN_SECURE_COOKIES": "0",
             "ZEN_PUBLIC_HOST": "",
+            "ZEN_LOCAL_HOST": "zen.local.example.net",
+            "ZEN_LAN_BIND_IP": "192.0.2.10",
             "ZEN_ALLOWED_HOSTS": "",
             "ZEN_CLOUDFLARE_ACCESS_PROTECTED": "0",
             "ZEN_HSTS_MAX_AGE": "31536000",
@@ -28,8 +30,11 @@ class SecureTransportConfigTests(unittest.TestCase):
         status = cfg.status("0.55.2")
         self.assertFalse(cfg.remote_access_enabled)
         self.assertFalse(cfg.secure_cookies)
-        self.assertEqual(status["state"], "disabled")
+        self.assertEqual(status["state"], "configuration_incomplete")
         self.assertFalse(status["remote_ready"])
+        self.assertEqual(status["remote_access"]["state"], "disabled")
+        self.assertTrue(status["local_https"]["configured"])
+        self.assertFalse(status["local_https"]["hardened"])
         self.assertEqual(status["live_external_validation"], "not_run")
 
     def test_remote_ready_requires_public_host_secure_cookie_access_and_host_allowlist(self):
@@ -37,7 +42,7 @@ class SecureTransportConfigTests(unittest.TestCase):
             ZEN_REMOTE_ACCESS_ENABLED="1",
             ZEN_SECURE_COOKIES="1",
             ZEN_PUBLIC_HOST="zen.example.net",
-            ZEN_ALLOWED_HOSTS="zen.example.net,localhost,127.0.0.1",
+            ZEN_ALLOWED_HOSTS="zen.example.net,zen.local.example.net,localhost,127.0.0.1",
             ZEN_CLOUDFLARE_ACCESS_PROTECTED="1",
         )
         status = cfg.status("0.55.2")
@@ -54,9 +59,9 @@ class SecureTransportConfigTests(unittest.TestCase):
             ZEN_CLOUDFLARE_ACCESS_PROTECTED="1",
         )
         status = cfg.status("0.55.2")
-        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["remote_access"]["state"], "blocked")
         self.assertFalse(status["remote_ready"])
-        failed = {item["key"] for item in status["checks"] if item["state"] == "fail"}
+        failed = {item["key"] for item in status["remote_access"]["checks"] if item["state"] == "fail"}
         self.assertIn("secure_cookie", failed)
 
     def test_remote_mode_requires_operator_confirmation_of_access_protection(self):
@@ -141,8 +146,8 @@ class SecureTransportSourceTests(unittest.TestCase):
         cls.script = (ROOT / "scripts/https_acceptance.py").read_text()
 
     def test_release_version_and_assets_are_current(self):
-        self.assertIn('version="0.55.4.2"', self.main)
-        self.assertIn('/static/app.css?v=0.55.4.2', self.index)
+        self.assertIn('version="0.56.0"', self.main)
+        self.assertIn('/static/app.css?v=0.56.0', self.index)
         self.assertIn("v0.55.2", self.readme)
 
     def test_session_secure_flag_is_configuration_driven(self):
@@ -157,7 +162,7 @@ class SecureTransportSourceTests(unittest.TestCase):
     def test_transport_api_and_operations_ui_are_authenticated_and_visible(self):
         self.assertIn('@app.get("/api/security/transport")', self.main)
         self.assertIn('Depends(require_role("admin", "operator", "viewer"))', self.main)
-        self.assertIn("Secure transport &amp; remote access", self.index)
+        self.assertIn("Secure transport &amp; PWA commissioning", self.index)
         self.assertIn("/api/security/transport", self.index)
 
     def test_response_security_headers_are_applied_without_csp_feature_creep(self):
@@ -269,7 +274,7 @@ class PostCoreReadinessSeparationTests(unittest.TestCase):
     def report(self, transport):
         from app.release_readiness import build_release_readiness
         return build_release_readiness(
-            version="0.55.4.2",
+            version="0.56.0",
             operations={"ok": True, "issues": []},
             startup={"status": "ready", "issues": []},
             diagnostics={"overall": "healthy", "counts": {"healthy": 15, "warning": 0, "critical": 0, "offline": 0}, "checks": []},

@@ -29,7 +29,7 @@ ZEN uses these configuration classes:
 - **conditional** — required only when its owning feature is enabled;
 - **conditional-secret** — a secret required only for an enabled optional feature;
 - **internal** — container/runtime wiring with a safe bounded default or a hard-coded Compose value; not a host `.env` setting;
-- **deprecated** — retained temporarily for compatibility and reported explicitly by the validator. There are no deprecated entries in v0.55.4.2.
+- **deprecated** — retained temporarily for compatibility and reported explicitly by the validator. There are no deprecated entries in v0.56.0.
 
 The older `SUMMARY_*` variables remain **active**, not deprecated: they belong to Parent Summary delivery and are separate from the v0.55 external Notification Delivery adapters.
 
@@ -40,7 +40,9 @@ The deployment validator currently fail-closes these relationships:
 - `ZEN_SMTP_ENABLED=1` requires `ZEN_SMTP_HOST`, `ZEN_SMTP_FROM` and `ZEN_SMTP_TO`;
 - SMTP implicit SSL and STARTTLS cannot both be enabled;
 - `ZEN_WEBHOOK_ALLOW_HTTP=1` requires a webhook signing secret, because HTTP is supported only for the local signed simulator path;
-- `ZEN_REMOTE_ACCESS_ENABLED=1` requires the public host, explicit allowed hosts, the Cloudflare tunnel-token file reference, secure cookies and confirmed Cloudflare Access protection.
+- `ZEN_SECURE_COOKIES=1` requires an explicit `ZEN_ALLOWED_HOSTS` entry covering `ZEN_LOCAL_HOST` plus `127.0.0.1` so release health checks cannot be locked out;
+- local HTTPS with `ZEN_SECURE_COOKIES=0` is accepted as an upgrade-safe configuration but is reported as incomplete commissioning;
+- `ZEN_REMOTE_ACCESS_ENABLED=1` requires the public host, explicit allowed hosts covering that public host, the Cloudflare tunnel-token file reference, secure cookies and confirmed Cloudflare Access protection.
 
 Subsystems whose enablement lives in `policy.db` rather than `.env` still validate their environment requirements at their owning runtime boundary.
 

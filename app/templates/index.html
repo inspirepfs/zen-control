@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.55.4.2">
-  <link rel="stylesheet" href="/static/layout.css?v=0.55.4.2">
-  <link rel="stylesheet" href="/static/activity.css?v=0.55.4.2">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.55.4.2">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.4.2">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.4.2">
+  <link rel="stylesheet" href="/static/app.css?v=0.56.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.56.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.56.0">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.56.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.56.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.56.0">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -2694,6 +2694,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
               <button type="button" class="primary compact" data-pwa-install hidden>Install ZEN Control</button>
             </div>
             <p class="pwa-security-note">Online-first by design: the installed app caches presentation assets only. Household policy, device activity, authentication responses and changes are never stored for offline viewing or queued for later replay.</p>
+            <p class="muted small">Server secure-origin prerequisite: <strong>{{ 'READY' if secure_transport.pwa.secure_origin_configured else 'BLOCKED' }}</strong>. Browser installability, service-worker control and push permission are validated on this device after HTTPS commissioning.</p>
           </div>
         </div>
 
@@ -3477,9 +3478,11 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
         <a class="button-link" href="/performance">Open performance metrics</a>
       </div>
       <div class="setting-item">
-        <strong>Secure transport &amp; remote access</strong>
-        <span class="muted">State: <strong>{{ secure_transport.state|replace('_', ' ')|upper }}</strong>{% if secure_transport.public_host %} · {{ secure_transport.public_host }}{% endif %}. Cloudflare configuration readiness is separate from live public-edge proof.</span>
-        <span class="muted small">Secure cookie {{ 'ON' if secure_transport.secure_cookies else 'OFF' }} · Host allowlist {{ 'ON' if secure_transport.host_allowlist_enforced else 'OFF' }} · Access protection {{ 'CONFIRMED' if secure_transport.cloudflare_access_protected else 'NOT CONFIRMED' }}</span>
+        <strong>Secure transport &amp; PWA commissioning</strong>
+        <span class="muted">State: <strong>{{ secure_transport.state|replace('_', ' ')|upper }}</strong>. Local HTTPS and optional remote Access are qualified separately; configuration readiness is not live certificate/browser proof.</span>
+        <span class="muted small">Local HTTPS: <strong>{{ secure_transport.local_https.state|replace('_', ' ')|upper }}</strong>{% if secure_transport.local_https.host %} · {{ secure_transport.local_https.host }} → {{ secure_transport.local_https.bind_ip }}{% endif %}</span>
+        <span class="muted small">Secure cookie {{ 'ON' if secure_transport.secure_cookies else 'OFF' }} · Host allowlist {{ 'ON' if secure_transport.host_allowlist_enforced else 'OFF' }} · PWA server prerequisite {{ 'READY' if secure_transport.pwa.secure_origin_configured else 'BLOCKED' }}</span>
+        <span class="muted small">Remote access: <strong>{{ secure_transport.remote_access.state|replace('_', ' ')|upper }}</strong>{% if secure_transport.public_host %} · {{ secure_transport.public_host }}{% endif %} · Access protection {{ 'CONFIRMED' if secure_transport.cloudflare_access_protected else 'NOT CONFIRMED' }}</span>
         <a class="button-link" href="/api/security/transport">Open transport JSON</a>
       </div>
       <div class="setting-item">

@@ -272,7 +272,7 @@ _TOPICS = {
         "release_readiness", "Operations", "Final release readiness",
         "The v0.50 release gate composes existing runtime, diagnostics, performance, recovery and shared-display evidence without creating a second enforcement authority.",
         does=("Runs a non-destructive export/import/reopen smoke against a temporary policy database.", "Names bounded sanitized diagnostic warning/blocker identities directly in release evidence so a PENDING/FAIL dependency gate explains what requires review.", "Requires affirmative live performance and controlled-restart evidence before reporting PASS."),
-        watch=("PENDING is not PASS and missing evidence is never converted to healthy state.", "HTTPS/secure remote access remains post-core commissioning; Notification Centre attention remains separate from RouterOS authority and public-edge readiness."),
+        watch=("PENDING is not PASS and missing evidence is never converted to healthy state.", "HTTPS/PWA secure transport remains post-core commissioning; local TLS, browser PWA evidence and optional public Access proof remain separate from RouterOS authority and Notification Centre attention."),
         related=(("Diagnostics", "/diagnostics"), ("Performance", "/performance"), ("Operations", "/?view=settings&section=operations#settings/operations")),
     ),
     "device_360": _topic(
@@ -318,7 +318,7 @@ _TOPICS = {
     ),
     "secure_transport": _topic(
         "secure_transport", "Tablet & access", "Secure transport and remote access",
-        "Secure transport prepares ZEN for HTTPS through an outbound-only Cloudflare Tunnel while retaining ZEN's own authentication, TOTP/shared-display lock and RouterOS authority boundaries.",
+        "Secure transport commissions local Caddy HTTPS first and can optionally add outbound-only Cloudflare Tunnel/Access remote access while retaining ZEN's own authentication, TOTP/shared-display lock and RouterOS authority boundaries.",
         does=("Uses Secure session cookies when remote access is enabled.", "Can enforce an explicit Host allowlist and reports whether Cloudflare Access protection has been operator-confirmed."),
         watch=("Configuration readiness is not live Internet proof; validate the public Access challenge and an authenticated ZEN journey after starting the tunnel.", "Once Secure cookies are enabled, authenticated browser sessions must use the HTTPS hostname rather than direct LAN HTTP."),
         related=(("Parent access", "/?view=settings&section=parents#settings/parents"), ("Operations", "/?view=settings&section=operations#settings/operations")),

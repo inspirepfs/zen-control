@@ -36,9 +36,11 @@ Browser push, SMTP and webhook delivery share durable per-attempt lifecycle evid
 
 The optional `test-tools` Compose profile adds Mailpit and a local signed webhook sink so the real SMTP/HTTP adapters, retry behavior and failure handling can be exercised without any external service. These simulators are test infrastructure only and add no monitoring or mutation authority.
 
-### HTTPS and remote access
+### HTTPS, remote access and PWA commissioning
 
-Local HTTPS is provided by Caddy using DNS-01 certificate issuance. Remote access is optional and uses Cloudflare Access plus an outbound Cloudflare Tunnel. Neither path changes RouterOS policy authority.
+Local HTTPS is provided by Caddy using DNS-01 certificate issuance. ZEN receives only the non-secret local hostname/bind identity so it can report configuration readiness; the DNS API token remains isolated to Caddy. Secure-cookie commissioning requires an explicit Host allowlist and can be host-probed with normal certificate/hostname validation plus service-worker/manifest checks.
+
+Remote access is optional and uses Cloudflare Access plus an outbound Cloudflare Tunnel. The public-edge probe proves only that an unauthenticated request is intercepted by Access; authenticated browser/PWA use remains separate evidence. Neither local HTTPS, PWA commissioning nor remote access changes RouterOS policy authority.
 
 ## Authority boundaries
 

@@ -251,6 +251,19 @@ def _truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _allowed_host_covers(raw: str | None, target: str | None) -> bool:
+    host = str(target or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    for item in str(raw or "").split(","):
+        candidate = item.strip().lower().rstrip(".")
+        if candidate == host:
+            return True
+        if candidate.startswith("*.") and host.endswith(candidate[1:]):
+            return True
+    return False
+
+
 def _secret_example_safe(value: str) -> bool:
     text = value.strip().lower()
     return not text or any(marker in text for marker in SAFE_SECRET_MARKERS)
@@ -337,6 +350,20 @@ def validate_contract(example_path: Path, local_path: Path | None) -> tuple[list
         if _truthy(values.get("ZEN_WEBHOOK_ALLOW_HTTP")) and not values.get("ZEN_WEBHOOK_SIGNING_SECRET", "").strip():
             errors.append("ZEN_WEBHOOK_ALLOW_HTTP=1 requires ZEN_WEBHOOK_SIGNING_SECRET")
 
+        local_host = values.get("ZEN_LOCAL_HOST", "").strip()
+        allowed_hosts = values.get("ZEN_ALLOWED_HOSTS", "").strip()
+        secure_cookies = _truthy(values.get("ZEN_SECURE_COOKIES"))
+        if secure_cookies:
+            if not allowed_hosts:
+                errors.append("ZEN_SECURE_COOKIES=1 requires ZEN_ALLOWED_HOSTS")
+            else:
+                if not _allowed_host_covers(allowed_hosts, local_host):
+                    errors.append("ZEN_SECURE_COOKIES=1 requires ZEN_ALLOWED_HOSTS to cover ZEN_LOCAL_HOST")
+                if not _allowed_host_covers(allowed_hosts, "127.0.0.1"):
+                    errors.append("ZEN_SECURE_COOKIES=1 requires ZEN_ALLOWED_HOSTS to cover 127.0.0.1 for local release health checks")
+        elif local_host:
+            warnings.append("Local HTTPS is configured but ZEN_SECURE_COOKIES=0; secure-session commissioning remains incomplete")
+
         if _truthy(values.get("ZEN_REMOTE_ACCESS_ENABLED")):
             remote_required = (
                 "ZEN_PUBLIC_HOST",
@@ -346,10 +373,12 @@ def validate_contract(example_path: Path, local_path: Path | None) -> tuple[list
             missing_remote = [name for name in remote_required if not values.get(name, "").strip()]
             if missing_remote:
                 errors.append("Remote access is enabled but required variable(s) are empty: " + ", ".join(missing_remote))
-            if not _truthy(values.get("ZEN_SECURE_COOKIES")):
+            if not secure_cookies:
                 errors.append("ZEN_REMOTE_ACCESS_ENABLED=1 requires ZEN_SECURE_COOKIES=1")
             if not _truthy(values.get("ZEN_CLOUDFLARE_ACCESS_PROTECTED")):
                 errors.append("ZEN_REMOTE_ACCESS_ENABLED=1 requires ZEN_CLOUDFLARE_ACCESS_PROTECTED=1")
+            if values.get("ZEN_PUBLIC_HOST", "").strip() and not _allowed_host_covers(allowed_hosts, values.get("ZEN_PUBLIC_HOST")):
+                errors.append("ZEN_REMOTE_ACCESS_ENABLED=1 requires ZEN_ALLOWED_HOSTS to cover ZEN_PUBLIC_HOST")
 
     classes: dict[str, int] = {}
     for name in user_vars:

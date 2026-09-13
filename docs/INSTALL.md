@@ -106,9 +106,9 @@ docker compose ps
 docker compose logs --tail=100 mikrotik-control
 ```
 
-## 5. Local HTTPS
+## 5. Local HTTPS and PWA commissioning
 
-The bundled Caddy image includes the Cloudflare DNS provider. Configure:
+The bundled Caddy image includes the Cloudflare DNS provider. Configure the non-secret local identity and the DNS API credential in `.env`:
 
 ```text
 ZEN_LOCAL_HOST=zen.example.com
@@ -116,7 +116,7 @@ ZEN_LAN_BIND_IP=192.168.1.10
 CADDY_CF_API_TOKEN=<DNS API token>
 ```
 
-Your LAN DNS should resolve `ZEN_LOCAL_HOST` directly to `ZEN_LAN_BIND_IP`.
+Your LAN DNS should resolve `ZEN_LOCAL_HOST` directly to `ZEN_LAN_BIND_IP`. The DNS API token is passed only to Caddy; ZEN receives the local hostname and bind IP for sanitized commissioning status, never the token.
 
 Validate Caddy independently:
 
@@ -125,9 +125,37 @@ docker compose run --rm --no-deps zen-local-https \
   caddy validate --config /etc/caddy/Caddyfile
 ```
 
+Before enabling Secure cookies, make sure the Host allowlist includes the local HTTPS hostname and the loopback health-check identity, for example:
+
+```text
+ZEN_ALLOWED_HOSTS=zen.example.com,localhost,127.0.0.1
+```
+
+Then enable Secure cookies and recreate ZEN:
+
+```text
+ZEN_SECURE_COOKIES=1
+```
+
+```bash
+python3 scripts/env_validate.py
+docker compose up -d --force-recreate mikrotik-control zen-local-https
+```
+
+Run the host-side local TLS/PWA prerequisite proof using the real local hostname. Normal certificate-chain and hostname validation remain enabled; there is no insecure TLS bypass:
+
+```bash
+python3 scripts/transport_acceptance.py \
+  --local-url https://zen.example.com/ \
+  --expect-version 0.56.0 \
+  --require-hsts
+```
+
+A local PASS proves the HTTPS health route, browser-security headers, HSTS, root-scope service worker and manifest prerequisites. It does **not** manufacture browser evidence. Open the HTTPS URL on the target Android/Chromium device and verify the PWA reports `READY`/`INSTALLED`, then enable browser push and send a push test from Notifications.
+
 ## 6. Optional Cloudflare remote access
 
-Remote access is disabled by default. Create the Cloudflare Access application **before** publishing the Tunnel route. The route should point to:
+Remote access is optional and remains disabled by default. Create the Cloudflare Access application **before** publishing the Tunnel route. The route should point to:
 
 ```text
 http://mikrotik-control:8080
@@ -135,7 +163,7 @@ http://mikrotik-control:8080
 
 Store the remotely-managed tunnel token outside the source tree. The pinned cloudflared container runs as UID/GID `65532:65532`; a host token file can therefore be owned `root:65532` with mode `0640`.
 
-Enable the relevant `.env` settings only after Access and the Tunnel route are protected.
+When remote access is deliberately enabled, the Host allowlist must cover both the local hostname and `ZEN_PUBLIC_HOST`; `ZEN_SECURE_COOKIES=1` and `ZEN_CLOUDFLARE_ACCESS_PROTECTED=1` are mandatory.
 
 Start the connector profile explicitly:
 
@@ -143,7 +171,23 @@ Start the connector profile explicitly:
 docker compose --profile remote-access up -d cloudflared
 ```
 
-Use `scripts/https_acceptance.py` from an external client to prove unauthenticated requests are intercepted by Cloudflare Access.
+Prove the unauthenticated public edge is intercepted by Cloudflare Access:
+
+```bash
+python3 scripts/https_acceptance.py https://zen-public.example.net/
+```
+
+Or combine local and public proof in one report:
+
+```bash
+python3 scripts/transport_acceptance.py \
+  --local-url https://zen.example.com/ \
+  --public-url https://zen-public.example.net/ \
+  --expect-version 0.56.0 \
+  --require-hsts
+```
+
+The public probe deliberately never logs in and accepts no credentials. An authenticated remote ZEN/PWA journey remains a manual commissioning check after the Access challenge is proven.
 
 ## 7. First application commissioning
 

@@ -71,6 +71,8 @@ class EnvironmentContractTests(unittest.TestCase):
             if ref.required and not values.get(name):
                 values[name] = f"configured-{name.lower()}"
         values["SESSION_SECRET"] = "SUPER-SECRET-DO-NOT-PRINT"
+        values["ZEN_SECURE_COOKIES"] = "1"
+        values["ZEN_ALLOWED_HOSTS"] = f"{values['ZEN_LOCAL_HOST']},localhost,127.0.0.1"
         with tempfile.TemporaryDirectory() as tmp:
             local = Path(tmp) / ".env"
             _write_env(local, values)

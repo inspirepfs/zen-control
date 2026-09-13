@@ -65,7 +65,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.55.4.2")
+app = FastAPI(title="ZEN Control", version="0.56.0")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -1617,8 +1617,16 @@ def pwa_icon(size: int):
 @app.get("/api/pwa/status")
 def pwa_status(user=Depends(require_role("admin", "operator", "viewer"))):
     """Document the server-side PWA/security contract for the installed client."""
+    transport = current_secure_transport_status()
     return {
         **status_contract(app.version),
+        "secure_transport": {
+            "state": transport.get("state"),
+            "local_https_state": (transport.get("local_https") or {}).get("state"),
+            "remote_access_state": (transport.get("remote_access") or {}).get("state"),
+            "secure_origin_configured": bool((transport.get("pwa") or {}).get("secure_origin_configured")),
+            "browser_validation": (transport.get("pwa") or {}).get("browser_validation", "not_run"),
+        },
         "push": {
             "available": True,
             "configured": True,

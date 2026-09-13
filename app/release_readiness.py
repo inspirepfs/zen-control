@@ -457,30 +457,42 @@ def build_release_readiness(
     # PASS/PENDING/FAIL count or manufacture a core release result.
     transport = dict(secure_transport or {})
     transport_state = str(transport.get("state") or "disabled")
-    if transport_state == "ready_for_live_validation":
+    local_https = dict(transport.get("local_https") or {})
+    remote_access = dict(transport.get("remote_access") or {})
+    if not transport:
+        https_state = "deferred"
+        https_summary = "Secure-transport commissioning evidence was not supplied to this historical/core readiness evaluation."
+    elif transport_state == "ready_for_live_validation":
         https_state = "ready_for_live_validation"
         https_summary = (
-            "Secure-cookie, Host allowlist and Cloudflare Access configuration are ready; "
-            "live public-edge and authenticated journey validation remain outstanding."
+            "Local HTTPS, secure-cookie and Host allowlist configuration are ready; "
+            "optional remote Access is either disabled or configuration-ready. Live TLS/PWA/browser evidence remains outstanding."
         )
-    elif transport_state == "blocked":
-        https_state = "blocked"
-        https_summary = "Remote access is enabled but one or more secure-transport configuration checks fail."
+    elif transport_state == "configuration_incomplete":
+        https_state = "configuration_incomplete"
+        https_summary = (
+            "Local HTTPS is configured but secure-session/Host hardening or optional remote-access configuration remains incomplete."
+        )
     else:
-        https_state = "deferred"
-        https_summary = "Remote access is not enabled on this deployment."
+        https_state = "blocked"
+        https_summary = "Secure transport is not sufficiently configured for live HTTPS/PWA commissioning."
 
     deferred = [
         {
             "key": "https_remote_access",
-            "label": "HTTPS / secure remote access",
+            "label": "HTTPS / secure transport & PWA commissioning",
             "state": https_state,
             "summary": https_summary,
             "evidence": {
+                "local_host": transport.get("local_host"),
+                "local_bind_ip": transport.get("lan_bind_ip"),
+                "local_https_state": local_https.get("state", "unknown"),
                 "public_host": transport.get("public_host"),
+                "remote_access_state": remote_access.get("state", "disabled"),
                 "secure_cookies": bool(transport.get("secure_cookies")),
                 "host_allowlist_enforced": bool(transport.get("host_allowlist_enforced")),
                 "cloudflare_access_protected": bool(transport.get("cloudflare_access_protected")),
+                "pwa_secure_origin_configured": bool((transport.get("pwa") or {}).get("secure_origin_configured")),
                 "live_external_validation": transport.get("live_external_validation", "not_run"),
             },
         },
@@ -513,7 +525,7 @@ def build_release_readiness(
             "The controlled restart check requires durable stop/start evidence; current uptime alone is insufficient.",
             "The final application release gate contains exactly eight current checks; all eight must PASS.",
             "Formal performance acceptance includes latency, coherent RouterOS connection budgets and runtime observability evidence.",
-            "HTTPS/remote access remains a separate public-release commissioning gate, does not alter the core PASS/PENDING/FAIL count, and does not alter the eight application checks.",
+            "HTTPS/PWA secure-transport commissioning remains a separate post-core gate, does not alter the core PASS/PENDING/FAIL count, and does not alter the eight application checks.",
             "Notification Centre is an implemented read-side attention capability and does not alter the eight application readiness checks.",
         ],
     }

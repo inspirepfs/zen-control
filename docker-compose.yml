@@ -88,6 +88,10 @@ services:
       ZEN_ALLOWED_HOSTS: "${ZEN_ALLOWED_HOSTS:-}"
       ZEN_CLOUDFLARE_ACCESS_PROTECTED: "${ZEN_CLOUDFLARE_ACCESS_PROTECTED:-0}"
       ZEN_HSTS_MAX_AGE: "${ZEN_HSTS_MAX_AGE:-31536000}"
+      # v0.56 local HTTPS commissioning metadata. The DNS API token remains
+      # isolated to Caddy; the application receives only non-secret host/bind identity.
+      ZEN_LOCAL_HOST: "${ZEN_LOCAL_HOST}"
+      ZEN_LAN_BIND_IP: "${ZEN_LAN_BIND_IP}"
 
       # v0.46 sanitized classifier-consumer heartbeat. Read-only and contains
       # no device/domain/traffic evidence.

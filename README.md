@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.55.4.2** — Notification Delivery Navigation Hotfix: exposes the already-implemented External Delivery surface in the Notifications sub-navigation while preserving the v0.55.4.1 environment contract and all v0.55.4 SMTP/webhook delivery semantics and authority boundaries.
+> Current release: **v0.56.0** — Secure Transport & PWA Commissioning: separates local HTTPS from optional remote Access readiness, hardens secure-cookie/Host allowlist commissioning, adds host-side TLS/PWA prerequisite acceptance, and exposes sanitized commissioning state without adding RouterOS authority.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
