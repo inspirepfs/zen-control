@@ -461,11 +461,11 @@ class V049ReleaseSurfaceTests(unittest.TestCase):
         template = (root / "app/templates/policy_history.html").read_text()
         help_text = (root / "app/help_content.py").read_text()
         readme = (root / "README.md").read_text()
-        self.assertIn('version="0.55.4"', main)
+        self.assertIn('version="0.55.4.1"', main)
         self.assertIn("IDENTITY UNPROVEN", template)
         self.assertIn("RouterOS execution proof", template)
         self.assertIn("current management identity", help_text)
-        self.assertIn("v0.55.4", readme)
+        self.assertIn("v0.55.4.1", readme)
 
 
 if __name__ == "__main__":

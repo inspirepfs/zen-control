@@ -18,6 +18,8 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Environment contract
+        run: python3 scripts/env_validate.py --no-local
       - name: Compile Python
         run: python3 -m py_compile app/*.py telemetry/ingest/*.py
       - name: UX validation

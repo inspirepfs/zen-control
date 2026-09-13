@@ -1,3 +1,14 @@
+## v0.55.4.1 — Environment Configuration Contract & Drift Prevention
+
+- Adds `scripts/env_validate.py` as the fail-closed environment contract for `.env.example`, Compose host interpolation, source environment references and the deployment host `.env`; validator output never prints local values or secrets.
+- Classifies user-facing configuration as required, optional, conditional and secret-bearing while explicitly tracking runtime-only internal variables and reserving a controlled deprecated-variable path.
+- Adds conditional host validation for enabled SMTP delivery, signed HTTP webhook simulation and remote-access security posture, including mutual exclusion of SMTP implicit SSL and STARTTLS.
+- Confirms the older `SUMMARY_*` variables remain active Parent Summary delivery configuration rather than dead legacy settings.
+- Wires environment validation into both `scripts/release_patch.py` and the GitHub `Quality` workflow so future code/Compose/example drift blocks release automatically.
+- Adds environment contract documentation plus regression coverage for duplicate keys, source-reference discovery, secret-safe output, local undocumented variables and conditional feature configuration.
+
+Authority boundary: environment validation is deployment/configuration evidence only. It does not read or mutate RouterOS, policy state, notification source evidence or external delivery authority.
+
 ## v0.55.4 — External Delivery Adapters & Delivery Simulation
 
 - Adds durable external notification fan-out for SMTP email and HMAC-SHA256 signed webhooks, downstream of the existing notification evidence, intelligence and attention-policy layers.

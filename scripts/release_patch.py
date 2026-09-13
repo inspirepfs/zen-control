@@ -453,6 +453,11 @@ def apply_patch(path: Path, *, dry_run: bool = False) -> None:
 def validate(*, dry_run: bool = False) -> None:
     app_files = sorted(str(path.relative_to(ROOT)) for path in (ROOT / "app").glob("*.py"))
     ingest_files = sorted(str(path.relative_to(ROOT)) for path in (ROOT / "telemetry/ingest").glob("*.py"))
+    # Environment configuration is a release contract. On real release hosts
+    # this also validates the local .env without ever printing secret values;
+    # source-only qualification safely falls back to the static contract when
+    # .env is absent.
+    run([sys.executable, "scripts/env_validate.py"], dry_run=dry_run)
     run([sys.executable, "-m", "py_compile", *app_files, *ingest_files], dry_run=dry_run)
     run([sys.executable, "scripts/ux_validate.py"], dry_run=dry_run)
     run([sys.executable, "scripts/public_release_audit.py"], dry_run=dry_run)

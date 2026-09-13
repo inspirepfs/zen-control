@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.55.4** — External Delivery Adapters & Delivery Simulation: durable SMTP email and HMAC-signed webhook fan-out reuse the notification attention pipeline, with environment-only secrets and optional local Mailpit/webhook simulators under the `test-tools` Compose profile. External delivery remains notification-only and creates no RouterOS authority.
+> Current release: **v0.55.4.1** — Environment Configuration Contract & Drift Prevention: `.env.example`, Compose interpolation, application environment references and the live host `.env` are validated as one fail-closed release contract without exposing secret values. v0.55.4 external SMTP/webhook delivery remains unchanged.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -143,6 +143,14 @@ Generate strong application secrets, for example:
 ```bash
 python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
+
+Validate the configuration contract before starting the stack:
+
+```bash
+python3 scripts/env_validate.py
+```
+
+This checks `.env` by variable name/contract only and never prints secret values. See [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) for required, optional, conditional, secret and internal configuration semantics.
 
 Then review [docs/INSTALL.md](docs/INSTALL.md) and [routeros/README.md](routeros/README.md) before starting the stack.
 

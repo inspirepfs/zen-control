@@ -17,6 +17,7 @@ Changes should preserve these contracts:
 ## Local checks
 
 ```bash
+python3 scripts/env_validate.py --no-local
 python3 -m py_compile app/*.py telemetry/ingest/*.py
 python3 scripts/ux_validate.py
 python3 scripts/public_release_audit.py
@@ -28,7 +29,7 @@ Add focused hostile/regression tests for changes to authentication, authority, m
 
 ## Release patch workflow
 
-`python3 scripts/release_patch.py` automates the qualified host release path: exact `-p0` patch dry-run/application, validation, affected-service Compose rebuild, app/runtime/topology health proof, Git stage/commit/push, GitHub Actions watch, and optional annotated tag push.
+`python3 scripts/release_patch.py` automates the qualified host release path and now fail-closes on environment-contract drift before compilation: exact `-p0` patch dry-run/application, validation, affected-service Compose rebuild, app/runtime/topology health proof, Git stage/commit/push, GitHub Actions watch, and optional annotated tag push.
 
 The safe default is automatic affected-service detection from the release delta; repeated `--rebuild-service` options add explicit services and `--rebuild-all` deliberately expands the deployment to the whole Compose project. Relative patch names are resolved from the repository and then `../`, matching the normal host layout. Tagging is fail-closed behind a successful watched GitHub Actions run unless an explicit `--allow-tag-without-ci` exception is supplied.
 
