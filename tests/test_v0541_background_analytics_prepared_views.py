@@ -201,8 +201,8 @@ class V0541SourceContractTests(unittest.TestCase):
         main = (ROOT / "app/main.py").read_text()
         pwa = (ROOT / "app/pwa.py").read_text()
         changelog = (ROOT / "CHANGELOG.md").read_text()
-        self.assertIn('version="0.57.0"', main)
-        self.assertIn('PWA_RELEASE = "0.57.0"', pwa)
+        self.assertIn('version="0.58.0"', main)
+        self.assertIn('PWA_RELEASE = "0.58.0"', pwa)
         self.assertIn("## v0.54.1 — Background analytics & prepared views", changelog)
 
     def test_background_prepared_handler_does_not_use_routeros(self):

@@ -147,7 +147,7 @@ Run the host-side local TLS/PWA prerequisite proof using the real local hostname
 ```bash
 python3 scripts/transport_acceptance.py \
   --local-url https://zen.example.com/ \
-  --expect-version 0.57.0 \
+  --expect-version 0.58.0 \
   --require-hsts
 ```
 
@@ -183,7 +183,7 @@ Or combine local and public proof in one report:
 python3 scripts/transport_acceptance.py \
   --local-url https://zen.example.com/ \
   --public-url https://zen-public.example.net/ \
-  --expect-version 0.57.0 \
+  --expect-version 0.58.0 \
   --require-hsts
 ```
 

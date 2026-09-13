@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.57.0">
-  <link rel="stylesheet" href="/static/layout.css?v=0.57.0">
-  <link rel="stylesheet" href="/static/activity.css?v=0.57.0">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.57.0">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.57.0">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.57.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.58.0">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -1948,6 +1948,26 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     </div>
   </section>
 
+  <section class="card activity-reporting-launch" data-ux-group="reports">
+    <div class="card-heading">
+      <div><h2>Reporting &amp; analytics</h2><p class="muted">A stats-heavy household report combining retained traffic, DNS, classification quality, policy checkpoints, notification and incident trends without inventing missing evidence.</p></div>
+      <span class="policy-badge enabled">7D PREPARED</span>
+    </div>
+    <div class="activity-history-actions">
+      <a class="button-link primary" href="/reporting?period=7d">7-day report</a>
+      <a class="button-link" href="/reporting?period=30d">30-day report</a>
+      <a class="button-link secondary" href="/reporting?period=today">Today</a>
+      <a class="button-link secondary" href="/reporting/export.csv?period=7d">Export 7-day CSV</a>
+    </div>
+    <div class="activity-feature-list activity-history-features">
+      <div><strong>Top movers</strong><span class="muted">Rank device and service traffic changes against the immediately preceding equivalent window.</span></div>
+      <div><strong>Classification quality</strong><span class="muted">Track retained traffic and DNS attribution with UNKNOWN/UNAVAILABLE preserved rather than converted to zero.</span></div>
+      <div><strong>Policy signals</strong><span class="muted">Show DNS block rate and desired-policy checkpoint coverage without claiming continuous historical RouterOS execution.</span></div>
+      <div><strong>Operational trends</strong><span class="muted">Summarise notification creation, escalation, acknowledgement and incident lifecycle evidence.</span></div>
+      <div><strong>Export</strong><span class="muted">Download a flat CSV for your own spreadsheet or deeper offline analysis.</span></div>
+    </div>
+  </section>
+
   <section class="card activity-devices-card" data-ux-group="devices">
     <div class="card-heading">
       <div><h2>Device activity</h2><p class="muted">Expand a device for service, DNS and timing detail. Managed devices use the configured name with the IP retained in brackets.</p></div>
@@ -3539,6 +3559,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       { key: 'dns', label: 'DNS', match: ['Top DNS names'] },
       { key: 'summaries', label: 'Summaries', match: ['Parent summary'] },
       { key: 'history', label: 'History', match: ['Historical analytics'] },
+      { key: 'reports', label: 'Reports', match: ['Reporting & analytics'] },
     ],
     notifications: [
       { key: 'inbox', label: 'Inbox', match: ['Notification centre', 'Inbox'] },

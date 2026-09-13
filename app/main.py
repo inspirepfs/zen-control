@@ -11,6 +11,8 @@ import json
 import time
 import secrets
 import functools
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -61,11 +63,12 @@ from app.kid_control_migration import translate_kid_control_snapshot
 from app.kid_control_cutover import build_kid_control_cutover_readiness, failed_cutover_cleanup_complete
 from app.help_content import get_help_topic, help_for_context, help_catalog, help_api_payload, help_owner
 from app.runtime_health import build_runtime_health
+from app.reporting import build_reporting_overview
 
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.57.0")
+app = FastAPI(title="ZEN Control", version="0.58.0")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -464,7 +467,7 @@ ROOT_VIEW_SECTIONS = {
     "devices": ("managed", "discovery", "bulk"),
     "policies": ("profiles", "assignments", "services", "bandwidth", "tools"),
     "schedules": ("planner", "exceptions", "templates", "router"),
-    "activity": ("overview", "devices", "services", "classification", "dns", "summaries", "history"),
+    "activity": ("overview", "devices", "services", "classification", "dns", "summaries", "history", "reports"),
     "notifications": ("inbox", "preferences", "intelligence", "delivery", "history"),
     "incidents": ("active", "history"),
     "audit": ("recent",),
@@ -1163,6 +1166,74 @@ def _prepare_history_payload() -> dict:
     }
 
 
+def _reporting_payload(period: str = "7d", start: str = "", end: str = "") -> dict:
+    """Build one read-only evidence report without consulting RouterOS."""
+    settings = policy_store.get_settings()
+    timezone_name = settings.get("policy_timezone", "Europe/London")
+    window = resolve_activity_window(period, timezone_name, start, end)
+    names = _activity_managed_names()
+
+    current = activity_store.overview_range(window["start"], window["end"], None)
+    previous = activity_store.overview_range(
+        window["previous_start"], window["previous_end"], None
+    )
+    current_devices = activity_store.top_devices_range(window["start"], window["end"], 100)
+    previous_devices = activity_store.top_devices_range(
+        window["previous_start"], window["previous_end"], 100
+    )
+    _decorate_activity_identity(current_devices, names)
+    _decorate_activity_identity(previous_devices, names)
+
+    current_services = activity_store.top_services_range(window["start"], window["end"], 100, None)
+    previous_services = activity_store.top_services_range(
+        window["previous_start"], window["previous_end"], 100, None
+    )
+    for row in current_services + previous_services:
+        row["display_name"] = str(row.get("service_name") or "Other")
+
+    classification_current = activity_store.classification_coverage_range(
+        window["start"], window["end"]
+    )
+    classification_previous = activity_store.classification_coverage_range(
+        window["previous_start"], window["previous_end"]
+    )
+    new_domains = activity_store.new_domains_range(
+        window["start"], window["end"], 30, 60, None
+    )
+    blocked_domains = activity_store.blocked_domains_range(
+        window["start"], window["end"], 60, None
+    )
+    for item in new_domains:
+        item["local_first_seen"] = _activity_local_timestamp(item.get("first_seen"), timezone_name)
+
+    serial_window = {
+        key: (value.isoformat() if hasattr(value, "isoformat") else value)
+        for key, value in window.items()
+    }
+    report = build_reporting_overview(
+        window=serial_window,
+        current=current,
+        previous=previous,
+        daily=activity_store.daily_history(window["start"], window["end"], timezone_name, None),
+        current_devices=current_devices,
+        previous_devices=previous_devices,
+        current_services=current_services,
+        previous_services=previous_services,
+        new_domains=new_domains,
+        blocked_domains=blocked_domains,
+        classification_current=classification_current,
+        classification_previous=classification_previous,
+        notification_report=policy_store.notification_reporting_range(window["start"], window["end"]),
+        incident_report=policy_store.incident_reporting_range(window["start"], window["end"]),
+        policy_history=policy_store.policy_history_stats(),
+        policy_window=policy_store.policy_reporting_range(window["start"], window["end"]),
+        config_analytics=policy_store.build_config_analytics_snapshot(),
+    )
+    report["timezone_name"] = timezone_name
+    report["period"] = str(period or "7d").lower()
+    return report
+
+
 def _build_device360_activity(address: str, timezone_name: str | None = None):
     activity = {}
     activity_error = None
@@ -1289,6 +1360,8 @@ def _background_prepared_view(payload: dict) -> dict:
             output = _classification_workbench_payload(24)
         elif view == "history:7d":
             output = _prepare_history_payload()
+        elif view == "reporting:7d":
+            output = _reporting_payload("7d")
         elif view.startswith("device360:"):
             address = view.split(":", 1)[1]
             activity, activity_error = _build_device360_activity(address)
@@ -1354,6 +1427,7 @@ def _schedule_background_analytics() -> int:
         ("services:24h", "analytics:services", 180),
         ("classification:24h", "analytics:classification", 300),
         ("history:7d", "analytics:history", 300),
+        ("reporting:7d", "analytics:reporting", 300),
     ]
     for address in sorted(policy_store.list_device_policy()):
         if address:
@@ -3353,6 +3427,115 @@ def activity_summary_page(
             **payload,
         },
         status_code=503 if error else 200,
+    )
+
+
+@app.get("/api/reporting/overview")
+def api_reporting_overview(
+    period: str = "7d",
+    start: str = "",
+    end: str = "",
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    try:
+        if str(period or "7d").lower() == "7d" and not start and not end:
+            prepared, meta = _prepared_payload("reporting:7d", allow_stale_same_revision=True)
+            if prepared:
+                return {**prepared, "prepared_view": meta}
+            _record_prepared_fallback("reporting:7d")
+        with activity_store.coherent_session():
+            report = _reporting_payload(period, start, end)
+        return {**report, "prepared_view": None}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ActivityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/reporting", response_class=HTMLResponse)
+def reporting_page(
+    request: Request,
+    period: str = "7d",
+    start: str = "",
+    end: str = "",
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    error = None
+    prepared_meta = None
+    try:
+        payload = None
+        if str(period or "7d").lower() == "7d" and not start and not end:
+            payload, prepared_meta = _prepared_payload("reporting:7d", allow_stale_same_revision=True)
+        if not payload:
+            if str(period or "7d").lower() == "7d" and not start and not end:
+                _record_prepared_fallback("reporting:7d")
+            with activity_store.coherent_session():
+                payload = _reporting_payload(period, start, end)
+    except (ActivityError, ValueError) as exc:
+        error = str(exc)
+        payload = {
+            "schema": "zen_reporting_overview_v1",
+            "window": {}, "metrics": {}, "classification": {}, "policy_signals": {},
+            "notifications": {}, "incidents": {}, "daily": [], "top_devices": [],
+            "top_services": [], "device_movers": [], "service_movers": [],
+            "new_domains": [], "blocked_domains": [], "timezone_name": "",
+            "evidence_note": "Reporting evidence is unavailable; no zero-value inference has been made.",
+        }
+    return templates.TemplateResponse(
+        "reporting.html",
+        {
+            "request": request,
+            "user": user,
+            "period": str(period or "7d").lower(),
+            "custom_start": start,
+            "custom_end": end,
+            "prepared_view": prepared_meta,
+            "error": error,
+            **payload,
+        },
+        status_code=503 if error else 200,
+    )
+
+
+@app.get("/reporting/export.csv")
+def reporting_export_csv(
+    period: str = "7d",
+    start: str = "",
+    end: str = "",
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    try:
+        with activity_store.coherent_session():
+            report = _reporting_payload(period, start, end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ActivityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["section", "key", "label", "current", "previous", "delta", "delta_percent", "detail"])
+    for key, item in (report.get("metrics") or {}).items():
+        writer.writerow(["metric", key, key.replace("_", " ").title(), item.get("current"), item.get("previous"), item.get("delta"), item.get("delta_percent"), item.get("unit")])
+    for row in report.get("daily") or []:
+        writer.writerow(["daily", row.get("day"), row.get("day"), row.get("total_bytes"), "", "", "", f"dns={row.get('dns_queries', 0)}; blocked={row.get('dns_blocked', 0)}"])
+    for row in report.get("top_devices") or []:
+        writer.writerow(["device", row.get("client_ip"), row.get("display_name"), row.get("total_bytes"), "", "", "", f"flows={row.get('flows', 0)}"])
+    for row in report.get("top_services") or []:
+        writer.writerow(["service", row.get("service_name"), row.get("display_name"), row.get("total_bytes"), "", "", "", f"flows={row.get('flows', 0)}"])
+    for section in ("device_movers", "service_movers"):
+        for row in report.get(section) or []:
+            writer.writerow([section, row.get("key"), row.get("label"), row.get("current"), row.get("previous"), row.get("delta"), row.get("delta_percent"), row.get("state")])
+    for row in report.get("new_domains") or []:
+        writer.writerow(["new_domain", row.get("domain"), row.get("domain"), row.get("queries"), "", "", "", f"devices={row.get('devices', 0)}"])
+    for row in report.get("blocked_domains") or []:
+        writer.writerow(["blocked_domain", row.get("domain"), row.get("domain"), row.get("blocked"), "", "", "", f"queries={row.get('queries', 0)}"])
+    content = output.getvalue()
+    filename = f"zen-report-{report.get('window', {}).get('start_date', 'range')}-{report.get('window', {}).get('end_date', 'range')}.csv"
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

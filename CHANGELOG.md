@@ -1,3 +1,14 @@
+## v0.58.0 — Reporting & Analytics
+
+- Adds a dedicated read-only Reporting & Analytics workbench with today/yesterday/7-day/30-day/custom windows.
+- Compares retained traffic, DNS and domain evidence with the immediately preceding equivalent period.
+- Ranks device and service movers without treating absent previous-period evidence as a mathematical zero percentage.
+- Tracks traffic/DNS classification quality, explicit DNS block signals and durable desired-policy checkpoint coverage while preserving historical enforcement boundaries.
+- Adds notification and incident lifecycle reporting, including acknowledge/resolution timing samples and top source families.
+- Adds a flat CSV export for offline analysis.
+- Adds a prepared 7-day reporting read model so the normal stats-heavy page remains off the request-time hot path.
+- Reporting remains read-only and introduces no RouterOS mutation authority.
+
 ## v0.57.0 — Operational Resilience & Upgrade Safety
 
 - Introduces formal policy-database schema lineage at schema **570**, recording the migration only after all existing additive compatibility migrations and data backfills succeed. Databases with a newer schema fail closed before mutation.

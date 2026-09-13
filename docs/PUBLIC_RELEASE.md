@@ -2,6 +2,10 @@
 
 This checklist is deliberately conservative because ZEN can control a real household network.
 
+## Product-scope status
+
+v0.58 completes the currently planned product-feature roadmap before public-release closure. Do not add unrelated feature work to clear publication; remaining gates are release-readiness evidence, license selection, credential rotation, source/history secret review, sanitized documentation/screenshots and final CI/host qualification.
+
 ## Required before changing repository visibility to public
 
 - [ ] Capture `/api/release-readiness` from the candidate release and require `zen_release_readiness_v2` with **PASS 8 / PENDING 0 / FAIL 0**; validate it with `python3 scripts/release_acceptance.py SNAPSHOT.json`.

@@ -29,7 +29,7 @@ class SecureTransportCommissioningConfigTests(unittest.TestCase):
         return SecureTransportConfig.from_mapping(values)
 
     def test_local_https_can_be_commissioning_ready_without_remote_access(self):
-        status = self.config().status("0.57.0")
+        status = self.config().status("0.58.0")
         self.assertEqual("ready_for_live_validation", status["state"])
         self.assertTrue(status["commissioning_ready"])
         self.assertEqual("ready_for_live_validation", status["local_https"]["state"])
@@ -37,7 +37,7 @@ class SecureTransportCommissioningConfigTests(unittest.TestCase):
         self.assertEqual("ready_for_browser_validation", status["pwa"]["state"])
 
     def test_secure_cookie_and_local_host_allowlist_are_required_for_hardened_local_https(self):
-        status = self.config(ZEN_SECURE_COOKIES="0", ZEN_ALLOWED_HOSTS="localhost,127.0.0.1").status("0.57.0")
+        status = self.config(ZEN_SECURE_COOKIES="0", ZEN_ALLOWED_HOSTS="localhost,127.0.0.1").status("0.58.0")
         self.assertEqual("configuration_incomplete", status["state"])
         self.assertFalse(status["commissioning_ready"])
         failed = {row["key"] for row in status["local_https"]["checks"] if row["state"] == "fail"}
@@ -50,7 +50,7 @@ class SecureTransportCommissioningConfigTests(unittest.TestCase):
             ZEN_ALLOWED_HOSTS="zen.home.example.net,zen.example.net,localhost,127.0.0.1",
             ZEN_CLOUDFLARE_ACCESS_PROTECTED="1",
         )
-        status = cfg.status("0.57.0")
+        status = cfg.status("0.58.0")
         self.assertTrue(status["remote_ready"])
         self.assertTrue(status["commissioning_ready"])
         self.assertEqual("ready_for_live_validation", status["remote_access"]["state"])
@@ -90,7 +90,7 @@ class TransportAcceptanceTests(unittest.TestCase):
                     "referrer-policy": "same-origin",
                     "strict-transport-security": "max-age=31536000",
                 },
-                "body": json.dumps({"ok": True, "status": "alive", "version": "0.57.0"}).encode(),
+                "body": json.dumps({"ok": True, "status": "alive", "version": "0.58.0"}).encode(),
                 "error": None,
             },
             "/service-worker.js": {
@@ -109,7 +109,7 @@ class TransportAcceptanceTests(unittest.TestCase):
 
         with patch.object(module, "_fetch", side_effect=lambda _base, path, _timeout: responses[path]):
             result = module.probe_local(
-                "https://zen.example.net/", expect_version="0.57.0", require_hsts=True
+                "https://zen.example.net/", expect_version="0.58.0", require_hsts=True
             )
         self.assertEqual("pass", result["state"])
         self.assertTrue(result["server_pwa_ready"])
@@ -127,7 +127,7 @@ class TransportAcceptanceTests(unittest.TestCase):
                         "x-frame-options": "DENY",
                         "referrer-policy": "same-origin",
                     },
-                    "body": json.dumps({"ok": True, "status": "alive", "version": "0.57.0"}).encode(),
+                    "body": json.dumps({"ok": True, "status": "alive", "version": "0.58.0"}).encode(),
                     "error": None,
                 }
             if path == "/service-worker.js":
@@ -154,10 +154,10 @@ class SecureTransportCommissioningSourceTests(unittest.TestCase):
         cls.release = (ROOT / "app/release_readiness.py").read_text()
 
     def test_release_identity_and_pwa_assets_are_v0560(self):
-        self.assertIn('version="0.57.0"', self.main)
-        self.assertIn('PWA_RELEASE = "0.57.0"', (ROOT / "app/pwa.py").read_text())
-        self.assertIn("const RELEASE = '0.57.0'", (ROOT / "app/static/pwa.js").read_text())
-        self.assertIn("const RELEASE = '0.57.0'", (ROOT / "app/static/service-worker.js").read_text())
+        self.assertIn('version="0.58.0"', self.main)
+        self.assertIn('PWA_RELEASE = "0.58.0"', (ROOT / "app/pwa.py").read_text())
+        self.assertIn("const RELEASE = '0.58.0'", (ROOT / "app/static/pwa.js").read_text())
+        self.assertIn("const RELEASE = '0.58.0'", (ROOT / "app/static/service-worker.js").read_text())
 
     def test_app_receives_only_non_secret_local_https_identity(self):
         self.assertIn('ZEN_LOCAL_HOST: "${ZEN_LOCAL_HOST}"', self.compose)

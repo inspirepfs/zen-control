@@ -243,7 +243,7 @@ class V057SourceContractTests(unittest.TestCase):
         main = (ROOT / "app" / "main.py").read_text()
         upgrade = (ROOT / "app" / "upgrade_safety.py").read_text()
         release = (ROOT / "scripts" / "release_patch.py").read_text()
-        self.assertIn('version="0.57.0"', main)
+        self.assertIn('version="0.58.0"', main)
         self.assertIn('SCHEMA_VERSION = 570', upgrade)
         self.assertIn('SCHEMA_RELEASE = "0.57.0"', upgrade)
         self.assertIn("s.backup(d)", release)

@@ -10,6 +10,7 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from contextlib import contextmanager
 from pathlib import Path
+from statistics import median
 
 from app.bandwidth import BandwidthRateError, normalize_rate
 from app.performance import perf_span
@@ -2133,6 +2134,61 @@ class PolicyStore:
             item["quota_state"] = json.loads(item.get("quota_state") or "{}")
         return result
 
+    def policy_reporting_range(self, start, end):
+        """Summarize retained desired-policy checkpoints for an explicit window.
+
+        Checkpoints are change evidence, not sampled execution telemetry, so the
+        returned quota/schedule counts deliberately retain the ``checkpoints``
+        suffix and must not be presented as duration or RouterOS execution proof.
+        """
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise ValueError("Policy reporting range requires datetime boundaries")
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise ValueError("Policy reporting range requires ordered timezone-aware boundaries")
+        start_value = self._policy_history_instant_iso(start)
+        end_value = self._policy_history_instant_iso(end)
+        with self._db() as db:
+            rows = [dict(row) for row in db.execute(
+                """SELECT desired_mode, schedule_active, quota_state
+                   FROM policy_state_history
+                   WHERE captured_at >= ? AND captured_at < ?
+                   ORDER BY captured_at, id""",
+                (start_value, end_value),
+            ).fetchall()]
+
+        result = {
+            "schema": "zen_policy_reporting_v1",
+            "checkpoints": len(rows),
+            "schedule_active_checkpoints": 0,
+            "quota_configured_checkpoints": 0,
+            "quota_active_checkpoints": 0,
+            "quota_daily_exhausted_checkpoints": 0,
+            "quota_service_active_checkpoints": 0,
+            "quota_unavailable_checkpoints": 0,
+            "blocked_mode_checkpoints": 0,
+            "authority": "desired-policy-checkpoints-only",
+        }
+        for row in rows:
+            if bool(row.get("schedule_active")):
+                result["schedule_active_checkpoints"] += 1
+            if str(row.get("desired_mode") or "").lower() == "blocked":
+                result["blocked_mode_checkpoints"] += 1
+            try:
+                quota = json.loads(row.get("quota_state") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                quota = {}
+            if quota.get("configured"):
+                result["quota_configured_checkpoints"] += 1
+            if quota.get("active"):
+                result["quota_active_checkpoints"] += 1
+            if quota.get("daily_exhausted"):
+                result["quota_daily_exhausted_checkpoints"] += 1
+            if quota.get("service_active"):
+                result["quota_service_active_checkpoints"] += 1
+            if quota.get("configured") and not quota.get("available", True):
+                result["quota_unavailable_checkpoints"] += 1
+        return result
+
     def policy_history_stats(self):
         with self._db() as db:
             row = db.execute(
@@ -3670,6 +3726,86 @@ class PolicyStore:
             )
         return {**counts, "acknowledged_samples": len(ack_seconds), "median_ack_seconds": median_ack_seconds}
 
+    def notification_reporting_range(self, start, end):
+        """Return bounded notification reporting facts for an explicit UTC-aware window.
+
+        Occurrence counters belong to durable notification rows and are therefore
+        labelled separately from the number of rows first created in the window.
+        The report never treats muted/suppressed attention as missing source evidence.
+        """
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise ValueError("Notification reporting range requires datetime boundaries")
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise ValueError("Notification reporting range requires ordered timezone-aware boundaries")
+
+        def parsed(value):
+            if not value:
+                return None
+            try:
+                item = datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                return None
+            if item.tzinfo is None:
+                item = item.replace(tzinfo=timezone.utc)
+            return item.astimezone(timezone.utc)
+
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        with self._db() as db:
+            rows = [dict(row) for row in db.execute("SELECT * FROM notifications").fetchall()]
+
+        created = []
+        resolved = 0
+        escalated = 0
+        acknowledged = 0
+        source_counts = {}
+        severity_counts = {"critical": 0, "warning": 0, "info": 0}
+        ack_seconds = []
+        for row in rows:
+            created_at = parsed(row.get("created_at"))
+            if created_at and start <= created_at < end:
+                created.append(row)
+                severity = self._incident_severity(row.get("source_severity") or row.get("severity"))
+                severity_counts[severity] = severity_counts.get(severity, 0) + 1
+                family = self._notification_source_family(row.get("source"))
+                source_counts[family] = source_counts.get(family, 0) + 1
+                ack_at = parsed(row.get("acknowledged_at"))
+                if ack_at and ack_at >= created_at:
+                    ack_seconds.append((ack_at - created_at).total_seconds())
+            resolved_at = parsed(row.get("resolved_at"))
+            if resolved_at and start <= resolved_at < end:
+                resolved += 1
+            escalated_at = parsed(row.get("escalated_at"))
+            if escalated_at and start <= escalated_at < end:
+                escalated += 1
+            acknowledged_at = parsed(row.get("acknowledged_at"))
+            if acknowledged_at and start <= acknowledged_at < end:
+                acknowledged += 1
+
+        ack_seconds.sort()
+        noisy_sources = [
+            {"source": key, "notifications": value}
+            for key, value in sorted(source_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ]
+        counts = self.notification_counts()
+        return {
+            "schema": "zen_notification_reporting_v1",
+            "created": len(created),
+            "occurrences_on_created_rows": sum(max(1, int(row.get("occurrences") or 1)) for row in created),
+            "resolved": resolved,
+            "acknowledged": acknowledged,
+            "escalated": escalated,
+            "critical_created": int(severity_counts.get("critical") or 0),
+            "warning_created": int(severity_counts.get("warning") or 0),
+            "info_created": int(severity_counts.get("info") or 0),
+            "median_ack_seconds": round(float(median(ack_seconds)), 1) if ack_seconds else None,
+            "ack_samples": len(ack_seconds),
+            "active_unresolved": int(counts.get("unresolved") or 0),
+            "unread_attention": int(counts.get("unread") or 0),
+            "noisy_sources": noisy_sources,
+            "authority": "attention-reporting-only",
+        }
+
     @staticmethod
     def _notification_action_hint(row):
         family = PolicyStore._notification_source_family((row or {}).get("source"))
@@ -4312,6 +4448,68 @@ class PolicyStore:
                 result["active"] += count
                 result[severity] = result.get(severity, 0) + count
         return result
+
+    def incident_reporting_range(self, start, end):
+        """Summarize incident lifecycle records for a reporting window."""
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise ValueError("Incident reporting range requires datetime boundaries")
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise ValueError("Incident reporting range requires ordered timezone-aware boundaries")
+
+        def parsed(value):
+            if not value:
+                return None
+            try:
+                item = datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                return None
+            if item.tzinfo is None:
+                item = item.replace(tzinfo=timezone.utc)
+            return item.astimezone(timezone.utc)
+
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        with self._db() as db:
+            rows = [dict(row) for row in db.execute("SELECT * FROM incidents").fetchall()]
+
+        opened = []
+        resolved = 0
+        resolution_seconds = []
+        source_counts = {}
+        severity_counts = {"critical": 0, "warning": 0, "info": 0}
+        for row in rows:
+            opened_at = parsed(row.get("opened_at"))
+            if opened_at and start <= opened_at < end:
+                opened.append(row)
+                severity = self._incident_severity(row.get("severity"))
+                severity_counts[severity] = severity_counts.get(severity, 0) + 1
+                source = str(row.get("source") or "unknown")
+                source_counts[source] = source_counts.get(source, 0) + 1
+            resolved_at = parsed(row.get("resolved_at"))
+            if resolved_at and start <= resolved_at < end:
+                resolved += 1
+                if opened_at and resolved_at >= opened_at:
+                    resolution_seconds.append((resolved_at - opened_at).total_seconds())
+
+        top_sources = [
+            {"source": key, "incidents": value}
+            for key, value in sorted(source_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+        ]
+        current = self.incident_counts()
+        return {
+            "schema": "zen_incident_reporting_v1",
+            "opened": len(opened),
+            "resolved": resolved,
+            "critical_opened": int(severity_counts.get("critical") or 0),
+            "warning_opened": int(severity_counts.get("warning") or 0),
+            "info_opened": int(severity_counts.get("info") or 0),
+            "median_resolution_seconds": round(float(median(resolution_seconds)), 1) if resolution_seconds else None,
+            "resolution_samples": len(resolution_seconds),
+            "active_now": int(current.get("active") or 0),
+            "critical_active_now": int(current.get("critical") or 0),
+            "top_sources": top_sources,
+            "authority": "operational-evidence-only",
+        }
 
     def acknowledge_incident(self, incident_id, actor):
         incident_id = int(incident_id)

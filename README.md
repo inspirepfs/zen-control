@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.57.0** — Operational Resilience & Upgrade Safety: formalizes SQLite schema lineage, creates verified pre-migration recovery copies, adds historical upgrade/restore acceptance, and makes the normal release workflow prove backup, migration, restart and retained-state health before publication.
+> Current release: **v0.58.0** — Reporting & Analytics: adds a read-only household reporting workbench with period comparisons, daily trends, device/service movers, classification quality, policy signals, notification/incident lifecycle trends and CSV export while preserving evidence boundaries.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -35,6 +35,7 @@ ZEN currently provides:
 - Effective-policy explainability and Device 360 views.
 - Historical desired-policy checkpoints correlated with retained network evidence.
 - IPFIX and Pi-hole-backed activity/classification reporting.
+- A stats-heavy Reporting & Analytics workbench with period comparisons, daily trends, device/service movers, classification quality, policy/quota checkpoint signals, notification/incident lifecycle trends and CSV export.
 - Operational diagnostics, incidents, audit evidence and release-readiness checks.
 - Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls, cooldown-based noise suppression, correlation groups, escalation rules, lifecycle timelines, explanation provenance, digest/noise analytics, browser push, SMTP email and signed webhook delivery.
 - TOTP parent authentication, recovery codes and shared-display locking.
@@ -42,7 +43,7 @@ ZEN currently provides:
 - Cloudflare Access/Tunnel remote access and split-DNS local HTTPS.
 - Controlled migration from MikroTik Kid Control with guarded cutover and rollback.
 - Revisioned configuration state, optimistic concurrency, a transactional outbox and durable read-side background jobs.
-- Prepared read models for Dashboard, Activity, Classification, Services, 7-day history and Device 360 activity evidence, with revision/age gating and bounded maintenance.
+- Prepared read models for Dashboard, Activity, Classification, Services, 7-day history, 7-day reporting and Device 360 activity evidence, with revision/age gating and bounded maintenance.
 - Read-path fan-out closure for normal Dashboard, Activity and Managed Devices navigation: stale same-revision evidence is explicit, prepared refresh work is coalesced, and live PostgreSQL/RouterOS fallback is removed from ordinary navigation.
 - Bounded parallel device observation/planning in the automatic reconciler, with deterministic results and per-device failure isolation.
 - A process-wide re-entrant RouterOS mutation lane that serializes app-owned writes while leaving read-only observation parallel-capable.

@@ -1,0 +1,170 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% include "_pwa_head.jinja" %}
+  <title>Reporting & Analytics · ZEN Control</title>
+  <link rel="stylesheet" href="/static/app.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.58.0">
+  <link rel="stylesheet" href="/static/reporting.css?v=0.58.0">
+</head>
+<body class="standalone-page">
+<header class="analytics-header standalone-header">
+  <div>
+    <div class="eyebrow">ZEN CONTROL · REPORTING &amp; ANALYTICS</div>
+    <div class="brand">Household evidence report</div>
+    <div class="muted small">{{window.label if window else 'Reporting'}} · {{timezone_name or 'configured household timezone'}}</div>
+  </div>
+  <div class="activity-page-actions">
+    <a class="button-link secondary back-link" href="/?view=activity&amp;section=reports#activity/reports">Back to Activity</a>
+    <a class="button-link" href="/reporting/export.csv?period={{period}}{% if period == 'custom' %}&amp;start={{custom_start}}&amp;end={{custom_end}}{% endif %}">Export CSV</a>
+  </div>
+</header>
+<main class="analytics-main reporting-main">
+{% set page_help = zen_help('activity_reporting') %}
+{% include "_context_help.jinja" %}
+{% if prepared_view %}<div class="local-only-note">Prepared reporting model · {{prepared_view.age_seconds|round(1)}}s old · config revision {{prepared_view.source_revision}} · generation {{prepared_view.generation}}</div>{% endif %}
+
+<section class="card analytics-filter-card">
+  <div class="analytics-filter-row">
+    <nav class="analytics-periods" aria-label="Report period">
+      {% for key,label in [('today','Today'),('yesterday','Yesterday'),('7d','7 days'),('30d','30 days')] %}
+      <a class="analytics-period {% if period == key %}active{% endif %}" href="/reporting?period={{key}}">{{label}}</a>
+      {% endfor %}
+    </nav>
+  </div>
+  <form method="get" action="/reporting" class="analytics-custom-range">
+    <input type="hidden" name="period" value="custom">
+    <label>Custom start <input type="date" name="start" value="{{custom_start or (window.start_date if window else '')}}" required></label>
+    <label>Custom end <input type="date" name="end" value="{{custom_end or (window.end_date if window else '')}}" required></label>
+    <button>Apply custom range</button>
+  </form>
+</section>
+
+{% if error %}
+<section class="card"><div class="conflict-warning">{{error}}</div><p class="muted">The report has not substituted missing telemetry with zero-value evidence.</p></section>
+{% else %}
+{% macro trend(item) -%}
+  {% if item.delta_percent is none %}
+    {% if item.current %}<span class="analytics-delta new">NEW</span>{% else %}<span class="analytics-delta flat">0%</span>{% endif %}
+  {% elif item.delta_percent > 0 %}<span class="analytics-delta up">+{{item.delta_percent}}%</span>
+  {% elif item.delta_percent < 0 %}<span class="analytics-delta down">{{item.delta_percent}}%</span>
+  {% else %}<span class="analytics-delta flat">0%</span>{% endif %}
+{%- endmacro %}
+
+<section class="card reporting-hero">
+  <div class="card-heading">
+    <div><h2>{{window.label}}</h2><p class="muted">Compared with the immediately preceding equivalent {{window.duration_hours|round(1)}} hour window.</p></div>
+    <span class="policy-badge enabled">{{window.start_date}} → {{window.end_date}}</span>
+  </div>
+  <div class="analytics-kpi-grid reporting-kpis">
+    {% set traffic = metrics.get('traffic', {}) %}
+    <div><span>Total traffic</span><strong>{{traffic.current_human}}</strong>{{trend(traffic)}}</div>
+    {% set download = metrics.get('download', {}) %}<div><span>Download</span><strong>{{download.current_human}}</strong>{{trend(download)}}</div>
+    {% set upload = metrics.get('upload', {}) %}<div><span>Upload</span><strong>{{upload.current_human}}</strong>{{trend(upload)}}</div>
+    {% set flows = metrics.get('flows', {}) %}<div><span>Flows</span><strong>{{flows.current}}</strong>{{trend(flows)}}</div>
+    {% set dns = metrics.get('dns_queries', {}) %}<div><span>DNS queries</span><strong>{{dns.current}}</strong>{{trend(dns)}}</div>
+    {% set blocked = metrics.get('blocked_dns', {}) %}<div><span>Blocked DNS</span><strong>{{blocked.current}}</strong>{{trend(blocked)}}</div>
+    {% set domains = metrics.get('unique_domains', {}) %}<div><span>Unique domains</span><strong>{{domains.current}}</strong>{{trend(domains)}}</div>
+    {% set devices = metrics.get('active_devices', {}) %}<div><span>Active devices</span><strong>{{devices.current}}</strong>{{trend(devices)}}</div>
+  </div>
+  <p class="muted small reporting-evidence-note">{{evidence_note}}</p>
+</section>
+
+<div class="analytics-two-column reporting-two-column">
+  <section class="card">
+    <div class="card-heading"><div><h2>Classification quality</h2><p class="muted">Retained attribution coverage, with missing or inconsistent evidence preserved explicitly.</p></div><span class="policy-badge staging">EVIDENCE QUALITY</span></div>
+    <div class="reporting-stat-grid">
+      <div><span>Traffic classified</span><strong>{% if classification.traffic.current is none %}{{classification.traffic.current_status|upper}}{% else %}{{classification.traffic.current}}%{% endif %}</strong><small>{% if classification.traffic.delta_points is not none %}{{'%+.1f'|format(classification.traffic.delta_points)}} points vs previous{% else %}No comparable percentage{% endif %}</small></div>
+      <div><span>DNS classified</span><strong>{% if classification.dns.current is none %}{{classification.dns.current_status|upper}}{% else %}{{classification.dns.current}}%{% endif %}</strong><small>{% if classification.dns.delta_points is not none %}{{'%+.1f'|format(classification.dns.delta_points)}} points vs previous{% else %}No comparable percentage{% endif %}</small></div>
+      <div><span>New domains</span><strong>{{policy_signals.new_domains}}</strong><small>No evidence in preceding 30-day lookback</small></div>
+      <div><span>Blocked domains</span><strong>{{policy_signals.blocked_domains}}</strong><small>Explicit DNS block evidence</small></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Policy &amp; control signals</h2><p class="muted">Useful policy context without claiming desired state proves historical RouterOS execution.</p></div><span class="policy-badge staging">DESIRED + OBSERVED</span></div>
+    <div class="reporting-stat-grid">
+      <div><span>DNS block rate</span><strong>{% if policy_signals.dns_block_rate is none %}NO EVIDENCE{% else %}{{policy_signals.dns_block_rate}}%{% endif %}</strong><small>{% if policy_signals.dns_block_rate_delta_points is not none %}{{'%+.1f'|format(policy_signals.dns_block_rate_delta_points)}} points vs previous{% else %}No comparable rate{% endif %}</small></div>
+      <div><span>Policy checkpoints</span><strong>{{policy_signals.policy_history_checkpoints}}</strong><small>{{policy_signals.policy_history_addresses}} retained addresses</small></div>
+      <div><span>Managed devices</span><strong>{{policy_signals.managed_devices}}</strong><small>{{policy_signals.profiles}} profiles</small></div>
+      <div><span>Service definitions</span><strong>{{policy_signals.services}}</strong><small>Current reporting/classification catalogue</small></div>
+      <div><span>Quota-active checkpoints</span><strong>{{policy_signals.quota_active_checkpoints}}</strong><small>{{policy_signals.quota_daily_exhausted_checkpoints}} daily-exhausted · {{policy_signals.quota_service_active_checkpoints}} service-active</small></div>
+      <div><span>Quota unavailable checkpoints</span><strong>{{policy_signals.quota_unavailable_checkpoints}}</strong><small>{{policy_signals.quota_configured_checkpoints}} quota-configured checkpoints</small></div>
+      <div><span>Schedule-active checkpoints</span><strong>{{policy_signals.schedule_active_checkpoints}}</strong><small>Desired-policy change evidence in this window</small></div>
+      <div><span>Blocked-mode checkpoints</span><strong>{{policy_signals.blocked_mode_checkpoints}}</strong><small>{{policy_signals.window_checkpoints}} total desired-policy checkpoints in-window</small></div>
+    </div>
+  </section>
+</div>
+
+<div class="analytics-two-column reporting-two-column">
+  <section class="card">
+    <div class="card-heading"><div><h2>Notification trends</h2><p class="muted">Attention-layer activity in the selected window. Current unresolved counts are shown separately.</p></div><span class="policy-badge enabled">ATTENTION</span></div>
+    <div class="reporting-stat-grid">
+      <div><span>Created</span><strong>{{notifications.created or 0}}</strong><small>{{notifications.occurrences_on_created_rows or 0}} durable occurrences on those rows</small></div>
+      <div><span>Resolved</span><strong>{{notifications.resolved or 0}}</strong><small>{{notifications.acknowledged or 0}} acknowledged in-window</small></div>
+      <div><span>Escalated</span><strong>{{notifications.escalated or 0}}</strong><small>{{notifications.critical_created or 0}} critical source notifications created</small></div>
+      <div><span>Median acknowledge</span><strong>{% if notifications.median_ack_seconds is none %}—{% else %}{{(notifications.median_ack_seconds / 60)|round(1)}} min{% endif %}</strong><small>{{notifications.ack_samples or 0}} samples · {{notifications.active_unresolved or 0}} unresolved now</small></div>
+    </div>
+    {% if notifications.noisy_sources %}<div class="reporting-mini-list">{% for item in notifications.noisy_sources %}<span><strong>{{item.source}}</strong> {{item.notifications}}</span>{% endfor %}</div>{% endif %}
+  </section>
+
+  <section class="card">
+    <div class="card-heading"><div><h2>Incident reliability</h2><p class="muted">Operational incident lifecycle evidence; it does not infer RouterOS health when no incident evidence exists.</p></div><span class="policy-badge enabled">OPERATIONS</span></div>
+    <div class="reporting-stat-grid">
+      <div><span>Opened</span><strong>{{incidents.opened or 0}}</strong><small>{{incidents.critical_opened or 0}} critical · {{incidents.warning_opened or 0}} warning</small></div>
+      <div><span>Resolved</span><strong>{{incidents.resolved or 0}}</strong><small>Resolved during selected window</small></div>
+      <div><span>Active now</span><strong>{{incidents.active_now or 0}}</strong><small>{{incidents.critical_active_now or 0}} critical now</small></div>
+      <div><span>Median resolution</span><strong>{% if incidents.median_resolution_seconds is none %}—{% else %}{{(incidents.median_resolution_seconds / 60)|round(1)}} min{% endif %}</strong><small>{{incidents.resolution_samples or 0}} samples</small></div>
+    </div>
+    {% if incidents.top_sources %}<div class="reporting-mini-list">{% for item in incidents.top_sources %}<span><strong>{{item.source}}</strong> {{item.incidents}}</span>{% endfor %}</div>{% endif %}
+  </section>
+</div>
+
+<section class="card reporting-daily-card">
+  <div class="card-heading"><div><h2>Daily trend</h2><p class="muted">Traffic, DNS, block and classification evidence by local household day.</p></div><span class="policy-badge enabled">{{daily|length}} DAYS</span></div>
+  <div class="activity-table-wrap">
+    <table class="activity-table reporting-table"><thead><tr><th>Day</th><th>Traffic</th><th>Download</th><th>Upload</th><th>Devices</th><th>DNS</th><th>Blocked</th><th>Traffic classified</th><th>DNS classified</th></tr></thead><tbody>
+    {% for row in daily %}<tr><td><strong>{{row.day}}</strong></td><td>{{row.total_bytes_human}}</td><td>{{row.download_bytes_human}}</td><td>{{row.upload_bytes_human}}</td><td>{{row.devices}}</td><td>{{row.dns_queries}}</td><td>{{row.dns_blocked}}</td><td>{% if row.traffic_percent is none %}NO EVIDENCE{% else %}{{row.traffic_percent}}%{% endif %}</td><td>{% if row.dns_percent is none %}NO EVIDENCE{% else %}{{row.dns_percent}}%{% endif %}</td></tr>
+    {% else %}<tr><td colspan="9" class="muted">No retained daily activity evidence in this period.</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+</section>
+
+<div class="analytics-two-column reporting-two-column">
+  <section class="card">
+    <div class="card-heading"><div><h2>Device movers</h2><p class="muted">Largest absolute traffic changes versus the preceding equivalent window.</p></div></div>
+    <div class="reporting-movers">
+      {% for row in device_movers %}<div><span><strong>{{row.label}}</strong><small>{{row.key}}</small></span><span>{{row.current_human}} <b class="{{'report-up' if row.delta > 0 else 'report-down'}}">{{row.delta_human}}</b>{% if row.delta_percent is not none %}<small>{{'%+.1f'|format(row.delta_percent)}}%</small>{% else %}<small>{{row.state|upper}}</small>{% endif %}</span></div>{% else %}<p class="muted">No device traffic changes to rank.</p>{% endfor %}
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-heading"><div><h2>Service movers</h2><p class="muted">Largest absolute service-attributed traffic changes versus the preceding equivalent window.</p></div></div>
+    <div class="reporting-movers">
+      {% for row in service_movers %}<div><span><strong>{{row.label}}</strong></span><span>{{row.current_human}} <b class="{{'report-up' if row.delta > 0 else 'report-down'}}">{{row.delta_human}}</b>{% if row.delta_percent is not none %}<small>{{'%+.1f'|format(row.delta_percent)}}%</small>{% else %}<small>{{row.state|upper}}</small>{% endif %}</span></div>{% else %}<p class="muted">No service traffic changes to rank.</p>{% endfor %}
+    </div>
+  </section>
+</div>
+
+<div class="analytics-two-column reporting-two-column">
+  <section class="card">
+    <div class="card-heading"><div><h2>Top devices</h2><p class="muted">Highest retained traffic totals in the selected period.</p></div></div>
+    <div class="reporting-movers">{% for row in top_devices %}<div><span><strong>{{row.display_name}}</strong><small>{{row.client_ip}}</small></span><span><strong>{{row.total_bytes_human}}</strong><small>{{row.flows}} flows</small></span></div>{% else %}<p class="muted">No device traffic evidence.</p>{% endfor %}</div>
+  </section>
+  <section class="card">
+    <div class="card-heading"><div><h2>Top services</h2><p class="muted">Highest service-attributed traffic totals in the selected period.</p></div></div>
+    <div class="reporting-movers">{% for row in top_services %}<div><span><strong>{{row.display_name}}</strong></span><span><strong>{{row.total_bytes_human}}</strong><small>{{row.flows}} flows</small></span></div>{% else %}<p class="muted">No service-attributed traffic evidence.</p>{% endfor %}</div>
+  </section>
+</div>
+
+<div class="analytics-two-column reporting-two-column">
+  <section class="card"><div class="card-heading"><div><h2>New domains</h2><p class="muted">No evidence in the preceding 30-day lookback for the same reporting scope.</p></div><span class="policy-badge staging">{{new_domains|length}} SHOWN</span></div><div class="reporting-domain-list">{% for row in new_domains %}<div><strong>{{row.domain}}</strong><span>{{row.queries}} queries · {{row.devices}} devices{% if row.service %} · {{row.service}}{% endif %}</span></div>{% else %}<p class="muted">No new domains identified.</p>{% endfor %}</div></section>
+  <section class="card"><div class="card-heading"><div><h2>Blocked domains</h2><p class="muted">Explicit retained DNS block evidence in the selected period.</p></div><span class="policy-badge disabled">{{blocked_domains|length}} SHOWN</span></div><div class="reporting-domain-list">{% for row in blocked_domains %}<div><strong>{{row.domain}}</strong><span>{{row.blocked}} blocked · {{row.queries}} queries{% if row.service %} · {{row.service}}{% endif %}</span></div>{% else %}<p class="muted">No blocked-domain evidence in this period.</p>{% endfor %}</div></section>
+</div>
+{% endif %}
+</main>
+</body>
+</html>
