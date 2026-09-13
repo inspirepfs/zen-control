@@ -4,11 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.54.5.3">
-  <link rel="stylesheet" href="/static/layout.css?v=0.54.5.3">
-  <link rel="stylesheet" href="/static/activity.css?v=0.54.5.3">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.54.5.3">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.54.5.3">
+  <link rel="stylesheet" href="/static/app.css?v=0.55.0">
+  <link rel="stylesheet" href="/static/layout.css?v=0.55.0">
+  <link rel="stylesheet" href="/static/activity.css?v=0.55.0">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.55.0">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.0">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.0">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -45,6 +46,11 @@
         </form>
       {% endif %}
     {% endif %}
+    <a class="notification-bell{% if notification_counts.critical_unread %} notification-bell-critical{% endif %}" href="/?view=notifications&amp;section=inbox#notifications/inbox" aria-label="Notifications: {{ notification_counts.unread }} unread" title="Notifications">
+      <span class="notification-bell-icon" aria-hidden="true">🔔</span>
+      <span class="notification-bell-label">Alerts</span>
+      {% if notification_counts.unread %}<span class="notification-bell-count">{{ notification_counts.unread }}</span>{% endif %}
+    </a>
     <form method="post" action="/logout" data-auth-exempt="1"><button class="ghost">Sign out</button></form>
   </div>
 </header>
@@ -2098,6 +2104,105 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
 </div>
 
 {% endif %}
+{% if active_view == 'notifications' %}
+<div class="tab-panel active" data-panel="notifications">
+  <section class="card notification-hero-card" data-ux-groups="inbox history">
+    <div class="card-heading">
+      <div>
+        <h2>Notification centre</h2>
+        <p class="muted">Durable attention events from ZEN's existing operational evidence. Notifications never create RouterOS authority and never replace the owning incident, worker or policy state.</p>
+      </div>
+      {% if notification_counts.critical_unread %}
+        <span class="reconcile-state reconcile-error">{{ notification_counts.critical_unread }} CRITICAL UNREAD</span>
+      {% elif notification_counts.unread %}
+        <span class="reconcile-state reconcile-partial">{{ notification_counts.unread }} UNREAD</span>
+      {% else %}
+        <span class="reconcile-state reconcile-sync">CAUGHT UP</span>
+      {% endif %}
+    </div>
+    <div class="notification-summary-grid">
+      <div><span class="muted small">Unread</span><strong>{{ notification_counts.unread }}</strong></div>
+      <div><span class="muted small">Critical</span><strong>{{ notification_counts.critical_unread }}</strong></div>
+      <div><span class="muted small">Unresolved</span><strong>{{ notification_counts.unresolved }}</strong></div>
+      <div><span class="muted small">Acknowledged</span><strong>{{ notification_counts.acknowledged }}</strong></div>
+      <div><span class="muted small">Events</span><strong>{{ notification_counts.events }}</strong></div>
+      <div><span class="muted small">Deduplicated</span><strong>{{ notification_counts.deduplicated }}</strong></div>
+    </div>
+    <div class="notification-stat-strip">
+      <span>Resolved <strong>{{ notification_counts.resolved }}</strong></span>
+      <span>Dismissed <strong>{{ notification_counts.dismissed }}</strong></span>
+      <span>Ack samples <strong>{{ notification_stats.acknowledged_samples or 0 }}</strong></span>
+      <span>Median acknowledge <strong>{% if notification_stats.acknowledged_samples %}{{ '%.1f'|format((notification_stats.median_ack_seconds or 0) / 60) }} min{% else %}—{% endif %}</strong></span>
+    </div>
+    {% if user.role in ['admin','operator'] and notification_counts.unread %}
+      <form method="post" action="/local/notifications/read-all" class="notification-read-all">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="ghost compact">Mark all read</button>
+      </form>
+    {% endif %}
+  </section>
+
+  <section class="card" data-ux-group="inbox">
+    <div class="card-heading">
+      <div>
+        <h2>Inbox</h2>
+        <p class="muted">Unread and unresolved attention stays here. Source resolution is shown separately from your read, acknowledge or dismiss state.</p>
+      </div>
+    </div>
+    <div class="notification-list">
+      {% for notification in notifications_inbox %}
+      <article class="notification-card notification-severity-{{ notification.severity }} notification-state-{{ notification.state }}{% if notification.resolved_at %} notification-resolved{% endif %}">
+        <div class="notification-card-main">
+          <div class="notification-card-heading">
+            <span class="notification-severity-badge">{{ notification.severity|upper }}</span>
+            {% if notification.state == 'unread' %}<span class="policy-badge active">UNREAD</span>{% elif notification.state == 'acknowledged' %}<span class="policy-badge staging">ACKNOWLEDGED</span>{% else %}<span class="policy-badge">{{ notification.state|upper }}</span>{% endif %}
+            {% if notification.resolved_at %}<span class="policy-badge">SOURCE RESOLVED</span>{% endif %}
+            <strong>{{ notification.title }}</strong>
+          </div>
+          <div class="notification-meta">
+            <span>{{ notification.source }}</span>
+            <span>{{ notification.event_type|replace('_',' ') }}</span>
+            {% if notification.subject %}<span>{{ notification.subject }}</span>{% endif %}
+            <span>#{{ notification.id }}</span>
+            <span>{{ notification.occurrences }} event{{ '' if notification.occurrences == 1 else 's' }}</span>
+          </div>
+          {% if notification.detail %}<p>{{ notification.detail }}</p>{% endif %}
+          <div class="notification-timestamps muted small">First {{ notification.first_seen_at }} · Last {{ notification.last_seen_at }}{% if notification.resolved_at %} · resolved {{ notification.resolved_at }}{% endif %}</div>
+          {% if notification.context_link %}<a class="button-link compact" href="{{ notification.context_link.href }}">{{ notification.context_link.label }}</a>{% endif %}
+        </div>
+        {% if user.role in ['admin','operator'] %}
+        <div class="notification-actions">
+          {% if notification.state == 'unread' %}
+          <form method="post" action="/local/notifications/{{ notification.id }}/read"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost compact">Read</button></form>
+          {% endif %}
+          {% if notification.state != 'acknowledged' %}
+          <form method="post" action="/local/notifications/{{ notification.id }}/ack"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="compact">Acknowledge</button></form>
+          {% endif %}
+          <form method="post" action="/local/notifications/{{ notification.id }}/dismiss"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost compact">Dismiss</button></form>
+        </div>
+        {% endif %}
+      </article>
+      {% else %}
+        <div class="notification-clear-state"><strong>Inbox clear</strong><span class="muted">No unread or unresolved notifications need attention.</span></div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card" data-ux-group="history">
+    <div class="card-heading"><div><h2>Notification history</h2><p class="muted">Resolved read items and dismissed notifications remain inspectable as operational evidence.</p></div></div>
+    <div class="notification-history-list">
+      {% for notification in notifications_history %}
+      <div class="notification-history-row">
+        <div><strong>{{ notification.title }}</strong><span class="muted small">{{ notification.source }} · {{ notification.severity|upper }} · {{ notification.state|upper }} · #{{ notification.id }}</span></div>
+        <div><span>{{ notification.updated_at }}</span><span class="muted small">{{ notification.resolution or ('dismissed by ' ~ notification.dismissed_by if notification.dismissed_by else 'archived') }}</span></div>
+        {% if notification.context_link %}<a class="inline-context-link" href="{{ notification.context_link.href }}">{{ notification.context_link.label }}</a>{% endif %}
+      </div>
+      {% else %}<p class="muted">No archived notifications yet.</p>{% endfor %}
+    </div>
+  </section>
+</div>
+{% endif %}
+
 {% if active_view == 'incidents' %}
 <div class="tab-panel active" data-panel="incidents">
   <section class="card incident-hero-card">
@@ -3151,6 +3256,10 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       { key: 'summaries', label: 'Summaries', match: ['Parent summary'] },
       { key: 'history', label: 'History', match: ['Historical analytics'] },
     ],
+    notifications: [
+      { key: 'inbox', label: 'Inbox', match: ['Notification centre', 'Inbox'] },
+      { key: 'history', label: 'History', match: ['Notification history'] },
+    ],
     incidents: [
       { key: 'active', label: 'Active', match: ['Incident centre', 'Active incidents'] },
       { key: 'history', label: 'History', match: [''] },
@@ -3273,7 +3382,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
   const raw = location.hash ? location.hash.substring(1) : '{{ active_view }}';
   const [initialTab, initialSubtab = ''] = raw.split('/');
   const serverView = '{{ active_view }}';
-  if (initialTab && initialTab !== serverView && ['dashboard','devices','policies','schedules','activity','incidents','audit','settings'].includes(initialTab)) {
+  if (initialTab && initialTab !== serverView && ['dashboard','devices','policies','schedules','activity','notifications','incidents','audit','settings'].includes(initialTab)) {
     const suffix = initialSubtab ? `#${initialTab}/${initialSubtab}` : `#${initialTab}`;
     window.location.replace(`/?view=${initialTab}&section=${initialSubtab || ''}${suffix}`);
     return;

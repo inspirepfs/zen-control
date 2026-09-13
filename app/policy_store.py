@@ -347,6 +347,41 @@ class PolicyStore:
                 CREATE INDEX IF NOT EXISTS idx_incidents_source_status
                     ON incidents(source, status);
 
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    source TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    subject TEXT NOT NULL DEFAULT '',
+                    severity TEXT NOT NULL DEFAULT 'info',
+                    state TEXT NOT NULL DEFAULT 'unread',
+                    title TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    source_ref TEXT NOT NULL DEFAULT '',
+                    target_url TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    read_at TEXT,
+                    read_by TEXT NOT NULL DEFAULT '',
+                    acknowledged_at TEXT,
+                    acknowledged_by TEXT NOT NULL DEFAULT '',
+                    dismissed_at TEXT,
+                    dismissed_by TEXT NOT NULL DEFAULT '',
+                    resolved_at TEXT,
+                    resolved_by TEXT NOT NULL DEFAULT '',
+                    resolution TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_notifications_state_updated
+                    ON notifications(state, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_notifications_source_event
+                    ON notifications(source, event_type, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_notifications_resolved_updated
+                    ON notifications(resolved_at, updated_at DESC);
+
                 CREATE TABLE IF NOT EXISTS reward_accounts (
                     ip TEXT PRIMARY KEY,
                     balance_minutes INTEGER NOT NULL DEFAULT 0,
@@ -1261,16 +1296,32 @@ class PolicyStore:
 
     def complete_background_job(self, job_id, *, worker_name, lease_token, result=None):
         now = self._operations_now_iso()
-        self._update_background_job_with_lease(
-            job_id,
-            worker_name,
-            lease_token,
-            """UPDATE background_jobs
-               SET status='succeeded', result_json=?, error='', finished_at=?, updated_at=?,
-                   lease_owner='', lease_token='', lease_expires_at=''
-               WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?""",
-            (self._bounded_json(result), now, now),
-        )
+        with self._db() as db:
+            row = db.execute(
+                """SELECT kind, scope FROM background_jobs
+                   WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?""",
+                (int(job_id), str(worker_name), str(lease_token)),
+            ).fetchone()
+            if not row:
+                raise ValueError("Background job lease no longer belongs to this worker")
+            cur = db.execute(
+                """UPDATE background_jobs
+                   SET status='succeeded', result_json=?, error='', finished_at=?, updated_at=?,
+                       lease_owner='', lease_token='', lease_expires_at=''
+                   WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?""",
+                (
+                    self._bounded_json(result), now, now, int(job_id),
+                    str(worker_name), str(lease_token),
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Background job lease no longer belongs to this worker")
+            self._resolve_notification_db(
+                db,
+                dedupe_key=f"background:{row['kind']}:{row['scope']}",
+                actor=str(worker_name),
+                resolution="A newer background job for this scope completed successfully",
+            )
 
     def fail_background_job(self, job_id, *, worker_name, lease_token, error):
         now_dt = datetime.now(timezone.utc)
@@ -1278,13 +1329,14 @@ class PolicyStore:
         retry_at = (now_dt + timedelta(seconds=5)).isoformat(timespec="seconds")
         with self._db() as db:
             row = db.execute(
-                """SELECT attempts, max_attempts FROM background_jobs
+                """SELECT attempts, max_attempts, kind, scope FROM background_jobs
                    WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?""",
                 (int(job_id), str(worker_name), str(lease_token)),
             ).fetchone()
             if not row:
                 raise ValueError("Background job lease no longer belongs to this worker")
             terminal = int(row["attempts"]) >= int(row["max_attempts"])
+            error_text = str(error or "Background job failed")[:500]
             db.execute(
                 """UPDATE background_jobs
                    SET status=?, error=?, available_at=?, finished_at=?, updated_at=?,
@@ -1292,13 +1344,32 @@ class PolicyStore:
                    WHERE id=?""",
                 (
                     "failed" if terminal else "pending",
-                    str(error or "Background job failed")[:500],
+                    error_text,
                     retry_at,
                     now if terminal else "",
                     now,
                     int(job_id),
                 ),
             )
+            if terminal:
+                title = (
+                    "Prepared read model failed"
+                    if str(row["kind"]) == "analytics.prepared-view"
+                    else "Background job failed"
+                )
+                self._upsert_notification_db(
+                    db,
+                    dedupe_key=f"background:{row['kind']}:{row['scope']}",
+                    source="background",
+                    event_type="background_job_failed",
+                    severity="warning",
+                    title=title,
+                    detail=f"{row['kind']} · {row['scope']}: {error_text}",
+                    subject=str(row["scope"]),
+                    source_ref=f"background_job:{int(job_id)}",
+                    raise_attention=True,
+                    increment_occurrence=True,
+                )
 
     def defer_background_job(self, job_id, *, worker_name, lease_token, delay_seconds=1, reason="deferred"):
         now_dt = datetime.now(timezone.utc)
@@ -1614,7 +1685,7 @@ class PolicyStore:
             counts = {}
             for table in (
                 "profiles", "device_policy", "services", "schedule_plans",
-                "aggregate_policy_groups", "incidents",
+                "aggregate_policy_groups", "incidents", "notifications",
             ):
                 counts[table] = int(db.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
             modes = {
@@ -2033,6 +2104,293 @@ class PolicyStore:
     def _incident_row(row):
         return dict(row) if row is not None else None
 
+    @staticmethod
+    def _notification_state(value):
+        value = str(value or "unread").strip().lower()
+        return value if value in {"unread", "read", "acknowledged", "dismissed"} else "unread"
+
+    @staticmethod
+    def _notification_row(row):
+        return dict(row) if row is not None else None
+
+    def _upsert_notification_db(
+        self,
+        db,
+        *,
+        dedupe_key,
+        source,
+        event_type,
+        severity,
+        title,
+        detail="",
+        subject="",
+        source_ref="",
+        target_url="",
+        raise_attention=True,
+        increment_occurrence=True,
+    ):
+        dedupe_key = str(dedupe_key or "").strip()[:240]
+        if not dedupe_key:
+            raise ValueError("Notification dedupe key is required")
+        source = str(source or "system").strip()[:120] or "system"
+        event_type = str(event_type or "event").strip()[:120] or "event"
+        subject = str(subject or "").strip()[:160]
+        source_ref = str(source_ref or "").strip()[:240]
+        target_url = str(target_url or "").strip()[:500]
+        severity = self._incident_severity(severity)
+        title = str(title or "Notification").strip()[:200] or "Notification"
+        detail = str(detail or "").strip()[:3000]
+        now = self._incident_now_iso()
+
+        row = db.execute(
+            "SELECT * FROM notifications WHERE dedupe_key=?",
+            (dedupe_key,),
+        ).fetchone()
+        if row is None:
+            cur = db.execute(
+                """INSERT INTO notifications
+                   (dedupe_key, source, event_type, subject, severity, state, title, detail,
+                    source_ref, target_url, created_at, first_seen_at, last_seen_at, updated_at, occurrences)
+                   VALUES (?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                (
+                    dedupe_key, source, event_type, subject, severity, title, detail,
+                    source_ref, target_url, now, now, now, now,
+                ),
+            )
+            notification_id = cur.lastrowid
+            action = "created"
+        else:
+            notification_id = int(row["id"])
+            state = self._notification_state(row["state"])
+            resolved = bool(row["resolved_at"])
+            severity_escalated = (
+                {"info": 0, "warning": 1, "critical": 2}.get(severity, 1)
+                > {"info": 0, "warning": 1, "critical": 2}.get(str(row["severity"]), 1)
+            )
+            reopen = bool(raise_attention and resolved)
+            escalated_attention = bool(raise_attention and severity_escalated)
+            next_state = "unread" if reopen or escalated_attention else state
+            occurrence_sql = "occurrences=occurrences+1," if increment_occurrence else ""
+            clear_attention = reopen or (state == "dismissed" and escalated_attention)
+            reopen_sql = (
+                "resolved_at=NULL, resolved_by='', resolution='', dismissed_at=NULL, dismissed_by='', "
+                "acknowledged_at=NULL, acknowledged_by='', "
+                if clear_attention else ""
+            )
+            db.execute(
+                f"""UPDATE notifications
+                    SET source=?, event_type=?, subject=?, severity=?, state=?, title=?, detail=?,
+                        source_ref=?, target_url=?, last_seen_at=?, updated_at=?,
+                        {occurrence_sql} {reopen_sql}
+                        read_at=CASE WHEN ?='unread' THEN NULL ELSE read_at END,
+                        read_by=CASE WHEN ?='unread' THEN '' ELSE read_by END
+                    WHERE id=?""",
+                (
+                    source, event_type, subject, severity, next_state, title, detail, source_ref,
+                    target_url, now, now, next_state, next_state, notification_id,
+                ),
+            )
+            action = "reopened" if reopen else ("escalated" if severity_escalated else "updated")
+
+        result = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+        return {**dict(result), "action": action}
+
+    def upsert_notification(self, **kwargs):
+        with self._db() as db:
+            return self._upsert_notification_db(db, **kwargs)
+
+    def get_notification(self, notification_id):
+        with self._db() as db:
+            row = db.execute("SELECT * FROM notifications WHERE id=?", (int(notification_id),)).fetchone()
+        return self._notification_row(row)
+
+    def list_notifications(self, *, archived=False, limit=100):
+        try:
+            limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        if archived:
+            where = "WHERE state='dismissed' OR (resolved_at IS NOT NULL AND state<>'unread')"
+        else:
+            where = "WHERE state<>'dismissed' AND (resolved_at IS NULL OR state='unread')"
+        with self._db() as db:
+            rows = db.execute(
+                f"""SELECT * FROM notifications {where}
+                    ORDER BY CASE state WHEN 'unread' THEN 0 WHEN 'acknowledged' THEN 1 ELSE 2 END,
+                             CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                             updated_at DESC, id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def notification_counts(self):
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT state, severity, resolved_at, occurrences FROM notifications"""
+            ).fetchall()
+        result = {
+            "total": len(rows), "events": 0, "deduplicated": 0, "unread": 0,
+            "critical_unread": 0, "warning_unread": 0, "info_unread": 0,
+            "acknowledged": 0, "dismissed": 0, "resolved": 0, "unresolved": 0,
+        }
+        for row in rows:
+            state = self._notification_state(row["state"])
+            severity = self._incident_severity(row["severity"])
+            occurrences = max(1, int(row["occurrences"] or 1))
+            result["events"] += occurrences
+            if state == "unread":
+                result["unread"] += 1
+                result[f"{severity}_unread"] += 1
+            if state == "acknowledged":
+                result["acknowledged"] += 1
+            if state == "dismissed":
+                result["dismissed"] += 1
+            if row["resolved_at"]:
+                result["resolved"] += 1
+            elif state != "dismissed":
+                result["unresolved"] += 1
+        result["deduplicated"] = max(0, result["events"] - result["total"])
+        return result
+
+    def notification_stats(self):
+        counts = self.notification_counts()
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT created_at, acknowledged_at FROM notifications
+                   WHERE acknowledged_at IS NOT NULL ORDER BY id"""
+            ).fetchall()
+        ack_seconds = []
+        for row in rows:
+            try:
+                start = datetime.fromisoformat(str(row["created_at"]))
+                end = datetime.fromisoformat(str(row["acknowledged_at"]))
+                ack_seconds.append(max(0.0, (end - start).total_seconds()))
+            except (TypeError, ValueError):
+                continue
+        ack_seconds.sort()
+        median_ack_seconds = 0.0
+        if ack_seconds:
+            mid = len(ack_seconds) // 2
+            median_ack_seconds = (
+                ack_seconds[mid]
+                if len(ack_seconds) % 2
+                else (ack_seconds[mid - 1] + ack_seconds[mid]) / 2.0
+            )
+        return {**counts, "acknowledged_samples": len(ack_seconds), "median_ack_seconds": median_ack_seconds}
+
+    def _notification_transition(self, notification_id, *, state, actor):
+        notification_id = int(notification_id)
+        state = self._notification_state(state)
+        if state == "unread":
+            raise ValueError("Unread is not a terminal operator transition")
+        actor = str(actor or "unknown").strip()[:100]
+        now = self._incident_now_iso()
+        with self._db() as db:
+            row = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+            if row is None:
+                raise ValueError("Notification does not exist")
+            if state == "read":
+                db.execute(
+                    "UPDATE notifications SET state='read', read_at=?, read_by=?, updated_at=? WHERE id=?",
+                    (now, actor, now, notification_id),
+                )
+            elif state == "acknowledged":
+                db.execute(
+                    """UPDATE notifications SET state='acknowledged', read_at=COALESCE(read_at, ?),
+                       read_by=CASE WHEN read_by='' THEN ? ELSE read_by END, acknowledged_at=?,
+                       acknowledged_by=?, updated_at=? WHERE id=?""",
+                    (now, actor, now, actor, now, notification_id),
+                )
+            elif state == "dismissed":
+                db.execute(
+                    """UPDATE notifications SET state='dismissed', read_at=COALESCE(read_at, ?),
+                       read_by=CASE WHEN read_by='' THEN ? ELSE read_by END, dismissed_at=?,
+                       dismissed_by=?, updated_at=? WHERE id=?""",
+                    (now, actor, now, actor, now, notification_id),
+                )
+            result = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+        return dict(result)
+
+    def mark_notification_read(self, notification_id, actor):
+        return self._notification_transition(notification_id, state="read", actor=actor)
+
+    def acknowledge_notification(self, notification_id, actor):
+        return self._notification_transition(notification_id, state="acknowledged", actor=actor)
+
+    def dismiss_notification(self, notification_id, actor):
+        return self._notification_transition(notification_id, state="dismissed", actor=actor)
+
+    def mark_all_notifications_read(self, actor):
+        actor = str(actor or "unknown").strip()[:100]
+        now = self._incident_now_iso()
+        with self._db() as db:
+            cur = db.execute(
+                """UPDATE notifications SET state='read', read_at=?, read_by=?, updated_at=?
+                   WHERE state='unread'""",
+                (now, actor, now),
+            )
+        return int(cur.rowcount or 0)
+
+    def _resolve_notification_db(self, db, *, dedupe_key, actor="system", resolution="Signal cleared"):
+        now = self._incident_now_iso()
+        db.execute(
+            """UPDATE notifications SET resolved_at=COALESCE(resolved_at, ?), resolved_by=?,
+               resolution=?, updated_at=? WHERE dedupe_key=?""",
+            (now, str(actor or "system")[:100], str(resolution or "Signal cleared")[:500], now, str(dedupe_key)),
+        )
+
+    def resolve_notification(self, dedupe_key, actor="system", resolution="Signal cleared"):
+        with self._db() as db:
+            self._resolve_notification_db(db, dedupe_key=dedupe_key, actor=actor, resolution=resolution)
+            row = db.execute("SELECT * FROM notifications WHERE dedupe_key=?", (str(dedupe_key),)).fetchone()
+        return self._notification_row(row)
+
+    def _sync_incident_notification_db(self, db, incident, action, actor):
+        fingerprint = str(incident["fingerprint"])
+        dedupe_key = f"incident:{fingerprint}"
+        existing = db.execute(
+            "SELECT id FROM notifications WHERE dedupe_key=?", (dedupe_key,)
+        ).fetchone()
+        should_create = existing is None and str(incident["status"]) != "resolved"
+        if should_create or action in {"opened", "reopened", "severity_changed"}:
+            result = self._upsert_notification_db(
+                db,
+                dedupe_key=dedupe_key,
+                source=str(incident["source"]),
+                event_type="incident",
+                severity=str(incident["severity"]),
+                title=str(incident["title"]),
+                detail=str(incident["detail"] or ""),
+                subject=str(incident["subject"] or ""),
+                source_ref=f"incident:{incident['id']}",
+                raise_attention=(str(incident["status"]) == "open"),
+                increment_occurrence=not should_create or action in {"opened", "reopened", "severity_changed"},
+            )
+            if should_create and str(incident["status"]) == "acknowledged":
+                ack_at = incident["acknowledged_at"] or self._incident_now_iso()
+                ack_by = str(incident["acknowledged_by"] or actor or "system")[:100]
+                db.execute(
+                    """UPDATE notifications SET state='acknowledged', read_at=?, read_by=?,
+                       acknowledged_at=?, acknowledged_by=?, updated_at=? WHERE id=?""",
+                    (ack_at, ack_by, ack_at, ack_by, self._incident_now_iso(), result["id"]),
+                )
+            return result
+        if existing is not None:
+            self._upsert_notification_db(
+                db,
+                dedupe_key=dedupe_key,
+                source=str(incident["source"]),
+                event_type="incident",
+                severity=str(incident["severity"]),
+                title=str(incident["title"]),
+                detail=str(incident["detail"] or ""),
+                subject=str(incident["subject"] or ""),
+                source_ref=f"incident:{incident['id']}",
+                raise_attention=False,
+                increment_occurrence=False,
+            )
+        return None
+
     def upsert_incident(
         self,
         *,
@@ -2112,6 +2470,7 @@ class PolicyStore:
                     action = "severity_changed" if prior_severity != severity else ("updated" if changed else "unchanged")
 
             result = db.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            self._sync_incident_notification_db(db, result, action, actor)
 
             setting = db.execute(
                 "SELECT value FROM app_settings WHERE key='incident_retention_days'"
@@ -2193,6 +2552,13 @@ class PolicyStore:
                    acknowledged_by=?, updated_at=? WHERE id=?""",
                 (now, actor, now, incident_id),
             )
+            db.execute(
+                """UPDATE notifications SET state='acknowledged',
+                   read_at=COALESCE(read_at, ?), read_by=CASE WHEN read_by='' THEN ? ELSE read_by END,
+                   acknowledged_at=?, acknowledged_by=?, updated_at=?
+                   WHERE dedupe_key=?""",
+                (now, actor, now, actor, now, f"incident:{row['fingerprint']}"),
+            )
             result = db.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
         return dict(result)
 
@@ -2210,6 +2576,12 @@ class PolicyStore:
                 """UPDATE incidents SET status='resolved', resolved_at=?, resolved_by=?,
                    resolution=?, suppress_until_clear=?, updated_at=? WHERE id=?""",
                 (now, actor, resolution, suppress_value, now, incident_id),
+            )
+            self._resolve_notification_db(
+                db,
+                dedupe_key=f"incident:{row['fingerprint']}",
+                actor=actor,
+                resolution=resolution,
             )
             result = db.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
         return dict(result)
@@ -2236,6 +2608,12 @@ class PolicyStore:
                            suppress_until_clear=0, updated_at=?
                            WHERE id=?""",
                         (now, actor, now, row["id"]),
+                    )
+                    self._resolve_notification_db(
+                        db,
+                        dedupe_key=f"incident:{row['fingerprint']}",
+                        actor=actor,
+                        resolution="Signal cleared by successful incident scan",
                     )
                     resolved.append({**dict(row), "status": "resolved", "resolved_at": now})
                 elif int(row["suppress_until_clear"] or 0):
@@ -2404,7 +2782,7 @@ class PolicyStore:
             "summary_deliveries", "policy_state_history", "managed_device_identity",
             "config_revision_state", "config_revisions", "outbox_events",
             "background_jobs", "background_scope_locks", "background_worker_metrics",
-            "prepared_views", "reconciliation_requests",
+            "prepared_views", "reconciliation_requests", "notifications",
         }
         try:
             with sqlite3.connect(self.path, timeout=5.0) as db:

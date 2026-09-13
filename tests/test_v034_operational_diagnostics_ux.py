@@ -235,7 +235,7 @@ class DiagnosticsIntegrationAndUxTests(unittest.TestCase):
         cls.ux = (ROOT / "app/ux.py").read_text()
 
     def test_v034_routes_and_version_are_wired(self):
-        self.assertIn('version="0.54.5.3"', self.main)
+        self.assertIn('version="0.55.0"', self.main)
         self.assertIn('@app.get("/diagnostics", response_class=HTMLResponse)', self.main)
         self.assertIn('@app.get("/api/operations/diagnostics")', self.main)
         self.assertIn('@app.get("/local/operations/diagnostics/export")', self.main)
@@ -267,9 +267,9 @@ class DiagnosticsIntegrationAndUxTests(unittest.TestCase):
         self.assertIn('@media(max-width:760px)', self.app_css)
 
     def test_diagnostics_assets_are_cache_busted(self):
-        self.assertIn('/static/app.css?v=0.54.5.3', self.template)
-        self.assertIn('/static/layout.css?v=0.54.5.3', self.template)
-        self.assertIn('/static/diagnostics.css?v=0.54.5.3', self.template)
+        self.assertIn('/static/app.css?v=0.55.0', self.template)
+        self.assertIn('/static/layout.css?v=0.55.0', self.template)
+        self.assertIn('/static/diagnostics.css?v=0.55.0', self.template)
 
     def test_bundle_privacy_boundary_is_visible(self):
         self.assertIn('Sanitized support bundle', self.template)

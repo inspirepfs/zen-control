@@ -1,0 +1,43 @@
+/* v0.55 notification centre: attention state only; source systems retain authority. */
+.notification-bell{display:inline-flex;align-items:center;gap:5px;min-height:34px;padding:6px 9px;border:1px solid #334368;border-radius:10px;background:#111a31;color:#dce6ff;text-decoration:none;font-size:.75rem;font-weight:700}
+.notification-bell:hover{border-color:#5973ad;background:#182441}
+.notification-bell-icon{font-size:.9rem;line-height:1;filter:saturate(.75)}
+.notification-bell-count{min-width:19px;height:19px;padding:0 5px;border-radius:999px;display:inline-grid;place-items:center;background:#d59a39;color:#11131b;font-size:.65rem;font-weight:900}
+.notification-bell-critical{border-color:#8a3c49;background:rgba(126,34,49,.26)}
+.notification-bell-critical .notification-bell-icon{filter:none}
+.notification-bell-critical .notification-bell-count{background:#ef6473;color:#fff}
+.notification-hero-card{padding:8px 9px!important}
+.notification-summary-grid{display:grid;grid-template-columns:repeat(6,minmax(72px,1fr));gap:4px;margin:5px 0}
+.notification-summary-grid>div{display:grid;gap:2px;padding:6px 7px;border:1px solid rgba(255,255,255,.06);border-radius:7px;background:rgba(255,255,255,.02)}
+.notification-summary-grid span{font-size:.58rem;text-transform:uppercase;letter-spacing:.035em}
+.notification-summary-grid strong{font-size:.9rem}
+.notification-stat-strip{display:flex;flex-wrap:wrap;gap:5px 12px;padding:5px 0;font-size:.65rem;color:#98a6c6}
+.notification-stat-strip strong{color:#dce6ff}
+.notification-read-all{margin-top:4px}
+.notification-list{display:grid;gap:5px}
+.notification-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:7px 8px;border:1px solid rgba(255,255,255,.07);border-left:3px solid #65728f;border-radius:8px;background:rgba(255,255,255,.018)}
+.notification-severity-warning{border-left-color:#d49a43}
+.notification-severity-critical{border-left-color:#e05a69;background:rgba(135,35,50,.08)}
+.notification-severity-info{border-left-color:#608fd0}
+.notification-state-unread{box-shadow:inset 0 0 0 1px rgba(255,255,255,.025)}
+.notification-resolved{opacity:.78}
+.notification-card-main{display:grid;gap:3px;min-width:0}
+.notification-card-heading{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.notification-card-heading strong{font-size:.78rem}
+.notification-severity-badge{padding:2px 5px;border-radius:999px;border:1px solid currentColor;font-size:.51rem;letter-spacing:.045em;font-weight:800;color:#a8b5d3}
+.notification-severity-critical .notification-severity-badge{color:#ef7884}
+.notification-severity-warning .notification-severity-badge{color:#e2ad5a}
+.notification-severity-info .notification-severity-badge{color:#83aee8}
+.notification-meta{display:flex;flex-wrap:wrap;gap:4px 8px;color:#8593b3;font-size:.61rem}
+.notification-card p{margin:1px 0;font-size:.69rem;line-height:1.2}
+.notification-timestamps{font-size:.58rem!important}
+.notification-actions{display:flex;align-items:flex-start;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.notification-actions form{margin:0}
+.notification-clear-state{display:grid;gap:2px;padding:10px;border:1px dashed rgba(255,255,255,.09);border-radius:8px;text-align:center}
+.notification-history-list{display:grid;gap:2px}
+.notification-history-row{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(180px,.8fr) auto;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.68rem}
+.notification-history-row:last-child{border-bottom:0}
+.notification-history-row>div{display:grid;gap:1px;min-width:0}
+.notification-history-row strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:900px){.notification-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.notification-card{grid-template-columns:1fr}.notification-actions{justify-content:flex-start}.notification-history-row{grid-template-columns:1fr}}
+@media(max-width:600px){.notification-bell-label{display:none}.notification-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.notification-bell{padding:6px 8px}.notification-card{padding:6px}.notification-meta{gap:3px 6px}}

@@ -48,7 +48,7 @@ from app.diagnostics import OperationalDiagnostics, read_telemetry_ingest_status
 from app.incidents import IncidentMonitor
 from app.auth import AuthManager, AuthError, fresh_auth_valid, shared_display_privilege_valid
 from app.auth import shared_display_extension_allowed, extend_shared_display_deadline
-from app.ux import build_connected_overview, audit_destination, incident_destination
+from app.ux import build_connected_overview, audit_destination, incident_destination, notification_destination
 from app.performance import (
     PERF_ENABLED, build_formal_acceptance, collector as performance_collector,
     instrument, perf_span, timed,
@@ -63,7 +63,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.54.5.3")
+app = FastAPI(title="ZEN Control", version="0.55.0")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -455,7 +455,7 @@ def csrf_ok(request: Request, token: str):
 
 ROOT_VIEWS = frozenset({
     "dashboard", "devices", "policies", "schedules",
-    "activity", "incidents", "audit", "settings",
+    "activity", "notifications", "incidents", "audit", "settings",
 })
 ROOT_VIEW_SECTIONS = {
     "dashboard": ("overview", "controls"),
@@ -463,6 +463,7 @@ ROOT_VIEW_SECTIONS = {
     "policies": ("profiles", "assignments", "services", "bandwidth", "tools"),
     "schedules": ("planner", "exceptions", "templates", "router"),
     "activity": ("overview", "devices", "services", "classification", "dns", "summaries", "history"),
+    "notifications": ("inbox", "history"),
     "incidents": ("active", "history"),
     "audit": ("recent",),
     "settings": ("parents", "policy", "automation", "security", "operations"),
@@ -2346,6 +2347,10 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     incident_status = incident_monitor.snapshot()
     summary_delivery_status = summary_delivery.snapshot()
     incident_counts = incident_status.get("counts") or policy_store.incident_counts()
+    notification_counts = policy_store.notification_counts()
+    notifications_inbox = []
+    notifications_history = []
+    notification_stats = {}
     incidents_active = []
     incidents_history = []
     connected_overview = {
@@ -2736,6 +2741,17 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         except ActivityError as exc:
             activity_error = str(exc)
 
+    if active_view == "notifications":
+        notifications_inbox = policy_store.list_notifications(archived=False, limit=120)
+        notifications_history = policy_store.list_notifications(archived=True, limit=80)
+        notification_stats = policy_store.notification_stats()
+        for item in notifications_inbox + notifications_history:
+            item["context_link"] = notification_destination(
+                item.get("source", ""),
+                item.get("event_type", ""),
+                item.get("target_url", ""),
+            )
+
     if active_view == "incidents":
         incidents_active = policy_store.list_incidents(include_resolved=False, limit=80)
         incidents_history = [
@@ -2850,6 +2866,10 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "summary_delivery_status": summary_delivery_status,
             "secure_transport": current_secure_transport_status(),
             "incident_counts": incident_counts,
+            "notification_counts": notification_counts,
+            "notifications_inbox": notifications_inbox,
+            "notifications_history": notifications_history,
+            "notification_stats": notification_stats,
             "incidents_active": incidents_active,
             "incidents_history": incidents_history,
             "connected_overview": connected_overview,
@@ -5278,6 +5298,84 @@ def local_reconciler_settings(
     except ValueError as exc:
         return redirect_error("settings/automation", str(exc))
     return redirect_ok("settings/automation", f"Automatic reconciliation set to {auto_reconcile_mode.upper()}")
+
+
+@app.get("/api/notifications")
+def api_notifications(
+    archived: bool = False,
+    limit: int = 100,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return {
+        "schema": "zen_notifications_v1",
+        "counts": policy_store.notification_counts(),
+        "stats": policy_store.notification_stats(),
+        "notifications": policy_store.list_notifications(archived=archived, limit=limit),
+    }
+
+
+@app.post("/local/notifications/read-all")
+def local_notifications_read_all(
+    request: Request,
+    csrf: str = Form(...),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/inbox", "CSRF validation failed")
+    changed = policy_store.mark_all_notifications_read(user["username"])
+    audit("NOTIFICATIONS_READ_ALL", user["username"], f"count={changed}")
+    return redirect_ok("notifications/inbox", f"Marked {changed} notification{'s' if changed != 1 else ''} read")
+
+
+@app.post("/local/notifications/{notification_id}/read")
+def local_notification_read(
+    notification_id: int,
+    request: Request,
+    csrf: str = Form(...),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/inbox", "CSRF validation failed")
+    try:
+        row = policy_store.mark_notification_read(notification_id, user["username"])
+    except ValueError as exc:
+        return redirect_error("notifications/inbox", str(exc))
+    audit("NOTIFICATION_READ", user["username"], f"id={notification_id} source={row.get('source')}")
+    return redirect_ok("notifications/inbox", f"Notification #{notification_id} marked read")
+
+
+@app.post("/local/notifications/{notification_id}/ack")
+def local_notification_ack(
+    notification_id: int,
+    request: Request,
+    csrf: str = Form(...),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/inbox", "CSRF validation failed")
+    try:
+        row = policy_store.acknowledge_notification(notification_id, user["username"])
+    except ValueError as exc:
+        return redirect_error("notifications/inbox", str(exc))
+    audit("NOTIFICATION_ACKNOWLEDGED", user["username"], f"id={notification_id} source={row.get('source')}")
+    return redirect_ok("notifications/inbox", f"Notification #{notification_id} acknowledged")
+
+
+@app.post("/local/notifications/{notification_id}/dismiss")
+def local_notification_dismiss(
+    notification_id: int,
+    request: Request,
+    csrf: str = Form(...),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/inbox", "CSRF validation failed")
+    try:
+        row = policy_store.dismiss_notification(notification_id, user["username"])
+    except ValueError as exc:
+        return redirect_error("notifications/inbox", str(exc))
+    audit("NOTIFICATION_DISMISSED", user["username"], f"id={notification_id} source={row.get('source')}")
+    return redirect_ok("notifications/inbox", f"Notification #{notification_id} dismissed")
 
 
 @app.get("/api/incidents")

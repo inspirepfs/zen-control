@@ -1,3 +1,12 @@
+## v0.55.0 — Notification Centre foundation & operational event integration
+
+- Adds a durable `notifications` store with stable deduplication keys, severity, source/event provenance, subject/source references, unread/read/acknowledged/dismissed attention state, independent source-resolution state, occurrence counts and retained history.
+- Adds a first-class Notification Centre with a persistent header bell/unread count, inbox/history views, source-context links, read/acknowledge/dismiss actions, mark-all-read, critical/unread badges and compact responsive styling.
+- Projects the existing durable Incident Monitor lifecycle into notifications without duplicating every scan. Open/reopen/severity-change events attract attention; incident acknowledgement and source resolution propagate to the linked notification while the incident remains the owning operational truth.
+- Emits a deduplicated notification only when a background job reaches terminal failure. A later successful job for the same kind/scope resolves that notification automatically, including prepared-view failures, without adding another polling worker.
+- Adds `zen_notifications_v1` authenticated API evidence and notification statistics for records, generated events, deduplicated repeats, unread/unresolved/critical counts, acknowledgement samples and median acknowledgement time.
+- Preserves authority boundaries: notifications are read-side attention/evidence only. Reading, acknowledging or dismissing a notification never authorises or performs RouterOS mutation and never clears the source condition.
+
 ## v0.54.5.3 — Navigation tail-latency closure
 
 - Removes Dashboard's per-device effective-policy recomputation from the normal navigation path. Favourite cards now reuse the revision-bound desired-policy projection already published by the reconciler; missing advisory plan evidence is shown as unknown rather than triggering synchronous policy resolution.

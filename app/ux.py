@@ -260,3 +260,14 @@ def incident_destination(source: str) -> dict:
     }
     label, href = mapping.get(key, ("Incident centre", "/?view=incidents&section=active#incidents/active"))
     return {"label": label, "href": href}
+
+
+def notification_destination(source: str, event_type: str = "", target_url: str = "") -> dict:
+    explicit = str(target_url or "").strip()
+    if explicit.startswith("/"):
+        return {"label": "Open context", "href": explicit}
+    source_key = str(source or "").lower()
+    event_key = str(event_type or "").lower()
+    if source_key == "background" or event_key == "background_job_failed":
+        return {"label": "Operations", "href": "/?view=settings&section=operations#settings/operations"}
+    return incident_destination(source_key)

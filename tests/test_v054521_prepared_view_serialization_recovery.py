@@ -93,7 +93,7 @@ class PreparedViewSerializationRecoveryTests(unittest.TestCase):
 class RuntimePreparedWorkHealthTests(unittest.TestCase):
     def _runtime(self, prepared_jobs):
         return build_runtime_health(
-            version="0.54.5.3.1",
+            version="0.55.0.1",
             background_worker=_Snapshot({
                 "worker_alive": True,
                 "durable": {"available": True, "prepared_jobs": prepared_jobs},
@@ -118,7 +118,7 @@ class RuntimePreparedWorkHealthTests(unittest.TestCase):
 
     def test_durable_worker_stats_failure_is_fail_closed(self):
         report = build_runtime_health(
-            version="0.54.5.3",
+            version="0.55.0",
             background_worker=_Snapshot({
                 "worker_alive": True,
                 "durable": {"available": False},
