@@ -211,9 +211,9 @@ _TOPICS = {
     "notifications": _topic(
         "notifications", "Operations", "Notification centre",
         "Notifications are ZEN's durable attention layer over existing incident and worker evidence. They can be read, acknowledged, dismissed or muted by preference without changing the underlying source state.",
-        does=("Shows unread, unresolved and historical attention events with deduplication and source links.", "Supports minimum severity, quiet hours, repeat cooldowns, per-event enable/disable, source-family muting and exact device/subject filters.", "Tracks notification volume, muted unread evidence, deduplication and acknowledgement timing."),
-        watch=("A notification preference changes attention only; it never authorises a RouterOS write or suppresses the owning incident, worker or policy evidence.", "Quiet hours and filters retain the durable notification row so evidence can still be inspected.", "Critical events can be configured to bypass quiet hours, and critical severity always bypasses repeat cooldown."),
-        related=(("Incident centre", "/?view=incidents&section=active#incidents/active"), ("Notification preferences", "/?view=notifications&section=preferences#notifications/preferences"), ("Operations", "/?view=settings&section=operations#settings/operations")),
+        does=("Shows unread, unresolved and historical attention events with deduplication and source links.", "Supports minimum severity, quiet hours, repeat cooldowns, per-event enable/disable, source-family muting and exact device/subject filters.", "Correlates related notifications, records a durable lifecycle timeline, explains why attention is being shown, escalates unresolved warning attention under explicit local rules, and previews digest candidates/noisy sources."),
+        watch=("A notification preference or intelligence rule changes attention only; it never authorises a RouterOS write or suppresses the owning incident, worker or policy evidence.", "Notification intelligence retains source severity separately from attention severity; an automatic escalation is not evidence that the source itself became critical.", "Quiet hours and filters retain the durable notification row so evidence can still be inspected; critical attention can be configured to bypass quiet hours and always bypasses repeat cooldown."),
+        related=(("Incident centre", "/?view=incidents&section=active#incidents/active"), ("Notification preferences", "/?view=notifications&section=preferences#notifications/preferences"), ("Notification intelligence", "/?view=notifications&section=intelligence#notifications/intelligence"), ("Operations", "/?view=settings&section=operations#settings/operations")),
     ),
     "incidents": _topic(
         "incidents", "Operations", "Incident centre",
@@ -404,6 +404,7 @@ _ROOT_CONTEXT = {
     ("activity", "history"): "activity_history",
     ("notifications", "inbox"): "notifications",
     ("notifications", "preferences"): "notifications",
+    ("notifications", "intelligence"): "notifications",
     ("notifications", "history"): "notifications",
     ("incidents", "active"): "incidents",
     ("incidents", "history"): "incidents",

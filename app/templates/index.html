@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.55.2">
-  <link rel="stylesheet" href="/static/layout.css?v=0.55.2">
-  <link rel="stylesheet" href="/static/activity.css?v=0.55.2">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.55.2">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.2">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.2">
+  <link rel="stylesheet" href="/static/app.css?v=0.55.3.1">
+  <link rel="stylesheet" href="/static/layout.css?v=0.55.3.1">
+  <link rel="stylesheet" href="/static/activity.css?v=0.55.3.1">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.55.3.1">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.3.1">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.3.1">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -2106,7 +2106,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
 {% endif %}
 {% if active_view == 'notifications' %}
 <div class="tab-panel active" data-panel="notifications">
-  <section class="card notification-hero-card" data-ux-groups="inbox preferences history">
+  <section class="card notification-hero-card" data-ux-groups="inbox preferences intelligence history">
     <div class="card-heading">
       <div>
         <h2>Notification centre</h2>
@@ -2171,6 +2171,18 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
           {% if notification.detail %}<p>{{ notification.detail }}</p>{% endif %}
           <div class="notification-timestamps muted small">First {{ notification.first_seen_at }} · Last {{ notification.last_seen_at }}{% if notification.resolved_at %} · resolved {{ notification.resolved_at }}{% endif %}</div>
           {% if notification.context_link %}<a class="button-link compact" href="{{ notification.context_link.href }}">{{ notification.context_link.label }}</a>{% endif %}
+          <details class="notification-why">
+            <summary>Why am I seeing this?</summary>
+            <div class="notification-why-grid">
+              <span><strong>Source truth</strong>{{ notification.source }}{% if notification.source_ref %} · {{ notification.source_ref }}{% endif %}</span>
+              <span><strong>Source severity</strong>{{ notification.source_severity|upper }}</span>
+              <span><strong>Attention severity</strong>{{ notification.severity|upper }}{% if notification.escalation_level %} · escalated{% endif %}</span>
+              <span><strong>Attention policy</strong>{{ notification.attention_reason }}</span>
+              <span><strong>Correlation</strong>{{ notification.correlation_key }}</span>
+              {% if notification.escalation_reason %}<span><strong>Escalation</strong>{{ notification.escalation_reason }}</span>{% endif %}
+            </div>
+            <p class="muted small"><strong>Suggested next step:</strong> {{ notification.action_hint }}</p>
+          </details>
         </div>
         {% if user.role in ['admin','operator'] %}
         <div class="notification-actions">
@@ -2287,6 +2299,96 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       <span>Muted sources <strong>{{ notification_preferences.muted_sources|length }}</strong></span>
       <span>Muted subjects <strong>{{ notification_preferences.muted_subjects|length }}</strong></span>
       <span>Disabled events <strong>{{ notification_preferences.disabled_events|length }}</strong></span>
+    </div>
+  </section>
+
+  <section class="card notification-intelligence-card" data-ux-group="intelligence">
+    <div class="card-heading">
+      <div>
+        <h2>Notification intelligence</h2>
+        <p class="muted">Correlate related events, escalate unresolved warning attention, explain provenance and preview digest candidates. Intelligence can raise attention but never changes RouterOS or policy state.</p>
+      </div>
+      {% if notification_intelligence.escalated_notifications %}<span class="reconcile-state reconcile-partial">{{ notification_intelligence.escalated_notifications }} ESCALATED</span>{% else %}<span class="reconcile-state reconcile-sync">OBSERVING</span>{% endif %}
+    </div>
+
+    <div class="notification-summary-grid notification-intelligence-summary">
+      <div><span class="muted small">Active groups</span><strong>{{ notification_intelligence.active_groups or 0 }}</strong></div>
+      <div><span class="muted small">Escalated</span><strong>{{ notification_intelligence.escalated_notifications or 0 }}</strong></div>
+      <div><span class="muted small">Reopens</span><strong>{{ notification_intelligence.reopens or 0 }}</strong></div>
+      <div><span class="muted small">Digest groups</span><strong>{{ notification_intelligence.digest_candidate_groups or 0 }}</strong></div>
+      <div><span class="muted small">Median escalation</span><strong>{% if notification_intelligence.median_escalation_seconds %}{{ '%.1f'|format(notification_intelligence.median_escalation_seconds / 60) }}m{% else %}—{% endif %}</strong></div>
+    </div>
+
+    {% if user.role in ['admin','operator'] %}
+    <form method="post" action="/local/notifications/intelligence" class="schedule-form-grid notification-intelligence-form">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label class="checkbox-row"><input type="checkbox" name="escalation_enabled" value="1" {% if notification_intelligence_settings.escalation_enabled %}checked{% endif %}> Enable automatic attention escalation</label>
+      <label>Warning age before CRITICAL attention
+        <select name="warning_escalate_seconds">
+          {% for value,label in [(300,'5 minutes'),(900,'15 minutes'),(1800,'30 minutes'),(3600,'1 hour'),(7200,'2 hours'),(21600,'6 hours'),(43200,'12 hours'),(86400,'24 hours')] %}
+          <option value="{{ value }}" {% if notification_intelligence_settings.warning_escalate_seconds == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Repeat count before CRITICAL attention
+        <select name="repeat_escalate_count">
+          {% for value in [2,3,5,10,20,50] %}<option value="{{ value }}" {% if notification_intelligence_settings.repeat_escalate_count == value %}selected{% endif %}>{{ value }} events</option>{% endfor %}
+        </select>
+      </label>
+      <label>Digest minimum events
+        <select name="digest_min_items">
+          {% for value in [2,3,5,10] %}<option value="{{ value }}" {% if notification_intelligence_settings.digest_min_items == value %}selected{% endif %}>{{ value }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Digest window
+        <select name="digest_window_minutes">
+          {% for value,label in [(15,'15 minutes'),(30,'30 minutes'),(60,'1 hour'),(180,'3 hours'),(360,'6 hours'),(720,'12 hours'),(1440,'24 hours')] %}
+          <option value="{{ value }}" {% if notification_intelligence_settings.digest_window_minutes == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="primary">Save intelligence settings</button>
+    </form>
+    {% endif %}
+    <p class="muted small">Escalation changes only the notification's attention severity. The source severity is retained separately and source resolution remains owned by the originating incident or worker evidence.</p>
+  </section>
+
+  <section class="card" data-ux-group="intelligence">
+    <div class="card-heading"><div><h2>Correlated attention groups</h2><p class="muted">Notifications sharing the same device/subject are grouped so one noisy condition can be understood as a thread rather than isolated alerts.</p></div></div>
+    <div class="notification-group-list">
+      {% for group in notification_groups %}
+      <article class="notification-group notification-severity-{{ group.highest_severity }}">
+        <div><strong>{{ group.subject or group.correlation_key }}</strong><span class="muted small">{{ group.notifications }} notification{{ '' if group.notifications == 1 else 's' }} · {{ group.events }} event{{ '' if group.events == 1 else 's' }} · {{ group.unresolved }} unresolved</span></div>
+        <div class="notification-meta"><span>{{ group.highest_severity|upper }}</span><span>{{ group.sources|join(', ') }}</span><span>{{ group.event_types|join(', ') }}</span>{% if group.suppressed %}<span>{{ group.suppressed }} muted</span>{% endif %}</div>
+        {% if group.titles %}<p>{{ group.titles|join(' · ') }}</p>{% endif %}
+      </article>
+      {% else %}<p class="muted">No active correlation groups.</p>{% endfor %}
+    </div>
+  </section>
+
+  <section class="card" data-ux-group="intelligence">
+    <div class="card-heading"><div><h2>Digest preview</h2><p class="muted">Low/medium urgency attention that could be summarised instead of pushed individually. This slice only previews candidates; it does not send a digest.</p></div></div>
+    <div class="notification-digest-list">
+      {% for group in notification_digest %}
+      <div class="notification-digest-row"><strong>{{ group.subject or group.correlation_key }}</strong><span>{{ group.summary }}</span><span class="muted small">{{ group.titles|join(' · ') }}</span></div>
+      {% else %}<p class="muted">No digest candidate groups in the current window.</p>{% endfor %}
+    </div>
+  </section>
+
+  <section class="card" data-ux-group="intelligence">
+    <div class="card-heading"><div><h2>Noise & escalation analytics</h2><p class="muted">Find event sources and subjects that consume the most attention before changing thresholds or filters.</p></div></div>
+    <div class="notification-analytics-grid">
+      <div><h3>Noisiest sources</h3>{% for item in notification_intelligence.noisy_sources or [] %}<div class="notification-analytics-row"><span>{{ item.source }}</span><strong>{{ item.events }}</strong></div>{% else %}<p class="muted small">No source evidence yet.</p>{% endfor %}</div>
+      <div><h3>Noisiest subjects</h3>{% for item in notification_intelligence.noisy_subjects or [] %}<div class="notification-analytics-row"><span>{{ item.subject }}</span><strong>{{ item.events }}</strong></div>{% else %}<p class="muted small">No subject evidence yet.</p>{% endfor %}</div>
+    </div>
+  </section>
+
+  <section class="card" data-ux-group="intelligence">
+    <div class="card-heading"><div><h2>Notification timeline</h2><p class="muted">Recent durable lifecycle events: creation, repetition, escalation, read/acknowledge/dismiss and source resolution.</p></div></div>
+    <div class="notification-timeline-list">
+      {% for event in notification_timeline %}
+      <div class="notification-timeline-row"><span class="notification-timeline-event">{{ event.event|replace('_',' ')|upper }}</span><div><strong>{{ event.title }}</strong><span class="muted small">#{{ event.notification_id }} · {{ event.source }}{% if event.subject %} · {{ event.subject }}{% endif %}</span></div><span>{{ event.reason or '—' }}</span><span class="muted small">{{ event.created_at }}</span></div>
+      {% else %}<p class="muted">No notification timeline events yet.</p>{% endfor %}
     </div>
   </section>
 
@@ -3361,6 +3463,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     notifications: [
       { key: 'inbox', label: 'Inbox', match: ['Notification centre', 'Inbox'] },
       { key: 'preferences', label: 'Preferences', match: ['Notification preferences'] },
+      { key: 'intelligence', label: 'Intelligence', match: ['Notification intelligence', 'Correlated attention groups', 'Digest preview', 'Noise & escalation analytics', 'Notification timeline'] },
       { key: 'history', label: 'History', match: ['Notification history'] },
     ],
     incidents: [

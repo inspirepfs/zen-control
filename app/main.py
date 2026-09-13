@@ -64,7 +64,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.55.2")
+app = FastAPI(title="ZEN Control", version="0.55.3.1")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -464,7 +464,7 @@ ROOT_VIEW_SECTIONS = {
     "policies": ("profiles", "assignments", "services", "bandwidth", "tools"),
     "schedules": ("planner", "exceptions", "templates", "router"),
     "activity": ("overview", "devices", "services", "classification", "dns", "summaries", "history"),
-    "notifications": ("inbox", "preferences", "history"),
+    "notifications": ("inbox", "preferences", "intelligence", "history"),
     "incidents": ("active", "history"),
     "audit": ("recent",),
     "settings": ("parents", "policy", "automation", "security", "operations"),
@@ -1322,8 +1322,17 @@ def _background_retention(_payload: dict) -> dict:
         **policy_store.prune_background_history(
             retention_days=14, keep_jobs=250, keep_outbox=250
         ),
+        **policy_store.prune_notification_timeline(
+            retention_days=90, keep_rows=10000
+        ),
         "authority": "local-bookkeeping-only",
     }
+
+
+def _background_notification_intelligence(_payload: dict) -> dict:
+    return policy_store.evaluate_notification_intelligence(
+        actor="system:notification-intelligence"
+    )
 
 
 def _schedule_background_analytics() -> int:
@@ -1366,6 +1375,18 @@ def _schedule_background_analytics() -> int:
         )
         if queued and queued.get("created"):
             scheduled += 1
+    minute_bucket = int(now.timestamp()) // 60
+    intelligence = policy_store.enqueue_background_job(
+        kind="notifications.intelligence",
+        scope="notifications:intelligence",
+        idempotency_key=f"notification-intelligence:v{app.version}:m{minute_bucket}",
+        payload={},
+        max_attempts=2,
+        replace_pending=True,
+    )
+    if intelligence and intelligence.get("created"):
+        scheduled += 1
+
     hour_bucket = int(now.timestamp()) // 3600
     maintenance = policy_store.enqueue_background_job(
         kind="maintenance.background-retention",
@@ -1382,6 +1403,7 @@ background_worker = BackgroundWorker(
     handlers={
         "analytics.config-summary": _background_config_analytics,
         "analytics.prepared-view": _background_prepared_view,
+        "notifications.intelligence": _background_notification_intelligence,
         "maintenance.background-retention": _background_retention,
     },
     producer=_schedule_background_analytics,
@@ -2375,6 +2397,11 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     notification_push_status = {}
     notification_event_catalog = []
     notification_source_catalog = []
+    notification_intelligence = {}
+    notification_intelligence_settings = policy_store.notification_intelligence_settings()
+    notification_groups = []
+    notification_digest = []
+    notification_timeline = []
     incidents_active = []
     incidents_history = []
     connected_overview = {
@@ -2772,6 +2799,12 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         notification_preferences = policy_store.notification_preferences()
         notification_push_status = push_delivery.snapshot(username=user["username"])
         notification_event_catalog = policy_store.notification_event_catalog()
+        if active_section == "intelligence":
+            notification_intelligence = policy_store.notification_intelligence_stats()
+            notification_intelligence_settings = policy_store.notification_intelligence_settings()
+            notification_groups = policy_store.notification_groups(active_only=True, limit=50)
+            notification_digest = policy_store.notification_digest_preview(limit=12)
+            notification_timeline = policy_store.list_notification_timeline(limit=60)
         muted_sources = set(notification_preferences.get("muted_sources") or [])
         notification_source_catalog = [
             {"key": key, "label": key.replace("_", " ").title(), "muted": key in muted_sources}
@@ -2906,6 +2939,11 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "notification_push_status": notification_push_status,
             "notification_event_catalog": notification_event_catalog,
             "notification_source_catalog": notification_source_catalog,
+            "notification_intelligence": notification_intelligence,
+            "notification_intelligence_settings": notification_intelligence_settings,
+            "notification_groups": notification_groups,
+            "notification_digest": notification_digest,
+            "notification_timeline": notification_timeline,
             "incidents_active": incidents_active,
             "incidents_history": incidents_history,
             "connected_overview": connected_overview,
@@ -5352,6 +5390,32 @@ def api_notifications(
     }
 
 
+@app.get("/api/notifications/intelligence")
+def api_notification_intelligence(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return {
+        "schema": "zen_notification_intelligence_v1",
+        "settings": policy_store.notification_intelligence_settings(),
+        "stats": policy_store.notification_intelligence_stats(),
+        "groups": policy_store.notification_groups(active_only=True, limit=50),
+        "digest_preview": policy_store.notification_digest_preview(limit=12),
+        "timeline": policy_store.list_notification_timeline(limit=60),
+        "authority": "attention-only-derived",
+    }
+
+
+@app.get("/api/notifications/{notification_id}/explain")
+def api_notification_explain(
+    notification_id: int,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    try:
+        return policy_store.notification_explanation(notification_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/api/notifications/push")
 def api_notification_push_status(
     user=Depends(require_role("admin", "operator", "viewer")),
@@ -5440,6 +5504,43 @@ def api_notification_push_test(
         f"queued={queued['queued']}",
     )
     return {"schema": "zen_notification_push_test_v1", **queued}
+
+
+@app.post("/local/notifications/intelligence")
+def local_notification_intelligence(
+    request: Request,
+    csrf: str = Form(...),
+    escalation_enabled: str = Form("0"),
+    warning_escalate_seconds: str = Form("1800"),
+    repeat_escalate_count: str = Form("5"),
+    digest_min_items: str = Form("2"),
+    digest_window_minutes: str = Form("60"),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/intelligence", "CSRF validation failed")
+    try:
+        saved = policy_store.save_notification_intelligence_settings(
+            escalation_enabled=escalation_enabled,
+            warning_escalate_seconds=warning_escalate_seconds,
+            repeat_escalate_count=repeat_escalate_count,
+            digest_min_items=digest_min_items,
+            digest_window_minutes=digest_window_minutes,
+            actor=user["username"],
+        )
+    except ValueError as exc:
+        return redirect_error("notifications/intelligence", str(exc))
+    background_worker.wake()
+    audit(
+        "NOTIFICATION_INTELLIGENCE_UPDATED",
+        user["username"],
+        (
+            f"escalation={'on' if saved['escalation_enabled'] else 'off'} "
+            f"age={saved['warning_escalate_seconds']}s repeats={saved['repeat_escalate_count']} "
+            f"digest_min={saved['digest_min_items']} window={saved['digest_window_minutes']}m"
+        ),
+    )
+    return redirect_ok("notifications/intelligence", "Notification intelligence settings updated")
 
 
 @app.post("/local/notifications/preferences")

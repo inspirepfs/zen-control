@@ -373,7 +373,13 @@ class PolicyStore:
                     resolved_at TEXT,
                     resolved_by TEXT NOT NULL DEFAULT '',
                     resolution TEXT NOT NULL DEFAULT '',
-                    attention_eligible_at TEXT NOT NULL DEFAULT ''
+                    attention_eligible_at TEXT NOT NULL DEFAULT '',
+                    source_severity TEXT NOT NULL DEFAULT '',
+                    correlation_key TEXT NOT NULL DEFAULT '',
+                    escalation_level INTEGER NOT NULL DEFAULT 0,
+                    escalated_at TEXT NOT NULL DEFAULT '',
+                    escalation_reason TEXT NOT NULL DEFAULT '',
+                    reopen_count INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_notifications_state_updated
@@ -382,6 +388,22 @@ class PolicyStore:
                     ON notifications(source, event_type, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_notifications_resolved_updated
                     ON notifications(resolved_at, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS notification_timeline (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    notification_id INTEGER NOT NULL,
+                    event TEXT NOT NULL,
+                    severity TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT '',
+                    actor TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_notification_timeline_notification
+                    ON notification_timeline(notification_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_notification_timeline_event
+                    ON notification_timeline(event, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS notification_push_subscriptions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -772,6 +794,11 @@ class PolicyStore:
                 "notification_muted_sources": "[]",
                 "notification_muted_subjects": "[]",
                 "notification_disabled_events": "[]",
+                "notification_escalation_enabled": "1",
+                "notification_warning_escalate_seconds": "1800",
+                "notification_repeat_escalate_count": "5",
+                "notification_digest_min_items": "2",
+                "notification_digest_window_minutes": "60",
             }
             for key, value in defaults.items():
                 db.execute(
@@ -786,6 +813,43 @@ class PolicyStore:
             notification_cols = {row["name"] for row in db.execute("PRAGMA table_info(notifications)")}
             if "attention_eligible_at" not in notification_cols:
                 db.execute("ALTER TABLE notifications ADD COLUMN attention_eligible_at TEXT NOT NULL DEFAULT ''")
+            for column, ddl in (
+                ("source_severity", "TEXT NOT NULL DEFAULT ''"),
+                ("correlation_key", "TEXT NOT NULL DEFAULT ''"),
+                ("escalation_level", "INTEGER NOT NULL DEFAULT 0"),
+                ("escalated_at", "TEXT NOT NULL DEFAULT ''"),
+                ("escalation_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("reopen_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in notification_cols:
+                    db.execute(f"ALTER TABLE notifications ADD COLUMN {column} {ddl}")
+            # Upgrade ordering matters: existing pre-v0.55.3.1 databases do not
+            # have correlation_key when the initial CREATE TABLE IF NOT EXISTS
+            # block runs. Create the correlation index only after the additive
+            # column migration above has completed.
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notifications_correlation "
+                "ON notifications(correlation_key, resolved_at, updated_at DESC)"
+            )
+            db.execute("UPDATE notifications SET source_severity=severity WHERE source_severity='' OR source_severity IS NULL")
+            rows = db.execute("SELECT id, source, event_type, subject FROM notifications WHERE correlation_key='' OR correlation_key IS NULL").fetchall()
+            for row in rows:
+                db.execute(
+                    "UPDATE notifications SET correlation_key=? WHERE id=?",
+                    (self._notification_correlation_key(row["source"], row["event_type"], row["subject"]), row["id"]),
+                )
+            baseline_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            db.execute(
+                """INSERT INTO notification_timeline
+                   (notification_id, event, severity, state, actor, reason, detail_json, created_at)
+                   SELECT n.id, 'baseline', n.severity, n.state, 'system:migration',
+                          'Existing notification adopted by notification intelligence', '{}', ?
+                   FROM notifications n
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM notification_timeline t WHERE t.notification_id=n.id
+                   )""",
+                (baseline_at,),
+            )
 
     @staticmethod
     def _operations_now_iso():
@@ -1673,6 +1737,33 @@ class PolicyStore:
             'keep_outbox': keep_outbox,
         }
 
+    def prune_notification_timeline(self, *, retention_days=90, keep_rows=10000):
+        """Bound derived notification lifecycle history without altering notifications.
+
+        Timeline rows are explanatory read-side evidence. The newest bounded floor is
+        retained even when older than the age threshold, and active notification rows
+        themselves are never deleted by this maintenance pass.
+        """
+        retention_days = max(7, min(3650, int(retention_days)))
+        keep_rows = max(500, min(50000, int(keep_rows)))
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=retention_days)
+        ).isoformat(timespec="seconds")
+        with self._db() as db:
+            cur = db.execute(
+                """DELETE FROM notification_timeline
+                   WHERE created_at<?
+                     AND id NOT IN (
+                       SELECT id FROM notification_timeline ORDER BY id DESC LIMIT ?
+                     )""",
+                (cutoff, keep_rows),
+            )
+        return {
+            "timeline_deleted": int(cur.rowcount or 0),
+            "timeline_retention_days": retention_days,
+            "timeline_keep_rows": keep_rows,
+        }
+
     def background_work_stats(self):
         with self._db() as db:
             jobs = {
@@ -2197,6 +2288,110 @@ class PolicyStore:
     def _notification_source_family(source):
         return str(source or "system").strip().lower().split(":", 1)[0] or "system"
 
+    @classmethod
+    def _notification_correlation_key(cls, source, event_type, subject=""):
+        subject_key = str(subject or "").strip().lower()
+        if subject_key:
+            return f"subject:{subject_key}"[:240]
+        family = cls._notification_source_family(source)
+        event = str(event_type or "event").strip().lower() or "event"
+        return f"source:{family}:{event}"[:240]
+
+    @staticmethod
+    def _notification_safe_json(value):
+        try:
+            return json.dumps(value or {}, sort_keys=True, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            return "{}"
+
+    def _record_notification_timeline_db(
+        self, db, *, notification_id, event, severity="", state="", actor="system", reason="", detail=None
+    ):
+        db.execute(
+            """INSERT INTO notification_timeline
+               (notification_id, event, severity, state, actor, reason, detail_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(notification_id),
+                str(event or "updated")[:80],
+                str(severity or "")[:20],
+                str(state or "")[:20],
+                str(actor or "system")[:100],
+                str(reason or "")[:500],
+                self._notification_safe_json(detail),
+                self._incident_now_iso(),
+            ),
+        )
+
+    def notification_intelligence_settings(self):
+        keys = (
+            "notification_escalation_enabled",
+            "notification_warning_escalate_seconds",
+            "notification_repeat_escalate_count",
+            "notification_digest_min_items",
+            "notification_digest_window_minutes",
+        )
+        with self._db() as db:
+            placeholders = ",".join("?" for _ in keys)
+            rows = db.execute(
+                f"SELECT key, value FROM app_settings WHERE key IN ({placeholders})", keys
+            ).fetchall()
+        raw = {row["key"]: row["value"] for row in rows}
+        def as_int(key, default, minimum, maximum):
+            try:
+                value = int(raw.get(key, default) or default)
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(value, maximum))
+        return {
+            "escalation_enabled": str(raw.get("notification_escalation_enabled", "1")) == "1",
+            "warning_escalate_seconds": as_int("notification_warning_escalate_seconds", 1800, 60, 86400),
+            "repeat_escalate_count": as_int("notification_repeat_escalate_count", 5, 2, 100),
+            "digest_min_items": as_int("notification_digest_min_items", 2, 2, 20),
+            "digest_window_minutes": as_int("notification_digest_window_minutes", 60, 5, 1440),
+        }
+
+    def save_notification_intelligence_settings(
+        self, *, escalation_enabled="1", warning_escalate_seconds="1800",
+        repeat_escalate_count="5", digest_min_items="2", digest_window_minutes="60",
+        actor="system:policy-store",
+    ):
+        enabled = "1" if str(escalation_enabled).strip().lower() in {"1", "true", "yes", "on"} else "0"
+        allowed_age = {300, 900, 1800, 3600, 7200, 21600, 43200, 86400}
+        allowed_repeats = {2, 3, 5, 10, 20, 50}
+        allowed_digest_min = {2, 3, 5, 10}
+        allowed_digest_window = {15, 30, 60, 180, 360, 720, 1440}
+        try:
+            warning_age = int(warning_escalate_seconds)
+            repeats = int(repeat_escalate_count)
+            digest_min = int(digest_min_items)
+            digest_window = int(digest_window_minutes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Notification intelligence settings must use whole numbers") from exc
+        if warning_age not in allowed_age:
+            raise ValueError("Warning escalation age is not an allowed value")
+        if repeats not in allowed_repeats:
+            raise ValueError("Repeat escalation count is not an allowed value")
+        if digest_min not in allowed_digest_min:
+            raise ValueError("Digest minimum is not an allowed value")
+        if digest_window not in allowed_digest_window:
+            raise ValueError("Digest window is not an allowed value")
+        values = {
+            "notification_escalation_enabled": enabled,
+            "notification_warning_escalate_seconds": str(warning_age),
+            "notification_repeat_escalate_count": str(repeats),
+            "notification_digest_min_items": str(digest_min),
+            "notification_digest_window_minutes": str(digest_window),
+        }
+        with self._db() as db:
+            for key, value in values.items():
+                db.execute(
+                    """INSERT INTO app_settings (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                    (key, value),
+                )
+        return {**self.notification_intelligence_settings(), "updated_by": str(actor or "unknown")[:100]}
+
     def _notification_preferences_db(self, db):
         keys = (
             "notification_enabled", "notification_min_severity",
@@ -2441,9 +2636,10 @@ class PolicyStore:
         subject = str(subject or "").strip()[:160]
         source_ref = str(source_ref or "").strip()[:240]
         target_url = str(target_url or "").strip()[:500]
-        severity = self._incident_severity(severity)
+        source_severity = self._incident_severity(severity)
         title = str(title or "Notification").strip()[:200] or "Notification"
         detail = str(detail or "").strip()[:3000]
+        correlation_key = self._notification_correlation_key(source, event_type, subject)
         now = self._incident_now_iso()
 
         row = db.execute(
@@ -2453,32 +2649,50 @@ class PolicyStore:
         if row is None:
             cur = db.execute(
                 """INSERT INTO notifications
-                   (dedupe_key, source, event_type, subject, severity, state, title, detail,
-                    source_ref, target_url, created_at, first_seen_at, last_seen_at, updated_at, occurrences,
-                    attention_eligible_at)
-                   VALUES (?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, 1, '')""",
+                   (dedupe_key, source, event_type, subject, severity, source_severity, correlation_key,
+                    state, title, detail, source_ref, target_url, created_at, first_seen_at, last_seen_at,
+                    updated_at, occurrences, attention_eligible_at, escalation_level, escalated_at,
+                    escalation_reason, reopen_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, 1, '', 0, '', '', 0)""",
                 (
-                    dedupe_key, source, event_type, subject, severity, title, detail,
-                    source_ref, target_url, now, now, now, now,
+                    dedupe_key, source, event_type, subject, source_severity, source_severity,
+                    correlation_key, title, detail, source_ref, target_url, now, now, now, now,
                 ),
             )
             notification_id = cur.lastrowid
             action = "created"
+            self._record_notification_timeline_db(
+                db, notification_id=notification_id, event="created", severity=source_severity,
+                state="unread", reason="Source event created notification",
+                detail={"source": source, "event_type": event_type, "source_ref": source_ref},
+            )
         else:
             notification_id = int(row["id"])
             state = self._notification_state(row["state"])
             resolved = bool(row["resolved_at"])
-            severity_escalated = (
-                {"info": 0, "warning": 1, "critical": 2}.get(severity, 1)
-                > {"info": 0, "warning": 1, "critical": 2}.get(str(row["severity"]), 1)
+            current_source_severity = self._incident_severity(row["source_severity"] or row["severity"])
+            current_attention_severity = self._incident_severity(row["severity"])
+            source_severity_escalated = (
+                self._notification_severity_rank(source_severity)
+                > self._notification_severity_rank(current_source_severity)
             )
             reopen = bool(raise_attention and resolved)
-            escalated_attention = bool(raise_attention and severity_escalated)
+            escalated_attention = bool(raise_attention and source_severity_escalated)
             next_state = "unread" if reopen or escalated_attention else state
             next_eligible_at = str(row["attention_eligible_at"] or "")
+            next_reopen_count = int(row["reopen_count"] or 0)
+            next_escalation_level = int(row["escalation_level"] or 0)
+            next_escalated_at = str(row["escalated_at"] or "")
+            next_escalation_reason = str(row["escalation_reason"] or "")
+
             if reopen:
+                next_reopen_count += 1
+                next_escalation_level = 0
+                next_escalated_at = ""
+                next_escalation_reason = ""
+                current_attention_severity = source_severity
                 next_eligible_at = ""
-                if severity != "critical":
+                if source_severity != "critical":
                     prefs = self._notification_preferences_db(db)
                     cooldown = int(prefs.get("cooldown_seconds") or 0)
                     if cooldown > 0 and row["resolved_at"]:
@@ -2491,8 +2705,22 @@ class PolicyStore:
                                 next_eligible_at = eligible_dt.isoformat(timespec="seconds")
                         except ValueError:
                             pass
+            elif next_escalation_level > 0:
+                # Intelligence escalation is attention metadata. A lower source
+                # severity cannot silently erase it while the same signal remains open.
+                current_attention_severity = (
+                    source_severity
+                    if self._notification_severity_rank(source_severity)
+                    > self._notification_severity_rank(current_attention_severity)
+                    else current_attention_severity
+                )
+            else:
+                current_attention_severity = source_severity
+
             if escalated_attention:
+                current_attention_severity = source_severity
                 next_eligible_at = ""
+
             occurrence_sql = "occurrences=occurrences+1," if increment_occurrence else ""
             clear_attention = reopen or (state == "dismissed" and escalated_attention)
             reopen_sql = (
@@ -2502,18 +2730,37 @@ class PolicyStore:
             )
             db.execute(
                 f"""UPDATE notifications
-                    SET source=?, event_type=?, subject=?, severity=?, state=?, title=?, detail=?,
-                        source_ref=?, target_url=?, last_seen_at=?, updated_at=?, attention_eligible_at=?,
-                        {occurrence_sql} {reopen_sql}
+                    SET source=?, event_type=?, subject=?, severity=?, source_severity=?, correlation_key=?,
+                        state=?, title=?, detail=?, source_ref=?, target_url=?, last_seen_at=?, updated_at=?,
+                        attention_eligible_at=?, escalation_level=?, escalated_at=?, escalation_reason=?,
+                        reopen_count=?, {occurrence_sql} {reopen_sql}
                         read_at=CASE WHEN ?='unread' THEN NULL ELSE read_at END,
                         read_by=CASE WHEN ?='unread' THEN '' ELSE read_by END
                     WHERE id=?""",
                 (
-                    source, event_type, subject, severity, next_state, title, detail, source_ref,
-                    target_url, now, now, next_eligible_at, next_state, next_state, notification_id,
+                    source, event_type, subject, current_attention_severity, source_severity, correlation_key,
+                    next_state, title, detail, source_ref, target_url, now, now, next_eligible_at,
+                    next_escalation_level, next_escalated_at, next_escalation_reason, next_reopen_count,
+                    next_state, next_state, notification_id,
                 ),
             )
-            action = "reopened" if reopen else ("escalated" if severity_escalated else "updated")
+            action = "reopened" if reopen else ("escalated" if source_severity_escalated else "updated")
+            if reopen:
+                self._record_notification_timeline_db(
+                    db, notification_id=notification_id, event="reopened", severity=current_attention_severity,
+                    state=next_state, reason="Source signal reopened after resolution",
+                    detail={"occurrences_incremented": bool(increment_occurrence)},
+                )
+            elif source_severity_escalated:
+                self._record_notification_timeline_db(
+                    db, notification_id=notification_id, event="source_escalated", severity=current_attention_severity,
+                    state=next_state, reason=f"Source severity changed {current_source_severity} → {source_severity}",
+                )
+            elif increment_occurrence:
+                self._record_notification_timeline_db(
+                    db, notification_id=notification_id, event="repeated", severity=current_attention_severity,
+                    state=next_state, reason="Source event repeated",
+                )
 
         result = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
         if raise_attention and action in {"created", "reopened", "escalated"}:
@@ -2653,7 +2900,7 @@ class PolicyStore:
             "timestamp": str(row.get("updated_at") or self._incident_now_iso()),
         }
 
-    def _queue_notification_push_db(self, db, notification):
+    def _queue_notification_push_db(self, db, notification, *, kind="notification"):
         row = dict(notification or {})
         if not row or self._notification_state(row.get("state")) != "unread" or row.get("resolved_at"):
             return 0
@@ -2669,15 +2916,16 @@ class PolicyStore:
         error = str(decision.get("reason") or "")[:500] if status == "suppressed" else ""
         payload = self._bounded_json(self._push_payload_for_notification(row))
         occurrence = max(1, int(row.get("occurrences") or 1))
+        kind = str(kind or "notification").strip().lower()[:40] or "notification"
         inserted = 0
         for subscription in subscriptions:
             cur = db.execute(
                 """INSERT OR IGNORE INTO notification_push_deliveries
                    (notification_id, subscription_id, occurrence, kind, status, attempts,
                     max_attempts, available_at, payload_json, created_at, updated_at, error)
-                   VALUES (?, ?, ?, 'notification', ?, 0, 3, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, 0, 3, ?, ?, ?, ?, ?)""",
                 (
-                    int(row.get("id") or 0), int(subscription["id"]), occurrence, status,
+                    int(row.get("id") or 0), int(subscription["id"]), occurrence, kind, status,
                     now, payload, now, now, error,
                 ),
             )
@@ -2886,7 +3134,13 @@ class PolicyStore:
             decision = self._notification_policy_decision(item, prefs=prefs, now=now)
             item["attention_suppressed"] = bool(decision["suppressed"])
             item["suppression_reason"] = str(decision.get("reason") or "")
+            item["attention_reason"] = str(decision.get("reason") or "eligible under current notification policy")
             item["event_key"] = str(decision.get("event_key") or "")
+            item["correlation_key"] = str(item.get("correlation_key") or self._notification_correlation_key(
+                item.get("source"), item.get("event_type"), item.get("subject")
+            ))
+            item["source_severity"] = self._incident_severity(item.get("source_severity") or item.get("severity"))
+            item["action_hint"] = self._notification_action_hint(item)
             result.append(item)
         return result
 
@@ -2951,6 +3205,332 @@ class PolicyStore:
             )
         return {**counts, "acknowledged_samples": len(ack_seconds), "median_ack_seconds": median_ack_seconds}
 
+    @staticmethod
+    def _notification_action_hint(row):
+        family = PolicyStore._notification_source_family((row or {}).get("source"))
+        hints = {
+            "security": "Review the Security view and the owning incident evidence before changing policy.",
+            "reconciler": "Review Operations and reconciliation evidence; retry or repair only after checking current RouterOS state.",
+            "operations": "Review Operations health and recovery evidence for the affected component.",
+            "bypass": "Review Activity and bypass evidence for the affected device before deciding whether policy needs changing.",
+            "telemetry": "Review Activity telemetry health and ingestion freshness before treating missing data as zero activity.",
+            "quota": "Review the affected device's quota and Device 360 evidence before granting or changing access.",
+            "background": "Review background-work status and the failed scope; the notification itself is not a repair authority.",
+        }
+        return hints.get(family, "Open the linked source context and review the owning evidence before taking action.")
+
+    def notification_timeline(self, notification_id, *, limit=100):
+        try:
+            limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT * FROM notification_timeline WHERE notification_id=?
+                   ORDER BY id DESC LIMIT ?""",
+                (int(notification_id), limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["detail"] = json.loads(str(item.pop("detail_json", "{}") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["detail"] = {}
+            result.append(item)
+        return result
+
+    def list_notification_timeline(self, *, limit=100):
+        try:
+            limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT t.*, n.title, n.source, n.subject, n.dedupe_key
+                   FROM notification_timeline t
+                   JOIN notifications n ON n.id=t.notification_id
+                   ORDER BY t.id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["detail"] = json.loads(str(item.pop("detail_json", "{}") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["detail"] = {}
+            result.append(item)
+        return result
+
+    def notification_groups(self, *, active_only=True, limit=50):
+        try:
+            limit = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            limit = 50
+        where = "WHERE resolved_at IS NULL AND state<>'dismissed'" if active_only else ""
+        with self._db() as db:
+            rows = db.execute(
+                f"SELECT * FROM notifications {where} ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+            prefs = self._notification_preferences_db(db)
+        groups = {}
+        now = datetime.now(timezone.utc)
+        for raw in rows:
+            row = dict(raw)
+            key = str(row.get("correlation_key") or self._notification_correlation_key(
+                row.get("source"), row.get("event_type"), row.get("subject")
+            ))
+            group = groups.setdefault(key, {
+                "correlation_key": key, "subject": str(row.get("subject") or ""),
+                "notifications": 0, "events": 0, "unread": 0, "unresolved": 0,
+                "suppressed": 0, "highest_severity": "info", "first_seen_at": "",
+                "last_seen_at": "", "sources": set(), "event_types": set(),
+                "notification_ids": [], "titles": [],
+            })
+            group["notifications"] += 1
+            group["events"] += max(1, int(row.get("occurrences") or 1))
+            if self._notification_state(row.get("state")) == "unread":
+                group["unread"] += 1
+            if not row.get("resolved_at") and self._notification_state(row.get("state")) != "dismissed":
+                group["unresolved"] += 1
+            decision = self._notification_policy_decision(row, prefs=prefs, now=now)
+            if decision.get("suppressed"):
+                group["suppressed"] += 1
+            if self._notification_severity_rank(row.get("severity")) > self._notification_severity_rank(group["highest_severity"]):
+                group["highest_severity"] = self._incident_severity(row.get("severity"))
+            first = str(row.get("first_seen_at") or "")
+            last = str(row.get("last_seen_at") or "")
+            if first and (not group["first_seen_at"] or first < group["first_seen_at"]):
+                group["first_seen_at"] = first
+            if last and (not group["last_seen_at"] or last > group["last_seen_at"]):
+                group["last_seen_at"] = last
+            group["sources"].add(str(row.get("source") or ""))
+            group["event_types"].add(str(row.get("event_type") or ""))
+            group["notification_ids"].append(int(row.get("id") or 0))
+            title = str(row.get("title") or "")
+            if title and title not in group["titles"]:
+                group["titles"].append(title)
+        result = []
+        for group in groups.values():
+            group["sources"] = sorted(group["sources"])
+            group["event_types"] = sorted(group["event_types"])
+            group["notification_ids"] = group["notification_ids"][:20]
+            group["titles"] = group["titles"][:4]
+            result.append(group)
+        result.sort(
+            key=lambda item: (
+                -self._notification_severity_rank(item["highest_severity"]),
+                -int(item["unresolved"]), -int(item["events"]), str(item["last_seen_at"]),
+            )
+        )
+        return result[:limit]
+
+    def notification_digest_preview(self, *, limit=12):
+        settings = self.notification_intelligence_settings()
+        min_items = int(settings.get("digest_min_items") or 2)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=int(settings.get("digest_window_minutes") or 60))
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT * FROM notifications
+                   WHERE resolved_at IS NULL AND state IN ('unread','read')
+                     AND severity<>'critical' ORDER BY updated_at DESC"""
+            ).fetchall()
+            prefs = self._notification_preferences_db(db)
+        groups = {}
+        now = datetime.now(timezone.utc)
+        for raw in rows:
+            row = dict(raw)
+            try:
+                updated = datetime.fromisoformat(str(row.get("updated_at") or ""))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if updated < cutoff:
+                    continue
+            except ValueError:
+                continue
+            decision = self._notification_policy_decision(row, prefs=prefs, now=now)
+            if decision.get("suppressed"):
+                continue
+            key = str(row.get("correlation_key") or "uncorrelated")
+            group = groups.setdefault(key, {
+                "correlation_key": key, "subject": str(row.get("subject") or ""),
+                "notifications": 0, "events": 0, "highest_severity": "info",
+                "titles": [], "notification_ids": [],
+            })
+            group["notifications"] += 1
+            group["events"] += max(1, int(row.get("occurrences") or 1))
+            if self._notification_severity_rank(row.get("severity")) > self._notification_severity_rank(group["highest_severity"]):
+                group["highest_severity"] = self._incident_severity(row.get("severity"))
+            title = str(row.get("title") or "")
+            if title and title not in group["titles"]:
+                group["titles"].append(title)
+            group["notification_ids"].append(int(row.get("id") or 0))
+        result = []
+        for group in groups.values():
+            if int(group["events"]) < min_items:
+                continue
+            group["titles"] = group["titles"][:4]
+            group["notification_ids"] = group["notification_ids"][:20]
+            group["summary"] = (
+                f"{group['events']} recent events"
+                + (f" for {group['subject']}" if group.get("subject") else "")
+                + f" · highest {group['highest_severity'].upper()}"
+            )
+            result.append(group)
+        result.sort(key=lambda item: (-int(item["events"]), -self._notification_severity_rank(item["highest_severity"])))
+        return result[:max(1, min(int(limit), 50))]
+
+    def notification_intelligence_stats(self):
+        with self._db() as db:
+            rows = [dict(row) for row in db.execute("SELECT * FROM notifications").fetchall()]
+            escalation_rows = db.execute(
+                "SELECT created_at, escalated_at FROM notifications WHERE escalation_level>0 AND escalated_at<>''"
+            ).fetchall()
+        source_counts = {}
+        subject_counts = {}
+        escalated = 0
+        reopen_count = 0
+        for row in rows:
+            family = self._notification_source_family(row.get("source"))
+            source_counts[family] = source_counts.get(family, 0) + max(1, int(row.get("occurrences") or 1))
+            subject = str(row.get("subject") or "").strip()
+            if subject:
+                subject_counts[subject] = subject_counts.get(subject, 0) + max(1, int(row.get("occurrences") or 1))
+            if int(row.get("escalation_level") or 0) > 0:
+                escalated += 1
+            reopen_count += int(row.get("reopen_count") or 0)
+        escalation_seconds = []
+        for row in escalation_rows:
+            try:
+                start = datetime.fromisoformat(str(row["created_at"]))
+                end = datetime.fromisoformat(str(row["escalated_at"]))
+                escalation_seconds.append(max(0.0, (end - start).total_seconds()))
+            except (TypeError, ValueError):
+                pass
+        escalation_seconds.sort()
+        median_escalation = 0.0
+        if escalation_seconds:
+            mid = len(escalation_seconds) // 2
+            median_escalation = escalation_seconds[mid] if len(escalation_seconds) % 2 else (escalation_seconds[mid-1] + escalation_seconds[mid]) / 2.0
+        noisy_sources = [
+            {"source": key, "events": value}
+            for key, value in sorted(source_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+        ]
+        noisy_subjects = [
+            {"subject": key, "events": value}
+            for key, value in sorted(subject_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+        ]
+        groups = self.notification_groups(active_only=True, limit=200)
+        digest = self.notification_digest_preview(limit=50)
+        return {
+            "schema": "zen_notification_intelligence_v1",
+            "active_groups": len(groups),
+            "escalated_notifications": escalated,
+            "reopens": reopen_count,
+            "median_escalation_seconds": median_escalation,
+            "digest_candidate_groups": len(digest),
+            "noisy_sources": noisy_sources,
+            "noisy_subjects": noisy_subjects,
+            "authority": "attention-only-derived",
+        }
+
+    def notification_explanation(self, notification_id):
+        row = self.get_notification(notification_id)
+        if row is None:
+            raise ValueError("Notification does not exist")
+        prefs = self.notification_preferences()
+        decision = self._notification_policy_decision(row, prefs=prefs, now=datetime.now(timezone.utc))
+        related = next(
+            (group for group in self.notification_groups(active_only=False, limit=200)
+             if group.get("correlation_key") == row.get("correlation_key")),
+            None,
+        )
+        return {
+            "schema": "zen_notification_explanation_v1",
+            "notification_id": int(row["id"]),
+            "source": str(row.get("source") or ""),
+            "source_ref": str(row.get("source_ref") or ""),
+            "source_severity": self._incident_severity(row.get("source_severity") or row.get("severity")),
+            "attention_severity": self._incident_severity(row.get("severity")),
+            "attention": {
+                "eligible": not bool(decision.get("suppressed")),
+                "reason": str(decision.get("reason") or "eligible under current notification policy"),
+                "event_key": str(decision.get("event_key") or ""),
+            },
+            "correlation": related or {"correlation_key": row.get("correlation_key")},
+            "escalation": {
+                "level": int(row.get("escalation_level") or 0),
+                "at": str(row.get("escalated_at") or ""),
+                "reason": str(row.get("escalation_reason") or ""),
+            },
+            "action_hint": self._notification_action_hint(row),
+            "target_url": str(row.get("target_url") or ""),
+            "timeline": self.notification_timeline(notification_id, limit=50),
+            "authority": "explanation-only-no-mutation-authority",
+        }
+
+    def evaluate_notification_intelligence(self, *, actor="system:notification-intelligence", now=None):
+        settings = self.notification_intelligence_settings()
+        now_dt = now or datetime.now(timezone.utc)
+        result = {
+            "schema": "zen_notification_intelligence_evaluation_v1",
+            "scanned": 0, "escalated": 0, "age_escalations": 0, "repeat_escalations": 0,
+            "authority": "attention-only-no-routeros-authority",
+        }
+        if not settings.get("escalation_enabled", True):
+            return result
+        age_seconds = int(settings.get("warning_escalate_seconds") or 1800)
+        repeat_count = int(settings.get("repeat_escalate_count") or 5)
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT * FROM notifications
+                   WHERE resolved_at IS NULL AND state IN ('unread','read')
+                     AND escalation_level=0
+                     AND COALESCE(NULLIF(source_severity,''), severity)='warning'
+                     AND severity<>'critical'"""
+            ).fetchall()
+            for raw in rows:
+                row = dict(raw)
+                result["scanned"] += 1
+                try:
+                    first_seen = datetime.fromisoformat(str(row.get("first_seen_at") or ""))
+                    if first_seen.tzinfo is None:
+                        first_seen = first_seen.replace(tzinfo=timezone.utc)
+                    age = max(0.0, (now_dt - first_seen).total_seconds())
+                except ValueError:
+                    age = 0.0
+                repeats = max(1, int(row.get("occurrences") or 1))
+                reasons = []
+                if age >= age_seconds:
+                    reasons.append(f"unresolved warning for {int(age)}s (threshold {age_seconds}s)")
+                    result["age_escalations"] += 1
+                if repeats >= repeat_count:
+                    reasons.append(f"repeated {repeats} times (threshold {repeat_count})")
+                    result["repeat_escalations"] += 1
+                if not reasons:
+                    continue
+                reason = "; ".join(reasons)[:500]
+                now_iso = now_dt.isoformat(timespec="seconds")
+                db.execute(
+                    """UPDATE notifications SET severity='critical', escalation_level=1, escalated_at=?,
+                       escalation_reason=?, state='unread', read_at=NULL, read_by='', updated_at=?,
+                       attention_eligible_at='' WHERE id=?""",
+                    (now_iso, reason, now_iso, int(row["id"])),
+                )
+                updated = dict(db.execute("SELECT * FROM notifications WHERE id=?", (int(row["id"]),)).fetchone())
+                self._record_notification_timeline_db(
+                    db, notification_id=int(row["id"]), event="intelligence_escalated", severity="critical",
+                    state="unread", actor=actor, reason=reason,
+                    detail={"source_severity": row.get("source_severity") or row.get("severity")},
+                )
+                self._cancel_notification_push_for_notification_db(
+                    db, int(row["id"]), "Notification escalated; superseded pending delivery"
+                )
+                self._queue_notification_push_db(db, updated, kind="escalation")
+                result["escalated"] += 1
+        return result
+
     def _notification_transition(self, notification_id, *, state, actor):
         notification_id = int(notification_id)
         state = self._notification_state(state)
@@ -2984,6 +3564,16 @@ class PolicyStore:
             self._cancel_notification_push_for_notification_db(
                 db, notification_id, f"Notification marked {state}"
             )
+            current = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+            self._record_notification_timeline_db(
+                db,
+                notification_id=notification_id,
+                event=state,
+                severity=str(current["severity"] or ""),
+                state=state,
+                actor=actor,
+                reason=f"Operator marked notification {state}",
+            )
             result = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
         return dict(result)
 
@@ -3012,12 +3602,18 @@ class PolicyStore:
                 self._cancel_notification_push_for_notification_db(
                     db, notification_id, "Notification marked read before push delivery"
                 )
+                current = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+                self._record_notification_timeline_db(
+                    db, notification_id=notification_id, event="read",
+                    severity=str(current["severity"] or "") if current else "", state="read",
+                    actor=actor, reason="Operator marked all unread notifications read",
+                )
         return int(cur.rowcount or 0)
 
     def _resolve_notification_db(self, db, *, dedupe_key, actor="system", resolution="Signal cleared"):
         now = self._incident_now_iso()
         row = db.execute(
-            "SELECT id FROM notifications WHERE dedupe_key=?", (str(dedupe_key),)
+            "SELECT id, resolved_at FROM notifications WHERE dedupe_key=?", (str(dedupe_key),)
         ).fetchone()
         db.execute(
             """UPDATE notifications SET resolved_at=COALESCE(resolved_at, ?), resolved_by=?,
@@ -3025,9 +3621,21 @@ class PolicyStore:
             (now, str(actor or "system")[:100], str(resolution or "Signal cleared")[:500], now, str(dedupe_key)),
         )
         if row is not None:
+            notification_id = int(row["id"])
             self._cancel_notification_push_for_notification_db(
-                db, int(row["id"]), "Source notification resolved before push delivery"
+                db, notification_id, "Source notification resolved before push delivery"
             )
+            if not row["resolved_at"]:
+                current = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+                self._record_notification_timeline_db(
+                    db,
+                    notification_id=notification_id,
+                    event="resolved",
+                    severity=str(current["severity"] or "") if current else "",
+                    state=str(current["state"] or "") if current else "",
+                    actor=actor,
+                    reason=str(resolution or "Signal cleared")[:500],
+                )
 
     def resolve_notification(self, dedupe_key, actor="system", resolution="Signal cleared"):
         with self._db() as db:

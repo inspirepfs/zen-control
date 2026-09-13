@@ -197,11 +197,11 @@ class FormalPerformanceSourceContractTests(unittest.TestCase):
         self.assertIn('or path.startswith("/local/performance/")', self.main)
 
     def test_release_and_formal_contract_are_v0544(self):
-        self.assertIn('version="0.55.2"', self.main)
+        self.assertIn('version="0.55.3.1"', self.main)
         self.assertIn("zen_performance_acceptance_v2", self.performance)
         self.assertIn("zen_formal_performance_acceptance_v1", self.performance)
         self.assertIn("ZEN Control v0.54.4 formal performance acceptance", self.script)
-        self.assertIn("Current release: **v0.55.2**", self.readme)
+        self.assertIn("Current release: **v0.55.3.1**", self.readme)
         self.assertIn("## v0.54.4 — Formal performance acceptance", self.changelog)
 
     def test_prepared_view_hit_miss_fallback_evidence_is_explicit(self):

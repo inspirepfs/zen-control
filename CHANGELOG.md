@@ -1,3 +1,22 @@
+## v0.55.3.1 — Notification Intelligence Upgrade Migration Hotfix
+
+- Fixes startup failure when upgrading an existing pre-v0.55.3 `notifications` table: the `correlation_key` index is now created only after the additive intelligence-column migration and correlation-key backfill complete.
+- Adds a production-shaped v0.55.2 → v0.55.3.1 SQLite upgrade regression test covering column creation, severity/correlation backfill, index creation and notification timeline baseline adoption.
+- No notification, policy, RouterOS authority or delivery semantics are changed; this is an upgrade-ordering hotfix only.
+
+## v0.55.3 — Notification Intelligence & Escalation
+
+- Adds durable notification lifecycle timelines covering creation, repeats, read/acknowledge/dismiss transitions, source resolution, reopen and automatic attention escalation. Existing notifications receive one migration baseline event without inventing prior history.
+- Adds stable correlation keys that group related notifications by exact device/subject across source families, with active-group counts, source/event provenance and grouped event volume.
+- Separates source severity from attention severity. Automatic escalation can raise an unresolved WARNING notification to CRITICAL attention while retaining the source's actual WARNING severity and leaving source resolution with the owning subsystem.
+- Adds bounded automatic escalation rules for unresolved warning age and repeated-event count. Acknowledged/dismissed/resolved notifications are never automatically escalated; escalation is evaluated by the existing read-side background worker and has no RouterOS dependency.
+- Adds a first-class Notification Intelligence view with configurable escalation thresholds, correlation groups, digest candidates, noisy-source/subject analytics, escalation/reopen metrics and a recent lifecycle timeline.
+- Adds “Why am I seeing this?” provenance to inbox notifications, showing source truth, source/attention severity, current attention-policy decision, correlation identity, escalation reason and a bounded next-step hint.
+- Adds digest preview logic that groups recent non-critical attention eligible under current notification preferences. v0.55.3 previews candidates only; it does not send digests or bypass v0.55.1 noise policy.
+- Adds authenticated intelligence/explanation APIs and gives intelligence escalations their own durable push-delivery identity so a CRITICAL escalation can supersede a cancelled normal pending delivery without violating delivery idempotency.
+
+Authority boundary: notification intelligence is derived attention metadata only. It cannot change policy, clear incidents, repair background work or mutate RouterOS. Source evidence, source severity and source resolution remain independently durable and authoritative.
+
 ## v0.55.2 — PWA / Browser Push Delivery
 
 - Adds standard encrypted Web Push delivery for the existing Notification Centre, using the browser/PWA Push API and service worker rather than a ZEN-specific cloud notification provider.

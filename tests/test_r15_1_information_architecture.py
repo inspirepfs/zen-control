@@ -11,7 +11,7 @@ class InformationArchitectureTests(unittest.TestCase):
         self.main = (ROOT / "app/main.py").read_text()
 
     def test_version(self):
-        self.assertIn('version="0.55.2"', self.main)
+        self.assertIn('version="0.55.3.1"', self.main)
 
     def test_durable_audit_is_main_tab_not_device_subsection(self):
         self.assertIn('data-tab="audit" href="/?view=audit&amp;section=recent#audit/recent">Audit</a>', self.index)

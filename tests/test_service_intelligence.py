@@ -153,7 +153,7 @@ class ServiceIntelligenceUxTests(unittest.TestCase):
         self.assertIn('publish_service_catalog()', self.main)
 
     def test_product_version_is_023(self):
-        self.assertIn('version="0.55.2"', self.main)
+        self.assertIn('version="0.55.3.1"', self.main)
 
     def test_custom_service_provisioning_is_explicit_and_previewed(self):
         for phrase in (

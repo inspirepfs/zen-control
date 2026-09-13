@@ -261,7 +261,7 @@ class NotificationSurfaceContractTests(unittest.TestCase):
 
     def test_notification_centre_is_first_class_navigation_context(self):
         self.assertIn('"notifications", "incidents", "audit", "settings"', self.main)
-        self.assertIn('"notifications": ("inbox", "preferences", "history")', self.main)
+        self.assertIn('"notifications": ("inbox", "preferences", "intelligence", "history")', self.main)
         self.assertIn('data-panel="notifications"', self.template)
         self.assertIn("Notification centre", self.template)
         self.assertIn("notification-bell", self.template)
@@ -286,8 +286,8 @@ class NotificationSurfaceContractTests(unittest.TestCase):
         self.assertIn("notification-history-row", self.css)
 
     def test_release_version_is_v0550(self):
-        self.assertIn('version="0.55.2"', self.main)
-        self.assertIn("Current release: **v0.55.2**", self.readme)
+        self.assertIn('version="0.55.3.1"', self.main)
+        self.assertIn("Current release: **v0.55.3.1**", self.readme)
         self.assertIn("## v0.55.2", (ROOT / "CHANGELOG.md").read_text())
 
 

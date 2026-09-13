@@ -20,10 +20,10 @@ class V036UXValidationTests(unittest.TestCase):
         }
 
     def test_release_is_v036_and_all_css_assets_are_cache_busted(self):
-        self.assertIn('version="0.55.2"', self.main)
+        self.assertIn('version="0.55.3.1"', self.main)
         joined = "\n".join(self.templates.values())
         self.assertNotIn("?v=0.35.0", joined)
-        self.assertIn("?v=0.55.2", joined)
+        self.assertIn("?v=0.55.3.1", joined)
 
     def test_parent_unlock_and_lock_preserve_current_context(self):
         self.assertGreaterEqual(
@@ -76,7 +76,7 @@ class V036UXValidationTests(unittest.TestCase):
                 continue
             with self.subTest(template=name):
                 self.assertIn('class="standalone-page"', text)
-                self.assertIn('/static/layout.css?v=0.55.2', text)
+                self.assertIn('/static/layout.css?v=0.55.3.1', text)
 
     def test_dynamic_browser_titles_include_product_name(self):
         for name in (

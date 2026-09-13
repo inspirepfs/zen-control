@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.55.2** — PWA / Browser Push Delivery: standard encrypted Web Push, persistent self-hosted VAPID identity, per-browser subscriptions, durable delivery/retry evidence, stale-subscription retirement, test delivery and click-through into ZEN. Push inherits the v0.55.1 attention policy and creates no RouterOS authority.
+> Current release: **v0.55.3.1** — Notification Intelligence & Escalation: correlation groups, durable notification timelines, source-vs-attention severity, bounded unresolved-warning escalation, “why am I seeing this?” provenance, digest previews and noisy-source analytics. Intelligence remains attention-only and creates no RouterOS authority.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -36,7 +36,7 @@ ZEN currently provides:
 - Historical desired-policy checkpoints correlated with retained network evidence.
 - IPFIX and Pi-hole-backed activity/classification reporting.
 - Operational diagnostics, incidents, audit evidence and release-readiness checks.
-- Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls and cooldown-based noise suppression.
+- Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls, cooldown-based noise suppression, correlation groups, escalation rules, lifecycle timelines, explanation provenance and digest/noise analytics.
 - TOTP parent authentication, recovery codes and shared-display locking.
 - Progressive Web App support for tablet/mobile use, including standard encrypted browser/PWA push notifications that respect ZEN attention preferences.
 - Cloudflare Access/Tunnel remote access and split-DNS local HTTPS.
@@ -215,6 +215,7 @@ Important endpoints include:
 - `/api/security/posture` — RouterOS enforcement/security posture
 - `/api/services/health` — service-contract health
 - `/api/performance` — bounded in-memory performance evidence
+- `/api/notifications/intelligence` — correlation, escalation, digest-preview and notification lifecycle evidence
 - `/api/release-readiness` — current release gate evidence
 - `/api/policy/explain/<ip>` — effective-policy explanation
 - `/api/devices/<ip>/360` — Device 360 contract
