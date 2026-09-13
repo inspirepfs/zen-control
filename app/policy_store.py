@@ -451,6 +451,48 @@ class PolicyStore:
                 CREATE INDEX IF NOT EXISTS idx_notification_push_deliveries_notification
                     ON notification_push_deliveries(notification_id, status, id);
 
+                CREATE TABLE IF NOT EXISTS notification_external_delivery_settings (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    webhook_enabled INTEGER NOT NULL DEFAULT 0,
+                    webhook_name TEXT NOT NULL DEFAULT 'Webhook',
+                    webhook_url TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    updated_by TEXT NOT NULL DEFAULT ''
+                );
+
+                INSERT OR IGNORE INTO notification_external_delivery_settings
+                    (singleton, webhook_enabled, webhook_name, webhook_url, updated_at, updated_by)
+                    VALUES (1, 0, 'Webhook', '', '', '');
+
+                CREATE TABLE IF NOT EXISTS notification_external_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    notification_id INTEGER NOT NULL DEFAULT 0,
+                    channel TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    destination_key TEXT NOT NULL,
+                    occurrence INTEGER NOT NULL DEFAULT 1,
+                    kind TEXT NOT NULL DEFAULT 'notification',
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 5,
+                    available_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL DEFAULT '',
+                    sent_at TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    http_status INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_notification_external_deliveries_claim
+                    ON notification_external_deliveries(status, available_at, id);
+                CREATE INDEX IF NOT EXISTS idx_notification_external_deliveries_notification
+                    ON notification_external_deliveries(notification_id, status, id);
+                CREATE INDEX IF NOT EXISTS idx_notification_external_deliveries_channel
+                    ON notification_external_deliveries(channel, status, id);
+
                 CREATE TABLE IF NOT EXISTS reward_accounts (
                     ip TEXT PRIMARY KEY,
                     balance_minutes INTEGER NOT NULL DEFAULT 0,
@@ -2765,6 +2807,7 @@ class PolicyStore:
         result = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
         if raise_attention and action in {"created", "reopened", "escalated"}:
             self._queue_notification_push_db(db, dict(result))
+            self._queue_notification_external_db(db, dict(result))
         return {**dict(result), "action": action}
 
     def upsert_notification(self, **kwargs):
@@ -3103,6 +3146,395 @@ class PolicyStore:
             "last_sent_at": str(totals["last_sent_at"] or ""),
             "last_failed_at": str(totals["last_failed_at"] or ""),
         }
+
+    @staticmethod
+    def _notification_external_env_bool(name, default=False):
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _notification_external_destination_key(channel, destination):
+        return hashlib.sha256(f"{channel}:{destination}".encode("utf-8")).hexdigest()[:32]
+
+    def notification_external_delivery_settings(self):
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM notification_external_delivery_settings WHERE singleton=1"
+            ).fetchone()
+        if row is None:
+            return {
+                "webhook_enabled": False,
+                "webhook_name": "Webhook",
+                "webhook_url": "",
+                "updated_at": "",
+                "updated_by": "",
+            }
+        result = dict(row)
+        result["webhook_enabled"] = bool(result.get("webhook_enabled"))
+        return result
+
+    def save_notification_external_delivery_settings(
+        self,
+        *,
+        webhook_enabled=False,
+        webhook_name="Webhook",
+        webhook_url="",
+        actor="system",
+    ):
+        from urllib.parse import urlsplit
+
+        enabled = str(webhook_enabled).strip().lower() in {"1", "true", "yes", "on"}
+        name = str(webhook_name or "Webhook").strip()[:100] or "Webhook"
+        url = str(webhook_url or "").strip()
+        if len(url) > 2000:
+            raise ValueError("Webhook URL is too long")
+        if url:
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+                raise ValueError("Webhook URL must be an absolute http:// or https:// URL")
+            if parsed.username or parsed.password:
+                raise ValueError("Webhook credentials must not be embedded in the URL")
+            if parsed.scheme == "http" and not self._notification_external_env_bool("ZEN_WEBHOOK_ALLOW_HTTP", False):
+                raise ValueError("HTTP webhook URLs require ZEN_WEBHOOK_ALLOW_HTTP=1; use HTTPS in production")
+        if enabled and not url:
+            raise ValueError("Webhook URL is required when webhook delivery is enabled")
+        now = self._incident_now_iso()
+        actor = str(actor or "system")[:100]
+        with self._db() as db:
+            db.execute(
+                """INSERT INTO notification_external_delivery_settings
+                   (singleton, webhook_enabled, webhook_name, webhook_url, updated_at, updated_by)
+                   VALUES (1, ?, ?, ?, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                     webhook_enabled=excluded.webhook_enabled,
+                     webhook_name=excluded.webhook_name,
+                     webhook_url=excluded.webhook_url,
+                     updated_at=excluded.updated_at,
+                     updated_by=excluded.updated_by""",
+                (1 if enabled else 0, name, url, now, actor),
+            )
+            if not enabled:
+                db.execute(
+                    """UPDATE notification_external_deliveries
+                       SET status='cancelled', updated_at=?, error='Webhook destination disabled'
+                       WHERE channel='webhook' AND status IN ('pending','sending')""",
+                    (now,),
+                )
+        return self.notification_external_delivery_settings()
+
+    def retire_notification_webhook(self, *, reason="Webhook retired"):
+        now = self._incident_now_iso()
+        with self._db() as db:
+            db.execute(
+                """UPDATE notification_external_delivery_settings
+                   SET webhook_enabled=0, updated_at=?, updated_by='system:external-delivery'
+                   WHERE singleton=1""",
+                (now,),
+            )
+            db.execute(
+                """UPDATE notification_external_deliveries
+                   SET status='cancelled', updated_at=?, error=?
+                   WHERE channel='webhook' AND status='pending'""",
+                (now, str(reason or "Webhook retired")[:500]),
+            )
+        return self.notification_external_delivery_settings()
+
+    def _external_payload_for_notification(self, row, *, kind="notification"):
+        target = str(row.get("target_url") or "").strip()
+        if not target.startswith("/") or target.startswith("//"):
+            target = "/?view=notifications&section=inbox#notifications/inbox"
+        kind = str(kind or "notification").strip().lower()[:40] or "notification"
+        event = "notification.escalated" if kind == "escalation" else "notification.attention"
+        return {
+            "schema": "zen_notification_delivery_v1",
+            "event": event,
+            "notification_id": int(row.get("id") or 0),
+            "kind": kind,
+            "severity": self._incident_severity(row.get("severity")),
+            "source_severity": self._incident_severity(row.get("source_severity") or row.get("severity")),
+            "source": str(row.get("source") or "")[:120],
+            "event_type": str(row.get("event_type") or "")[:120],
+            "subject": str(row.get("subject") or "")[:160],
+            "source_ref": str(row.get("source_ref") or "")[:240],
+            "title": str(row.get("title") or "ZEN Control notification")[:200],
+            "detail": str(row.get("detail") or "")[:3000],
+            "url": target,
+            "occurrences": max(1, int(row.get("occurrences") or 1)),
+            "correlation_key": str(row.get("correlation_key") or "")[:240],
+            "escalation_level": int(row.get("escalation_level") or 0),
+            "escalation_reason": str(row.get("escalation_reason") or "")[:500],
+            "created_at": str(row.get("created_at") or ""),
+            "updated_at": str(row.get("updated_at") or self._incident_now_iso()),
+            "authority": "attention-only-no-routeros-authority",
+        }
+
+    def _notification_external_targets_db(self, db):
+        targets = []
+        if self._notification_external_env_bool("ZEN_SMTP_ENABLED", False) and str(os.getenv("ZEN_SMTP_TO", "")).strip():
+            targets.append(("email", "env:ZEN_SMTP_TO"))
+        settings = db.execute(
+            "SELECT * FROM notification_external_delivery_settings WHERE singleton=1"
+        ).fetchone()
+        if settings and int(settings["webhook_enabled"] or 0) and str(settings["webhook_url"] or "").strip():
+            targets.append(("webhook", str(settings["webhook_url"]).strip()))
+        return targets
+
+    def _queue_notification_external_db(self, db, notification, *, kind="notification"):
+        row = dict(notification or {})
+        if not row or self._notification_state(row.get("state")) != "unread" or row.get("resolved_at"):
+            return 0
+        targets = self._notification_external_targets_db(db)
+        if not targets:
+            return 0
+        prefs = self._notification_preferences_db(db)
+        decision = self._notification_policy_decision(row, prefs=prefs, now=datetime.now(timezone.utc))
+        now = self._incident_now_iso()
+        status = "suppressed" if decision.get("suppressed") else "pending"
+        error = str(decision.get("reason") or "")[:500] if status == "suppressed" else ""
+        payload = self._bounded_json(self._external_payload_for_notification(row, kind=kind))
+        occurrence = max(1, int(row.get("occurrences") or 1))
+        max_attempts = max(1, min(int(os.getenv("ZEN_EXTERNAL_MAX_ATTEMPTS", "5") or 5), 10))
+        kind = str(kind or "notification").strip().lower()[:40] or "notification"
+        inserted = 0
+        for channel, destination in targets:
+            destination_key = self._notification_external_destination_key(channel, destination)
+            idempotency_key = (
+                f"external:{int(row.get('id') or 0)}:{channel}:{destination_key}:{occurrence}:{kind}"
+            )
+            cur = db.execute(
+                """INSERT OR IGNORE INTO notification_external_deliveries
+                   (notification_id, channel, destination, destination_key, occurrence, kind,
+                    idempotency_key, status, attempts, max_attempts, available_at, payload_json,
+                    created_at, updated_at, error, http_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0)""",
+                (
+                    int(row.get("id") or 0), channel, destination, destination_key, occurrence,
+                    kind, idempotency_key, status, max_attempts, now, payload, now, now, error,
+                ),
+            )
+            inserted += int(cur.rowcount or 0)
+        return inserted
+
+    def enqueue_notification_external_test(self, *, channel):
+        channel = str(channel or "").strip().lower()
+        if channel not in {"email", "webhook"}:
+            raise ValueError("External delivery test channel must be email or webhook")
+        now = self._incident_now_iso()
+        occurrence = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if channel == "email":
+            if not self._notification_external_env_bool("ZEN_SMTP_ENABLED", False):
+                raise ValueError("ZEN SMTP delivery is not enabled in the environment")
+            if not str(os.getenv("ZEN_SMTP_TO", "")).strip():
+                raise ValueError("ZEN_SMTP_TO is not configured")
+            destination = "env:ZEN_SMTP_TO"
+        else:
+            settings = self.notification_external_delivery_settings()
+            if not settings.get("webhook_enabled") or not settings.get("webhook_url"):
+                raise ValueError("Webhook delivery is not enabled/configured")
+            destination = str(settings["webhook_url"])
+        destination_key = self._notification_external_destination_key(channel, destination)
+        payload = self._bounded_json({
+            "schema": "zen_notification_delivery_v1",
+            "event": "notification.test",
+            "notification_id": 0,
+            "kind": "test",
+            "severity": "info",
+            "source_severity": "info",
+            "source": "notification-delivery",
+            "event_type": "test",
+            "subject": "",
+            "source_ref": "",
+            "title": f"ZEN Control {channel} delivery test",
+            "detail": f"ZEN Control {channel} external notification delivery is working.",
+            "url": "/?view=notifications&section=delivery#notifications/delivery",
+            "occurrences": 1,
+            "correlation_key": "notification-delivery:test",
+            "escalation_level": 0,
+            "escalation_reason": "",
+            "created_at": now,
+            "updated_at": now,
+            "authority": "attention-only-no-routeros-authority",
+        })
+        max_attempts = max(1, min(int(os.getenv("ZEN_EXTERNAL_MAX_ATTEMPTS", "5") or 5), 10))
+        idempotency = f"external-test:{channel}:{destination_key}:{occurrence}"
+        with self._db() as db:
+            cur = db.execute(
+                """INSERT INTO notification_external_deliveries
+                   (notification_id, channel, destination, destination_key, occurrence, kind,
+                    idempotency_key, status, attempts, max_attempts, available_at, payload_json,
+                    created_at, updated_at, error, http_status)
+                   VALUES (0, ?, ?, ?, ?, 'test', ?, 'pending', 0, ?, ?, ?, ?, ?, '', 0)""",
+                (channel, destination, destination_key, occurrence, idempotency, max_attempts, now, payload, now, now),
+            )
+            delivery_id = int(cur.lastrowid)
+        return {"queued": 1, "delivery_id": delivery_id, "channel": channel}
+
+    def recover_notification_external_deliveries(self):
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        stale = (now_dt - timedelta(minutes=2)).isoformat(timespec="seconds")
+        with self._db() as db:
+            cur = db.execute(
+                """UPDATE notification_external_deliveries
+                   SET status='pending', available_at=?, updated_at=?, claimed_at='',
+                       error='Recovered interrupted external delivery'
+                   WHERE status='sending' AND claimed_at<>'' AND claimed_at<=?""",
+                (now, now, stale),
+            )
+        return int(cur.rowcount or 0)
+
+    def claim_notification_external_deliveries(self, *, limit=20):
+        limit = max(1, min(int(limit), 100))
+        now = self._incident_now_iso()
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT * FROM notification_external_deliveries
+                   WHERE status='pending' AND available_at<=?
+                   ORDER BY id LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                cur = db.execute(
+                    """UPDATE notification_external_deliveries
+                       SET status='sending', attempts=attempts+1, claimed_at=?, updated_at=?
+                       WHERE id=? AND status='pending'""",
+                    (now, now, int(row["id"])),
+                )
+                if cur.rowcount == 1:
+                    claimed.append(db.execute(
+                        "SELECT * FROM notification_external_deliveries WHERE id=?", (int(row["id"]),)
+                    ).fetchone())
+        return [dict(row) for row in claimed]
+
+    def complete_notification_external_delivery(self, delivery_id):
+        now = self._incident_now_iso()
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM notification_external_deliveries WHERE id=?", (int(delivery_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("External notification delivery does not exist")
+            db.execute(
+                """UPDATE notification_external_deliveries
+                   SET status='sent', sent_at=?, updated_at=?, claimed_at='', error='', http_status=0
+                   WHERE id=?""",
+                (now, now, int(delivery_id)),
+            )
+        return True
+
+    def fail_notification_external_delivery(
+        self,
+        delivery_id,
+        error,
+        *,
+        retryable=True,
+        http_status=None,
+    ):
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        error = str(error or "External delivery failed")[:500]
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM notification_external_deliveries WHERE id=?", (int(delivery_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("External notification delivery does not exist")
+            attempts = int(row["attempts"] or 0)
+            terminal = (not retryable) or attempts >= int(row["max_attempts"] or 5)
+            delay = {1: 15, 2: 60, 3: 300, 4: 900}.get(attempts, 1800)
+            available = (now_dt + timedelta(seconds=delay)).isoformat(timespec="seconds")
+            status = "failed" if terminal else "pending"
+            db.execute(
+                """UPDATE notification_external_deliveries
+                   SET status=?, available_at=?, updated_at=?, claimed_at='', error=?, http_status=?
+                   WHERE id=?""",
+                (status, available, now, error, int(http_status or 0), int(delivery_id)),
+            )
+            result = db.execute(
+                "SELECT * FROM notification_external_deliveries WHERE id=?", (int(delivery_id),)
+            ).fetchone()
+        return dict(result)
+
+    def _cancel_notification_external_for_notification_db(self, db, notification_id, reason):
+        now = self._incident_now_iso()
+        db.execute(
+            """UPDATE notification_external_deliveries
+               SET status='cancelled', updated_at=?, error=?
+               WHERE notification_id=? AND status IN ('pending','sending')""",
+            (now, str(reason or "Notification no longer needs external attention")[:500], int(notification_id)),
+        )
+
+    def list_notification_external_deliveries(self, *, limit=50):
+        try:
+            limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit = 50
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT id, notification_id, channel, destination, occurrence, kind,
+                          idempotency_key, status, attempts, max_attempts, available_at,
+                          created_at, updated_at, claimed_at, sent_at, error, http_status
+                   FROM notification_external_deliveries ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        result = []
+        for raw in rows:
+            row = dict(raw)
+            if row["channel"] == "email":
+                row["destination"] = "environment-configured recipients"
+            result.append(row)
+        return result
+
+    def notification_external_delivery_stats(self):
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT channel, status, COUNT(*) AS count
+                   FROM notification_external_deliveries GROUP BY channel, status"""
+            ).fetchall()
+            sent = db.execute(
+                """SELECT channel, created_at, sent_at FROM notification_external_deliveries
+                   WHERE status='sent' AND sent_at<>'' ORDER BY id DESC LIMIT 500"""
+            ).fetchall()
+        channels = {"email": {}, "webhook": {}}
+        total = 0
+        for row in rows:
+            channel = str(row["channel"])
+            count = int(row["count"] or 0)
+            channels.setdefault(channel, {})[str(row["status"])] = count
+            total += count
+        latencies = {"email": [], "webhook": []}
+        for row in sent:
+            try:
+                created = datetime.fromisoformat(str(row["created_at"]))
+                finished = datetime.fromisoformat(str(row["sent_at"]))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if finished.tzinfo is None:
+                    finished = finished.replace(tzinfo=timezone.utc)
+                latencies.setdefault(str(row["channel"]), []).append(max(0.0, (finished - created).total_seconds()))
+            except ValueError:
+                pass
+        result = {"total": total, "channels": {}}
+        for channel in sorted(channels):
+            counts = channels[channel]
+            values = sorted(latencies.get(channel, []))
+            median = 0.0
+            if values:
+                middle = len(values) // 2
+                median = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+            result["channels"][channel] = {
+                "pending": counts.get("pending", 0),
+                "sending": counts.get("sending", 0),
+                "sent": counts.get("sent", 0),
+                "failed": counts.get("failed", 0),
+                "suppressed": counts.get("suppressed", 0),
+                "cancelled": counts.get("cancelled", 0),
+                "median_delivery_seconds": round(median, 3),
+            }
+        return result
 
     def get_notification(self, notification_id):
         with self._db() as db:
@@ -3527,7 +3959,11 @@ class PolicyStore:
                 self._cancel_notification_push_for_notification_db(
                     db, int(row["id"]), "Notification escalated; superseded pending delivery"
                 )
+                self._cancel_notification_external_for_notification_db(
+                    db, int(row["id"]), "Notification escalated; superseded pending delivery"
+                )
                 self._queue_notification_push_db(db, updated, kind="escalation")
+                self._queue_notification_external_db(db, updated, kind="escalation")
                 result["escalated"] += 1
         return result
 
@@ -3562,6 +3998,9 @@ class PolicyStore:
                     (now, actor, now, actor, now, notification_id),
                 )
             self._cancel_notification_push_for_notification_db(
+                db, notification_id, f"Notification marked {state}"
+            )
+            self._cancel_notification_external_for_notification_db(
                 db, notification_id, f"Notification marked {state}"
             )
             current = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
@@ -3602,6 +4041,9 @@ class PolicyStore:
                 self._cancel_notification_push_for_notification_db(
                     db, notification_id, "Notification marked read before push delivery"
                 )
+                self._cancel_notification_external_for_notification_db(
+                    db, notification_id, "Notification marked read before external delivery"
+                )
                 current = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
                 self._record_notification_timeline_db(
                     db, notification_id=notification_id, event="read",
@@ -3624,6 +4066,9 @@ class PolicyStore:
             notification_id = int(row["id"])
             self._cancel_notification_push_for_notification_db(
                 db, notification_id, "Source notification resolved before push delivery"
+            )
+            self._cancel_notification_external_for_notification_db(
+                db, notification_id, "Source notification resolved before external delivery"
             )
             if not row["resolved_at"]:
                 current = db.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
@@ -3850,13 +4295,22 @@ class PolicyStore:
                    acknowledged_by=?, updated_at=? WHERE id=?""",
                 (now, actor, now, incident_id),
             )
+            dedupe_key = f"incident:{row['fingerprint']}"
             db.execute(
                 """UPDATE notifications SET state='acknowledged',
                    read_at=COALESCE(read_at, ?), read_by=CASE WHEN read_by='' THEN ? ELSE read_by END,
                    acknowledged_at=?, acknowledged_by=?, updated_at=?
                    WHERE dedupe_key=?""",
-                (now, actor, now, actor, now, f"incident:{row['fingerprint']}"),
+                (now, actor, now, actor, now, dedupe_key),
             )
+            notification = db.execute("SELECT id FROM notifications WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+            if notification is not None:
+                self._cancel_notification_push_for_notification_db(
+                    db, int(notification["id"]), "Incident acknowledged before push delivery"
+                )
+                self._cancel_notification_external_for_notification_db(
+                    db, int(notification["id"]), "Incident acknowledged before external delivery"
+                )
             result = db.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
         return dict(result)
 

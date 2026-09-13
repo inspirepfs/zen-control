@@ -20,7 +20,7 @@ class _Snapshot:
 class RuntimeHealthContractTests(unittest.TestCase):
     def _healthy(self):
         return build_runtime_health(
-            version="0.55.3.1",
+            version="0.55.4",
             background_worker=_Snapshot({"worker_alive": True}),
             reconciler=_Snapshot({
                 "worker_alive": True,
@@ -42,7 +42,7 @@ class RuntimeHealthContractTests(unittest.TestCase):
 
     def test_worker_failure_degrades_runtime_health(self):
         report = build_runtime_health(
-            version="0.55.3.1",
+            version="0.55.4",
             background_worker=_Snapshot({"worker_alive": False}),
             reconciler=_Snapshot({"worker_alive": True, "router_mutation": {}}),
             incident_monitor=_Snapshot({"worker_alive": True}),
@@ -54,7 +54,7 @@ class RuntimeHealthContractTests(unittest.TestCase):
 
     def test_snapshot_exception_is_sanitized_and_fails_closed(self):
         report = build_runtime_health(
-            version="0.55.3.1",
+            version="0.55.4",
             background_worker=_Snapshot(error=True),
             reconciler=_Snapshot({"worker_alive": True, "router_mutation": {}}),
             incident_monitor=_Snapshot({"worker_alive": True}),
@@ -68,7 +68,7 @@ class RuntimeHealthContractTests(unittest.TestCase):
 
     def test_mutation_lane_unavailable_degrades_runtime_health(self):
         report = build_runtime_health(
-            version="0.55.3.1",
+            version="0.55.4",
             background_worker=_Snapshot({"worker_alive": True}),
             reconciler=_Snapshot({
                 "worker_alive": True,
@@ -105,8 +105,8 @@ class V0543SourceContractTests(unittest.TestCase):
         main = (ROOT / "app/main.py").read_text()
         readme = (ROOT / "README.md").read_text()
         changelog = (ROOT / "CHANGELOG.md").read_text()
-        self.assertIn('version="0.55.3.1"', main)
-        self.assertIn("Current release: **v0.55.3.1**", readme)
+        self.assertIn('version="0.55.4"', main)
+        self.assertIn("Current release: **v0.55.4**", readme)
         self.assertIn("## v0.54.3 — Deployment topology & runtime-health closure", changelog)
 
 

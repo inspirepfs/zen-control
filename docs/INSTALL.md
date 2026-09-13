@@ -42,6 +42,43 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 Keep `OTP_ENCRYPTION_KEY` stable after authenticators are enrolled.
 
+### Optional notification delivery
+
+Outbound SMTP connection details and credentials are environment-only. Configure them in `.env`; they are injected into the application by `docker-compose.yml` and are never stored in `policy.db`:
+
+```text
+ZEN_SMTP_ENABLED=0
+ZEN_SMTP_HOST=
+ZEN_SMTP_PORT=587
+ZEN_SMTP_USERNAME=
+ZEN_SMTP_PASSWORD=
+ZEN_SMTP_FROM=
+ZEN_SMTP_FROM_NAME=ZEN Control
+ZEN_SMTP_TO=
+ZEN_SMTP_STARTTLS=1
+ZEN_SMTP_SSL=0
+ZEN_SMTP_TIMEOUT_SECONDS=10
+```
+
+Webhook destination metadata is configured in ZEN, while the HMAC signing secret remains environment-only:
+
+```text
+ZEN_WEBHOOK_SIGNING_SECRET=
+ZEN_WEBHOOK_TIMEOUT_SECONDS=10
+ZEN_WEBHOOK_MAX_ATTEMPTS=5
+ZEN_WEBHOOK_ALLOW_HTTP=0
+```
+
+Production webhooks should use HTTPS. `ZEN_WEBHOOK_ALLOW_HTTP=1` exists only for controlled local simulation.
+
+For end-to-end testing without external infrastructure, start the optional local sinks:
+
+```bash
+docker compose --profile test-tools up -d --build
+```
+
+A typical local simulation uses Mailpit at `mailpit:1025` with TLS disabled and configures the ZEN webhook destination as `http://webhook-sink:8092/webhook`. The host-only inspection UIs are `http://127.0.0.1:8025` for Mailpit and `http://127.0.0.1:8092` for the webhook sink. The webhook sink can deliberately return `429`, `500` or `410` by adding `?status=429`, `?status=500` or `?status=410` to the endpoint. Restore `ZEN_WEBHOOK_ALLOW_HTTP=0` after local simulation.
+
 `ZEN_ROUTER_OBSERVE_WORKERS` controls only parallel observation/planning in the automatic reconciler. Increasing it does not parallelize RouterOS mutation: all app-owned writes still pass through the single serialized mutation lane and are preceded by fresh authority/security proof.
 
 ## 3. RouterOS preparation

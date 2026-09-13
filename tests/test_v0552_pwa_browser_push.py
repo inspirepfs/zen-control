@@ -204,9 +204,9 @@ class PushSurfaceContractTests(unittest.TestCase):
 
     def test_runtime_dependency_is_explicit_and_release_is_v0552(self):
         self.assertIn("pywebpush", self.requirements)
-        self.assertIn('version="0.55.3.1"', self.main)
-        self.assertIn("const RELEASE = '0.55.3.1'", self.js)
-        self.assertIn("const RELEASE = '0.55.3.1'", self.worker)
+        self.assertIn('version="0.55.4"', self.main)
+        self.assertIn("const RELEASE = '0.55.4'", self.js)
+        self.assertIn("const RELEASE = '0.55.4'", self.worker)
 
 
 if __name__ == "__main__":

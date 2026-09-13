@@ -1,3 +1,17 @@
+## v0.55.4 — External Delivery Adapters & Delivery Simulation
+
+- Adds durable external notification fan-out for SMTP email and HMAC-SHA256 signed webhooks, downstream of the existing notification evidence, intelligence and attention-policy layers.
+- Keeps all SMTP configuration—including host, credentials, sender and recipients—environment-only. SMTP secrets are never persisted to `policy.db` or returned through UI/API status.
+- Stores only ordinary webhook destination metadata in ZEN while keeping the HMAC signing secret environment-only. Production webhooks require HTTPS; HTTP requires explicit `ZEN_WEBHOOK_ALLOW_HTTP=1` test opt-in.
+- Adds durable pending/sending/sent/failed/suppressed/cancelled delivery truth, bounded retry/backoff, restart recovery, stable idempotency keys, per-channel delivery statistics and median delivery latency.
+- Reuses the v0.55.1 attention-policy decision before external delivery is queued, so quiet hours, severity thresholds, source/device/event filters and cooldowns suppress email/webhook exactly as they suppress browser push without deleting notification evidence.
+- Cancels unsent external deliveries when the notification is read, acknowledged, dismissed or source-resolved; an intelligence escalation supersedes a normal pending delivery and receives its own delivery identity.
+- Signs webhook JSON over `timestamp + "." + raw_body` and sends `X-ZEN-Event`, `X-ZEN-Delivery-ID`, `X-ZEN-Timestamp`, `X-ZEN-Signature` and `Idempotency-Key` headers. Retryable HTTP 408/425/429/5xx responses back off durably; HTTP 410 retires the configured destination.
+- Adds a first-class Notification Delivery UI with sanitized channel readiness, test-send actions, per-channel counters and durable delivery history. No SMTP password, recipient list or webhook secret is exposed.
+- Adds optional `test-tools` Compose services: Mailpit for real SMTP capture and a small local signed-webhook sink with an inspection UI plus controllable 429/500/410 responses for failure-path qualification. The normal stack remains unchanged unless the profile is requested.
+
+Authority boundary: external delivery can only transmit already-authorised notification attention. It has no RouterOS adapter, cannot mutate policy or source evidence, and cannot turn delivery success/failure into enforcement authority.
+
 ## v0.55.3.1 — Notification Intelligence Upgrade Migration Hotfix
 
 - Fixes startup failure when upgrading an existing pre-v0.55.3 `notifications` table: the `correlation_key` index is now created only after the additive intelligence-column migration and correlation-key backfill complete.

@@ -27,6 +27,7 @@ from app.activity import (
 from app.parent_summary import build_parent_device_summary, summarize_parent_household
 from app.summary_delivery import SummaryDeliveryService
 from app.push_delivery import PushDeliveryService, VapidIdentity
+from app.external_delivery import NotificationExternalDeliveryService
 from app.policy_engine import build_device_policy_plan, PolicyPlanError
 from app.policy_explain import build_policy_explanation
 from app.device360 import build_device_360_snapshot, filter_related_records
@@ -64,7 +65,7 @@ from app.runtime_health import build_runtime_health
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
 
-app = FastAPI(title="ZEN Control", version="0.55.3.1")
+app = FastAPI(title="ZEN Control", version="0.55.4")
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_urlsafe(32))
 OTP_ENCRYPTION_KEY = os.getenv("OTP_ENCRYPTION_KEY") or SESSION_SECRET
@@ -464,7 +465,7 @@ ROOT_VIEW_SECTIONS = {
     "policies": ("profiles", "assignments", "services", "bandwidth", "tools"),
     "schedules": ("planner", "exceptions", "templates", "router"),
     "activity": ("overview", "devices", "services", "classification", "dns", "summaries", "history"),
-    "notifications": ("inbox", "preferences", "intelligence", "history"),
+    "notifications": ("inbox", "preferences", "intelligence", "delivery", "history"),
     "incidents": ("active", "history"),
     "audit": ("recent",),
     "settings": ("parents", "policy", "automation", "security", "operations"),
@@ -1451,6 +1452,10 @@ push_delivery = PushDeliveryService(
         subject=os.getenv("ZEN_PUSH_VAPID_SUBJECT") or None,
     ),
 )
+external_delivery = NotificationExternalDeliveryService(
+    policy_store=policy_store,
+    audit=audit,
+)
 
 operational_diagnostics = OperationalDiagnostics(
     app_version=app.version,
@@ -1570,10 +1575,12 @@ def start_auto_reconciler():
     incident_monitor.start()
     summary_delivery.start()
     push_delivery.start()
+    external_delivery.start()
 
 
 @app.on_event("shutdown")
 def stop_auto_reconciler():
+    external_delivery.stop()
     push_delivery.stop()
     summary_delivery.stop()
     background_worker.stop()
@@ -2395,6 +2402,8 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     notification_stats = {}
     notification_preferences = policy_store.notification_preferences()
     notification_push_status = {}
+    notification_external_status = {}
+    notification_external_settings = policy_store.notification_external_delivery_settings()
     notification_event_catalog = []
     notification_source_catalog = []
     notification_intelligence = {}
@@ -2798,6 +2807,8 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
         notification_stats = policy_store.notification_stats()
         notification_preferences = policy_store.notification_preferences()
         notification_push_status = push_delivery.snapshot(username=user["username"])
+        notification_external_status = external_delivery.snapshot()
+        notification_external_settings = policy_store.notification_external_delivery_settings()
         notification_event_catalog = policy_store.notification_event_catalog()
         if active_section == "intelligence":
             notification_intelligence = policy_store.notification_intelligence_stats()
@@ -2937,6 +2948,8 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
             "notification_stats": notification_stats,
             "notification_preferences": notification_preferences,
             "notification_push_status": notification_push_status,
+            "notification_external_status": notification_external_status,
+            "notification_external_settings": notification_external_settings,
             "notification_event_catalog": notification_event_catalog,
             "notification_source_catalog": notification_source_catalog,
             "notification_intelligence": notification_intelligence,
@@ -5504,6 +5517,61 @@ def api_notification_push_test(
         f"queued={queued['queued']}",
     )
     return {"schema": "zen_notification_push_test_v1", **queued}
+
+
+@app.get("/api/notifications/delivery")
+def api_notification_external_delivery(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return external_delivery.snapshot()
+
+
+@app.post("/local/notifications/delivery")
+def local_notification_external_delivery_settings(
+    request: Request,
+    csrf: str = Form(...),
+    webhook_enabled: str = Form("0"),
+    webhook_name: str = Form("Webhook"),
+    webhook_url: str = Form(""),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/delivery", "CSRF validation failed")
+    try:
+        saved = policy_store.save_notification_external_delivery_settings(
+            webhook_enabled=webhook_enabled,
+            webhook_name=webhook_name,
+            webhook_url=webhook_url,
+            actor=user["username"],
+        )
+    except ValueError as exc:
+        return redirect_error("notifications/delivery", str(exc))
+    external_delivery.wake()
+    audit(
+        "NOTIFICATION_EXTERNAL_SETTINGS_UPDATED",
+        user["username"],
+        f"webhook={'on' if saved['webhook_enabled'] else 'off'} name={saved['webhook_name']}",
+    )
+    return redirect_ok("notifications/delivery", "External notification delivery settings updated")
+
+
+@app.post("/local/notifications/delivery/test/{channel}")
+def local_notification_external_delivery_test(
+    channel: str,
+    request: Request,
+    csrf: str = Form(...),
+    user=Depends(require_role("admin", "operator")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("notifications/delivery", "CSRF validation failed")
+    try:
+        queued = external_delivery.enqueue_test(channel, actor=user["username"])
+    except (ValueError, RuntimeError) as exc:
+        return redirect_error("notifications/delivery", str(exc))
+    return redirect_ok(
+        "notifications/delivery",
+        f"{str(channel).upper()} test queued as delivery #{queued['delivery_id']}",
+    )
 
 
 @app.post("/local/notifications/intelligence")

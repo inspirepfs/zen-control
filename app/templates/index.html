@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% include "_pwa_head.jinja" %}
-  <link rel="stylesheet" href="/static/app.css?v=0.55.3.1">
-  <link rel="stylesheet" href="/static/layout.css?v=0.55.3.1">
-  <link rel="stylesheet" href="/static/activity.css?v=0.55.3.1">
-  <link rel="stylesheet" href="/static/notifications.css?v=0.55.3.1">
-  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.3.1">
-  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.3.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.55.4">
+  <link rel="stylesheet" href="/static/layout.css?v=0.55.4">
+  <link rel="stylesheet" href="/static/activity.css?v=0.55.4">
+  <link rel="stylesheet" href="/static/notifications.css?v=0.55.4">
+  <link rel="stylesheet" href="/static/service-intelligence.css?v=0.55.4">
+  <link rel="stylesheet" href="/static/historical-analytics.css?v=0.55.4">
   <title>ZEN Control</title>
 </head>
 <body data-parent-locked="{{ 1 if auth_state.locked else 0 }}">
@@ -2106,7 +2106,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
 {% endif %}
 {% if active_view == 'notifications' %}
 <div class="tab-panel active" data-panel="notifications">
-  <section class="card notification-hero-card" data-ux-groups="inbox preferences intelligence history">
+  <section class="card notification-hero-card" data-ux-groups="inbox preferences intelligence delivery history">
     <div class="card-heading">
       <div>
         <h2>Notification centre</h2>
@@ -2299,6 +2299,81 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       <span>Muted sources <strong>{{ notification_preferences.muted_sources|length }}</strong></span>
       <span>Muted subjects <strong>{{ notification_preferences.muted_subjects|length }}</strong></span>
       <span>Disabled events <strong>{{ notification_preferences.disabled_events|length }}</strong></span>
+    </div>
+  </section>
+
+  <section class="card notification-delivery-card" data-ux-group="delivery">
+    <div class="card-heading">
+      <div>
+        <h2>External delivery</h2>
+        <p class="muted">Optional SMTP email and signed webhook delivery use the same durable notification, intelligence and attention-policy pipeline as browser push. External delivery has no RouterOS or policy mutation authority.</p>
+      </div>
+      {% if notification_external_status.worker_running %}<span class="policy-badge enabled">WORKER RUNNING</span>{% else %}<span class="policy-badge disabled">WORKER STOPPED</span>{% endif %}
+    </div>
+
+    <div class="notification-delivery-grid">
+      <article class="notification-delivery-channel">
+        <div class="notification-card-heading"><strong>Email / SMTP</strong>{% if notification_external_status.channels.email.ready %}<span class="policy-badge enabled">READY</span>{% elif notification_external_status.channels.email.enabled %}<span class="policy-badge staging">INCOMPLETE</span>{% else %}<span class="policy-badge">DISABLED</span>{% endif %}</div>
+        <p class="muted small">SMTP host, recipients and credentials are environment-only. ZEN never writes SMTP secrets into policy.db or returns them through the UI/API.</p>
+        <div class="notification-delivery-kv">
+          <span>Host<strong>{{ notification_external_status.channels.email.host or 'NOT CONFIGURED' }}{% if notification_external_status.channels.email.host %}:{{ notification_external_status.channels.email.port }}{% endif %}</strong></span>
+          <span>Sender<strong>{{ notification_external_status.channels.email.from or 'NOT CONFIGURED' }}</strong></span>
+          <span>Recipients<strong>{{ notification_external_status.channels.email.recipients or 0 }} configured</strong></span>
+          <span>Transport<strong>{% if notification_external_status.channels.email.ssl %}TLS/SSL{% elif notification_external_status.channels.email.starttls %}STARTTLS{% else %}PLAIN / TEST ONLY{% endif %}</strong></span>
+          <span>Credentials<strong>{{ 'PRESENT' if notification_external_status.channels.email.credentials_present else 'NOT SET' }}</strong></span>
+        </div>
+        {% if notification_external_status.channels.email.error %}<p class="inline-error">{{ notification_external_status.channels.email.error }}</p>{% endif %}
+        {% if user.role in ['admin','operator'] %}
+        <form method="post" action="/local/notifications/delivery/test/email"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost compact" {% if not notification_external_status.channels.email.ready %}disabled{% endif %}>Send email test</button></form>
+        {% endif %}
+      </article>
+
+      <article class="notification-delivery-channel">
+        <div class="notification-card-heading"><strong>Signed webhook</strong>{% if notification_external_status.channels.webhook.ready %}<span class="policy-badge enabled">READY</span>{% elif notification_external_status.channels.webhook.enabled %}<span class="policy-badge staging">INCOMPLETE</span>{% else %}<span class="policy-badge">DISABLED</span>{% endif %}</div>
+        <p class="muted small">Every POST is JSON with a delivery ID, timestamp, idempotency key and HMAC-SHA256 signature. The signing secret is environment-only.</p>
+        {% if user.role in ['admin','operator'] %}
+        <form method="post" action="/local/notifications/delivery" class="notification-delivery-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <label class="checkbox-row"><input type="checkbox" name="webhook_enabled" value="1" {% if notification_external_settings.webhook_enabled %}checked{% endif %}> Enable webhook delivery</label>
+          <label>Name<input name="webhook_name" value="{{ notification_external_settings.webhook_name }}" maxlength="100"></label>
+          <label>Endpoint URL<input name="webhook_url" value="{{ notification_external_settings.webhook_url }}" placeholder="https://example.net/zen/webhook"></label>
+          <div class="notification-delivery-actions"><button class="primary compact">Save webhook</button></div>
+        </form>
+        <form method="post" action="/local/notifications/delivery/test/webhook"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost compact" {% if not notification_external_status.channels.webhook.ready %}disabled{% endif %}>Send webhook test</button></form>
+        {% else %}
+        <div class="notification-delivery-kv"><span>Name<strong>{{ notification_external_settings.webhook_name }}</strong></span><span>Endpoint<strong>{{ notification_external_settings.webhook_url or 'NOT CONFIGURED' }}</strong></span></div>
+        {% endif %}
+        {% if notification_external_status.channels.webhook.error %}<p class="inline-error">{{ notification_external_status.channels.webhook.error }}</p>{% endif %}
+        <p class="muted small">Signing secret: <strong>{{ 'PRESENT' if notification_external_status.channels.webhook.signing_secret_present else 'NOT CONFIGURED' }}</strong>. HTTP endpoints are rejected unless <code>ZEN_WEBHOOK_ALLOW_HTTP=1</code>, intended for the local simulator only.</p>
+      </article>
+    </div>
+
+    <div class="notification-summary-grid notification-delivery-summary">
+      {% for channel in ['email','webhook'] %}
+      {% set stats = notification_external_status.stats.channels.get(channel, {}) %}
+      <div><span class="muted small">{{ channel }} sent</span><strong>{{ stats.get('sent', 0) }}</strong></div>
+      <div><span class="muted small">{{ channel }} pending</span><strong>{{ stats.get('pending', 0) }}</strong></div>
+      <div><span class="muted small">{{ channel }} failed</span><strong>{{ stats.get('failed', 0) }}</strong></div>
+      {% endfor %}
+    </div>
+    <div class="notification-stat-strip">
+      <span>SMTP simulator <strong>Mailpit · test-tools profile</strong></span>
+      <span>Webhook simulator <strong>ZEN local sink · test-tools profile</strong></span>
+      <span>Start <strong><code>docker compose --profile test-tools up -d</code></strong></span>
+    </div>
+  </section>
+
+  <section class="card" data-ux-group="delivery">
+    <div class="card-heading"><div><h2>External delivery history</h2><p class="muted">Durable delivery attempts, retries, suppressions and failures. Email recipient values remain environment-backed and are not copied into this view.</p></div></div>
+    <div class="notification-delivery-history">
+      {% for delivery in notification_external_status.history %}
+      <div class="notification-delivery-row">
+        <span class="policy-badge">{{ delivery.channel|upper }}</span>
+        <div><strong>#{{ delivery.id }} · {{ delivery.kind|upper }} · {{ delivery.status|upper }}</strong><span class="muted small">notification {{ delivery.notification_id or 'TEST' }} · attempts {{ delivery.attempts }}/{{ delivery.max_attempts }}</span></div>
+        <span>{{ delivery.destination }}</span>
+        <span class="muted small">{{ delivery.sent_at or delivery.updated_at }}{% if delivery.http_status %} · HTTP {{ delivery.http_status }}{% endif %}{% if delivery.error %} · {{ delivery.error }}{% endif %}</span>
+      </div>
+      {% else %}<p class="muted">No external notification deliveries yet.</p>{% endfor %}
     </div>
   </section>
 

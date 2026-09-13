@@ -42,6 +42,27 @@ services:
       ZEN_PUSH_VAPID_SUBJECT: "${ZEN_PUSH_VAPID_SUBJECT:-mailto:zen-control@example.invalid}"
       ZEN_PUSH_POLL_SECONDS: "${ZEN_PUSH_POLL_SECONDS:-5}"
 
+      # v0.55.4 external notification delivery. SMTP configuration and all
+      # delivery secrets are environment-only; webhook destination metadata is
+      # ordinary non-authoritative ZEN state.
+      ZEN_SMTP_ENABLED: "${ZEN_SMTP_ENABLED:-0}"
+      ZEN_SMTP_HOST: "${ZEN_SMTP_HOST:-}"
+      ZEN_SMTP_PORT: "${ZEN_SMTP_PORT:-587}"
+      ZEN_SMTP_USERNAME: "${ZEN_SMTP_USERNAME:-}"
+      ZEN_SMTP_PASSWORD: "${ZEN_SMTP_PASSWORD:-}"
+      ZEN_SMTP_FROM: "${ZEN_SMTP_FROM:-}"
+      ZEN_SMTP_FROM_NAME: "${ZEN_SMTP_FROM_NAME:-ZEN Control}"
+      ZEN_SMTP_TO: "${ZEN_SMTP_TO:-}"
+      ZEN_SMTP_STARTTLS: "${ZEN_SMTP_STARTTLS:-1}"
+      ZEN_SMTP_SSL: "${ZEN_SMTP_SSL:-0}"
+      ZEN_SMTP_TIMEOUT_SECONDS: "${ZEN_SMTP_TIMEOUT_SECONDS:-10}"
+      ZEN_WEBHOOK_SIGNING_SECRET: "${ZEN_WEBHOOK_SIGNING_SECRET:-}"
+      ZEN_WEBHOOK_TIMEOUT_SECONDS: "${ZEN_WEBHOOK_TIMEOUT_SECONDS:-10}"
+      ZEN_WEBHOOK_MAX_ATTEMPTS: "${ZEN_WEBHOOK_MAX_ATTEMPTS:-5}"
+      ZEN_WEBHOOK_ALLOW_HTTP: "${ZEN_WEBHOOK_ALLOW_HTTP:-0}"
+      ZEN_EXTERNAL_MAX_ATTEMPTS: "${ZEN_EXTERNAL_MAX_ATTEMPTS:-5}"
+      ZEN_EXTERNAL_DELIVERY_POLL_SECONDS: "${ZEN_EXTERNAL_DELIVERY_POLL_SECONDS:-5}"
+
       # v0.30 performance gathering. Metrics are bounded and memory-only.
       ZEN_PERF_ENABLED: "${ZEN_PERF_ENABLED:-1}"
       ZEN_PERF_SAMPLE_LIMIT: "${ZEN_PERF_SAMPLE_LIMIT:-500}"
@@ -291,6 +312,33 @@ services:
     depends_on:
       mikrotik-control:
         condition: service_started
+
+
+
+  # v0.55.4 optional local delivery simulators. These are not started by the
+  # normal stack and are never required in production.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: zen-mailpit
+    profiles: ["test-tools"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+
+  webhook-sink:
+    image: python:3.12-alpine
+    container_name: zen-webhook-sink
+    profiles: ["test-tools"]
+    restart: unless-stopped
+    command: ["python", "/app/webhook_sink.py"]
+    environment:
+      ZEN_TEST_WEBHOOK_SECRET: "${ZEN_WEBHOOK_SIGNING_SECRET:-}"
+      ZEN_TEST_WEBHOOK_PORT: "8092"
+    volumes:
+      - ./test-tools/webhook_sink.py:/app/webhook_sink.py:ro
+    ports:
+      - "127.0.0.1:8092:8092"
 
 secrets:
   cloudflare_tunnel_token:

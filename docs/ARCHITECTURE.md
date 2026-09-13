@@ -28,6 +28,14 @@ MikroTik exports IPFIX to GoFlow2. The telemetry ingest process combines flow ev
 
 The application publishes a sanitized live service-classifier catalogue into a shared volume. This allows custom service metadata to participate in reporting without giving the telemetry worker RouterOS authority.
 
+### Notification delivery
+
+Notifications are a downstream attention layer over durable incident, worker and policy evidence. Intelligence may correlate or escalate attention, preferences may suppress delivery, and delivery adapters may transmit eligible attention, but none of these stages can become RouterOS or policy authority.
+
+Browser push, SMTP and webhook delivery share durable per-attempt lifecycle evidence with bounded retries. SMTP host, credentials, sender and recipient configuration are environment-only. Webhook destination metadata may be stored in SQLite, but the HMAC signing secret is environment-only. Webhook payloads are signed over the exact timestamp and raw JSON body, and include a stable delivery/idempotency identity.
+
+The optional `test-tools` Compose profile adds Mailpit and a local signed webhook sink so the real SMTP/HTTP adapters, retry behavior and failure handling can be exercised without any external service. These simulators are test infrastructure only and add no monitoring or mutation authority.
+
 ### HTTPS and remote access
 
 Local HTTPS is provided by Caddy using DNS-01 certificate issuance. Remote access is optional and uses Cloudflare Access plus an outbound Cloudflare Tunnel. Neither path changes RouterOS policy authority.

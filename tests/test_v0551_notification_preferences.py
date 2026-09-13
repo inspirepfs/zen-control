@@ -203,7 +203,7 @@ class NotificationPreferenceSurfaceTests(unittest.TestCase):
         cls.css = (ROOT / "app" / "static" / "notifications.css").read_text()
 
     def test_preferences_are_first_class_notification_section(self):
-        self.assertIn('"notifications": ("inbox", "preferences", "intelligence", "history")', self.main)
+        self.assertIn('"notifications": ("inbox", "preferences", "intelligence", "delivery", "history")', self.main)
         self.assertIn("Notification preferences", self.template)
         self.assertIn("data-ux-group=\"preferences\"", self.template)
         self.assertIn("notification_preferences", self.main)
@@ -221,10 +221,10 @@ class NotificationPreferenceSurfaceTests(unittest.TestCase):
         self.assertIn("quiet hours", self.help.lower())
 
     def test_release_identity_is_v0551(self):
-        self.assertIn('version="0.55.3.1"', self.main)
-        self.assertIn("Current release: **v0.55.3.1**", (ROOT / "README.md").read_text())
+        self.assertIn('version="0.55.4"', self.main)
+        self.assertIn("Current release: **v0.55.4**", (ROOT / "README.md").read_text())
         self.assertIn("## v0.55.2", (ROOT / "CHANGELOG.md").read_text())
-        self.assertIn('PWA_RELEASE = "0.55.3.1"', (ROOT / "app" / "pwa.py").read_text())
+        self.assertIn('PWA_RELEASE = "0.55.4"', (ROOT / "app" / "pwa.py").read_text())
 
 
 if __name__ == "__main__":

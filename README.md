@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.55.3.1** — Notification Intelligence & Escalation: correlation groups, durable notification timelines, source-vs-attention severity, bounded unresolved-warning escalation, “why am I seeing this?” provenance, digest previews and noisy-source analytics. Intelligence remains attention-only and creates no RouterOS authority.
+> Current release: **v0.55.4** — External Delivery Adapters & Delivery Simulation: durable SMTP email and HMAC-signed webhook fan-out reuse the notification attention pipeline, with environment-only secrets and optional local Mailpit/webhook simulators under the `test-tools` Compose profile. External delivery remains notification-only and creates no RouterOS authority.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -36,7 +36,7 @@ ZEN currently provides:
 - Historical desired-policy checkpoints correlated with retained network evidence.
 - IPFIX and Pi-hole-backed activity/classification reporting.
 - Operational diagnostics, incidents, audit evidence and release-readiness checks.
-- Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls, cooldown-based noise suppression, correlation groups, escalation rules, lifecycle timelines, explanation provenance and digest/noise analytics.
+- Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls, cooldown-based noise suppression, correlation groups, escalation rules, lifecycle timelines, explanation provenance, digest/noise analytics, browser push, SMTP email and signed webhook delivery.
 - TOTP parent authentication, recovery codes and shared-display locking.
 - Progressive Web App support for tablet/mobile use, including standard encrypted browser/PWA push notifications that respect ZEN attention preferences.
 - Cloudflare Access/Tunnel remote access and split-DNS local HTTPS.

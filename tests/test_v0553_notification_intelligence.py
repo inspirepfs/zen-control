@@ -184,7 +184,7 @@ class NotificationIntelligenceSurfaceTests(unittest.TestCase):
         cls.css = (ROOT / "app" / "static" / "notifications.css").read_text()
 
     def test_intelligence_is_first_class_notification_section_and_explanation_surface(self):
-        self.assertIn('"notifications": ("inbox", "preferences", "intelligence", "history")', self.main)
+        self.assertIn('"notifications": ("inbox", "preferences", "intelligence", "delivery", "history")', self.main)
         self.assertIn("Notification intelligence", self.template)
         self.assertIn("Why am I seeing this?", self.template)
         self.assertIn('data-ux-group="intelligence"', self.template)
@@ -204,9 +204,9 @@ class NotificationIntelligenceSurfaceTests(unittest.TestCase):
         self.assertIn("never authorises a RouterOS write", self.help)
 
     def test_release_identity_is_v0553(self):
-        self.assertIn('version="0.55.3.1"', self.main)
-        self.assertIn('PWA_RELEASE = "0.55.3.1"', (ROOT / "app" / "pwa.py").read_text())
-        self.assertIn("const RELEASE = '0.55.3.1'", (ROOT / "app" / "static" / "service-worker.js").read_text())
+        self.assertIn('version="0.55.4"', self.main)
+        self.assertIn('PWA_RELEASE = "0.55.4"', (ROOT / "app" / "pwa.py").read_text())
+        self.assertIn("const RELEASE = '0.55.4'", (ROOT / "app" / "static" / "service-worker.js").read_text())
 
 
 if __name__ == "__main__":

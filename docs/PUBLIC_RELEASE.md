@@ -8,10 +8,12 @@ This checklist is deliberately conservative because ZEN can control a real house
 - [ ] Select an open-source license and add the root `LICENSE` file.
 - [ ] Rotate any credential that has ever appeared in chat, terminal captures, support bundles or screenshots.
 - [ ] Confirm `.env`, `secrets/`, databases, logs, archives and certificates are ignored and absent from Git history.
+- [ ] Explicitly review/rotate notification delivery secrets, including `ZEN_SMTP_PASSWORD` and `ZEN_WEBHOOK_SIGNING_SECRET`; verify real SMTP recipients and webhook endpoints are absent from committed examples, logs and screenshots.
 - [ ] Run `python3 scripts/public_release_audit.py`.
 - [ ] Run the full unit/hostile suite.
 - [ ] Run the UX validator and Python compile gate.
 - [ ] Validate Compose with safe example configuration.
+- [ ] Treat the optional `test-tools` Mailpit/webhook-sink profile as simulation infrastructure only; do not present it as a production SMTP relay or webhook service.
 - [ ] Review `git ls-files` manually for household/device/private deployment material.
 - [ ] Check README, docs and screenshots for real names, MAC addresses, private hostnames, public hostnames tied to the household, tokens and activity data.
 - [ ] Capture only sanitized screenshots.
