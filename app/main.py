@@ -95,6 +95,20 @@ templates.env.globals["zen_help_for_context"] = help_for_context
 _original_template_response = templates.TemplateResponse
 
 def _performance_template_response(*args, **kwargs):
+    # Starlette 1.x removed the deprecated TemplateResponse(name, context)
+    # signature. ZEN still has legacy call sites, so normalize them at the
+    # existing instrumentation boundary while allowing request-first calls to
+    # pass through unchanged.
+    if args and isinstance(args[0], str):
+        name = args[0]
+        context = args[1] if len(args) > 1 else kwargs.pop("context", None)
+        if not isinstance(context, dict):
+            raise TypeError("legacy TemplateResponse call requires a context dictionary")
+        request = context.get("request")
+        if request is None:
+            raise TypeError("template context must contain request")
+        args = (request, name, context, *args[2:])
+
     with perf_span("template.render"):
         return _original_template_response(*args, **kwargs)
 

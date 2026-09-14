@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.59.0.5 — Starlette TemplateResponse Compatibility Hotfix
+
+- Fixes HTTP 500 responses on dashboard, login and other server-rendered HTML surfaces after the v0.59.0.4 upgrade to Starlette 1.6.0 removed the deprecated `TemplateResponse(name, context)` signature.
+- Normalizes existing legacy ZEN template calls at the existing performance instrumentation boundary into Starlette 1.x request-first form, while allowing future request-first calls to pass through unchanged.
+- Fails closed with a clear error if a legacy template call omits the request from its context instead of passing a context dictionary as the template name.
+- Retains the v0.59.0.4 security-fixed dependency floors unchanged; application/PWA release remains `0.59.0`, and RouterOS authority, policy, telemetry and database semantics are unchanged.
+
 ## v0.59.0.4 — Public Release Framework & RouterOS Security Closure
 
 - Raises FastAPI to `0.141.1` and pins Starlette to `1.6.0`, moving ZEN off the pre-1.3.1 Starlette line affected by 2026 request/form parsing and request-URL security advisories.
