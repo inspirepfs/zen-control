@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.59.0.7 — CI & Runtime Acceptance Hardening
+
+- Adds `scripts/runtime_acceptance.py`, a credential-safe rebuilt-runtime smoke that proves process liveness, embedded runtime health, public sign-in rendering, synthetic password authentication and authenticated dashboard rendering.
+- Extends GitHub Quality with a dedicated `runtime-container-smoke` job that builds and starts the real `mikrotik-control` image using synthetic loopback-only RouterOS configuration before running the runtime acceptance.
+- Keeps RouterOS unavailable by design in CI (`127.0.0.1:8728`) so the smoke can prove the recovery/UI path without acquiring or exercising RouterOS mutation authority.
+- Always captures application logs and removes CI containers/volumes, including when runtime acceptance fails.
+- Adds regression coverage for the acceptance client and CI contract so a future framework/template incompatibility cannot be hidden by green source tests and health APIs alone.
+- Application/PWA release remains `0.59.0`; policy, database, telemetry and RouterOS authority semantics are unchanged.
+
 ## v0.59.0.6 — Documentation Hardening & Public Operations Clarity
 
 - Reworks the public documentation around three clear journeys: first installation, day-2 operation/recovery, and contribution/security review.

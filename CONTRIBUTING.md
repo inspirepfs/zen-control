@@ -56,6 +56,8 @@ an authenticated dashboard route renders successfully
 
 The v0.59.0.4 → v0.59.0.5 incident is the reason this is explicit: health endpoints remained green while the old Starlette `TemplateResponse(name, context)` call shape caused server-rendered HTML to fail with HTTP 500.
 
+GitHub Quality now enforces this automatically with `scripts/runtime_acceptance.py` in the `runtime-container-smoke` job. The CI smoke uses synthetic credentials and an unreachable loopback RouterOS endpoint, proves `/health/live`, `/health/runtime`, `/login` and an authenticated dashboard render, and intentionally does not treat RouterOS readiness as part of this HTML/runtime compatibility gate.
+
 ## Documentation expectations
 
 A user-visible or operator-visible change should update the relevant public document in the same change. Prefer stable operational language over development-slice shorthand. New environment variables must be reflected in `.env.example` and the environment contract; RouterOS assumptions belong in `routeros/`; release/process changes belong in `docs/PUBLIC_RELEASE.md`.
