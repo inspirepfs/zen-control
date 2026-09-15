@@ -2715,7 +2715,17 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
               <button type="button" class="primary compact" data-pwa-install hidden>Install ZEN Control</button>
             </div>
             <p class="pwa-security-note">Online-first by design: the installed app caches presentation assets only. Household policy, device activity, authentication responses and changes are never stored for offline viewing or queued for later replay.</p>
-            <p class="muted small">Server secure-origin prerequisite: <strong>{{ 'READY' if secure_transport.pwa.secure_origin_configured else 'BLOCKED' }}</strong>. Browser installability, service-worker control and push permission are validated on this device after HTTPS commissioning.</p>
+            <p class="muted small">Server secure-origin prerequisite: <strong>{{ 'READY' if secure_transport.pwa.secure_origin_configured else 'BLOCKED' }}</strong>. Browser installability, service-worker control and push permission are validated independently on this device after HTTPS commissioning.</p>
+            <details class="pwa-diagnostics-panel">
+              <summary>Install / reinstall diagnostics</summary>
+              <p class="muted small">Device-local browser evidence only. ZEN does not send or persist this diagnostic state and the copied summary excludes hostnames, credentials, household data and push endpoint/key material.</p>
+              <div class="pwa-diagnostic-grid" data-pwa-diagnostics aria-live="polite"></div>
+              <div class="pwa-diagnostic-actions">
+                <button type="button" class="secondary compact" data-pwa-diagnostics-refresh>Refresh diagnostics</button>
+                <button type="button" class="secondary compact" data-pwa-diagnostics-copy>Copy diagnostics</button>
+                <span class="muted small" data-pwa-diagnostics-copy-status></span>
+              </div>
+            </details>
           </div>
         </div>
 

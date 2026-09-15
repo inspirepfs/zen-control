@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.59.0.8 — PWA Install/Reinstall Diagnostics
+
+- Adds device-local browser diagnostics for secure-context, display-mode/standalone, manifest loading, root service-worker registration/control, Chromium install-event delivery, app-installed events, notification permission and push-subscription presence.
+- Corrects install-state semantics: service-worker registration is no longer presented as proof that the browser will offer installation; `READY TO INSTALL` is shown only when the browser actually provides `beforeinstallprompt`.
+- Adds explicit `PROMPT NOT OFFERED`, `BROWSER-MANAGED`, `PROMPT DISMISSED` and `INSTALL ACCEPTED` states so tablet/multi-device troubleshooting no longer relies on guesswork.
+- Adds a sanitized Copy diagnostics path and `window.ZEN_PWA_DIAGNOSTICS()` DevTools helper. The report contains capability/state booleans only and excludes hostname, credentials, household data, subscription endpoint/keys and persistent device fingerprints.
+- Expands PWA help/operator/install documentation and adds a JavaScript syntax gate plus regression contracts for the diagnostics surface.
+- Removes exact maintenance-tag assertions from unrelated historical tests; only the current release contract owns the exact maintenance marker.
+- Application/PWA runtime remains `0.59.0`; RouterOS authority, policy, telemetry, notification delivery and database semantics are unchanged.
+
 ## v0.59.0.7 — CI & Runtime Acceptance Hardening
 
 - Adds `scripts/runtime_acceptance.py`, a credential-safe rebuilt-runtime smoke that proves process liveness, embedded runtime health, public sign-in rendering, synthetic password authentication and authenticated dashboard rendering.

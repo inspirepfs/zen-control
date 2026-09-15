@@ -287,7 +287,7 @@ class NotificationSurfaceContractTests(unittest.TestCase):
 
     def test_release_version_is_v0550(self):
         self.assertIn('version="0.59.0"', self.main)
-        self.assertIn("Current maintenance release: **v0.59.0.6**", self.readme)
+        self.assertIn("`v0.59.0.x`", self.readme)
         self.assertIn("## v0.55.2", (ROOT / "CHANGELOG.md").read_text())
 
 

@@ -32,7 +32,7 @@ class PublicReleaseClosureTests(unittest.TestCase):
     def test_release_version_and_public_closure_label(self):
         self.assertIn('version="0.59.0"', (ROOT / "app/main.py").read_text())
         self.assertIn('PWA_RELEASE = "0.59.0"', (ROOT / "app/pwa.py").read_text())
-        self.assertIn("Current maintenance release: **v0.59.0.6**", self.readme)
+        self.assertIn("`v0.59.0.x`", self.readme)
         self.assertIn("application/PWA reports version **0.59.0**", self.readme)
 
     def test_agpl_license_is_selected_not_left_as_manual_gate(self):
@@ -54,7 +54,8 @@ class PublicReleaseClosureTests(unittest.TestCase):
     def test_android_pwa_manual_gate_is_explicitly_open_and_non_blocking(self):
         joined = "\n".join((self.readme, self.public, self.install, self.operator))
         self.assertIn("Android installation: **proven on at least one real device**", joined)
-        self.assertIn("tablet/multi-device installability diagnostics: **OPEN / follow-up**", joined)
+        self.assertIn("device-local install/reinstall diagnostics: **implemented**", joined)
+        self.assertIn("representative tablet/multi-device commissioning closure: **OPEN / follow-up**", joined)
         self.assertIn("installed-PWA browser-push lifecycle", joined)
         self.assertIn("non-blocking for source publication", joined)
         self.assertNotIn("Android PWA commissioning: PASS", joined)

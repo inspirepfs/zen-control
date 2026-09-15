@@ -167,7 +167,11 @@ python3 scripts/transport_acceptance.py \
   --require-hsts
 ```
 
-A local PASS proves the HTTPS health route, browser-security headers, HSTS, root-scope service worker and manifest prerequisites. It does **not** manufacture browser evidence. Android installation has been proven on at least one real device. Multi-device/tablet installability diagnostics, standalone lifecycle across representative devices and installed-PWA push commissioning remain open follow-up work; browser installability is partly device/browser controlled and must not be inferred from server readiness alone.
+A local PASS proves the HTTPS health route, browser-security headers, HSTS, root-scope service worker and manifest prerequisites. It does **not** manufacture browser evidence. Android installation has been proven on at least one real device.
+
+After signing in on each device, open **Settings → Parent access → Install / reinstall diagnostics**. The panel reports device-local evidence for secure context, display/standalone mode, manifest loading, service-worker registration/control, the Chromium `beforeinstallprompt` event, `appinstalled`, notification permission and whether a browser push subscription exists. `READY TO INSTALL` is shown only after the browser itself exposes an install event. `PROMPT NOT OFFERED` means the prerequisites loaded but the browser did not expose that event on this page; it is evidence to investigate, not proof of a ZEN defect.
+
+Use **Copy diagnostics** (or `window.ZEN_PWA_DIAGNOSTICS()` in browser DevTools) to compare phone and tablet results. The copied contract deliberately excludes hostname/origin, credentials, household policy/activity, notification subscription endpoint/keys and persistent device fingerprints. Multi-device/tablet closure and installed-PWA push lifecycle across representative devices remain follow-up commissioning evidence.
 
 ## 6. Optional Cloudflare remote access
 
@@ -235,7 +239,7 @@ A new installation is not commissioned merely because containers are running. Be
 
 **`Invalid host header` / login loop after enabling Secure cookies** — check `ZEN_ALLOWED_HOSTS`, DNS resolution, the exact HTTPS hostname and whether the service was recreated after `.env` changes.
 
-**HTTPS works but PWA install is unavailable** — confirm the browser is using the HTTPS FQDN, the manifest and root service worker load, and the browser/device has not already installed the app. ZEN cannot force `beforeinstallprompt`; use browser diagnostics for multi-device/tablet cases.
+**HTTPS works but PWA install is unavailable** — open the device-local Install / reinstall diagnostics first. Compare Secure context, Manifest, Service worker, Install event API and `beforeinstallprompt` evidence with a device where installation works. `PROMPT NOT OFFERED` can mean already installed, browser/device policy, Custom Tab/in-app browser, unmet browser-specific criteria or browser-managed installation. ZEN cannot force `beforeinstallprompt`.
 
 **Health is green but HTML returns 500** — inspect `docker compose logs mikrotik-control`. Framework/template compatibility can fail independently of health endpoints; this is why rendered-route smoke is part of maintenance qualification.
 

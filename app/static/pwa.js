@@ -2,6 +2,45 @@
   'use strict';
   const RELEASE = '0.59.0';
   let deferredInstallPrompt = null;
+  let currentRegistration = null;
+  const browserDiagnostics = {
+    schema: 'zen_pwa_browser_diagnostics_v1',
+    version: RELEASE,
+    secureContext: Boolean(window.isSecureContext),
+    standalone: false,
+    displayMode: 'browser',
+    installEventApiDetected: ('onbeforeinstallprompt' in window) || ('BeforeInstallPromptEvent' in window),
+    beforeInstallPromptReceived: false,
+    appInstalledEventReceived: false,
+    lastPromptOutcome: 'not_run',
+    serviceWorker: {
+      supported: 'serviceWorker' in navigator,
+      registered: false,
+      active: false,
+      waiting: false,
+      installing: false,
+      controller: false,
+      scopePath: null,
+    },
+    manifest: {
+      linkPresent: false,
+      loaded: false,
+      id: null,
+      scope: null,
+      startUrl: null,
+      display: null,
+      iconSizes: [],
+      error: null,
+    },
+    notifications: {
+      supported: 'Notification' in window,
+      permission: 'Notification' in window ? Notification.permission : 'unsupported',
+    },
+    push: {
+      supported: ('PushManager' in window) && ('serviceWorker' in navigator),
+      subscribed: null,
+    },
+  };
 
   const standalone = () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
   const csrfToken = () => document.querySelector('meta[name="zen-csrf"]')?.content || document.querySelector('input[name="csrf"]')?.value || '';
@@ -17,6 +56,204 @@
       button.disabled = !deferredInstallPrompt;
     });
   }
+
+
+  function currentDisplayMode() {
+    for (const mode of ['fullscreen', 'standalone', 'minimal-ui', 'window-controls-overlay', 'browser']) {
+      try {
+        if (window.matchMedia(`(display-mode: ${mode})`).matches) return mode;
+      } catch (_error) { /* Browser does not understand this display mode. */ }
+    }
+    return standalone() ? 'standalone' : 'browser';
+  }
+
+  function installDiagnosis() {
+    if (standalone()) {
+      return {state: 'INSTALLED', detail: `Running in standalone app mode · v${RELEASE}`};
+    }
+    if (!window.isSecureContext) {
+      return {state: 'HTTPS REQUIRED', detail: 'A secure HTTPS context is required for normal PWA installation and service-worker use.'};
+    }
+    if (!browserDiagnostics.serviceWorker.supported) {
+      return {state: 'UNSUPPORTED', detail: 'This browser does not expose service-worker support.'};
+    }
+    if (!browserDiagnostics.manifest.linkPresent) {
+      return {state: 'MANIFEST MISSING', detail: 'The page has no web-app manifest link.'};
+    }
+    if (browserDiagnostics.manifest.error) {
+      return {state: 'MANIFEST UNAVAILABLE', detail: 'The web-app manifest could not be loaded or parsed.'};
+    }
+    if (!browserDiagnostics.serviceWorker.registered) {
+      return {state: 'SERVICE WORKER UNAVAILABLE', detail: 'A root-scope service worker is not registered on this page.'};
+    }
+    if (deferredInstallPrompt) {
+      return {state: 'READY TO INSTALL', detail: `The browser offered an install prompt on this page · v${RELEASE}`};
+    }
+    if (browserDiagnostics.lastPromptOutcome === 'dismissed') {
+      return {state: 'PROMPT DISMISSED', detail: 'The last browser install prompt was dismissed. A new prompt requires the browser to offer another install event.'};
+    }
+    if (browserDiagnostics.lastPromptOutcome === 'accepted') {
+      return {state: 'INSTALL ACCEPTED', detail: 'The browser accepted the install request; waiting for installed/standalone evidence.'};
+    }
+    if (!browserDiagnostics.installEventApiDetected) {
+      return {state: 'BROWSER-MANAGED', detail: 'This browser does not expose the Chromium beforeinstallprompt API. Use its own install/Add to Home Screen UI if available.'};
+    }
+    return {
+      state: 'PROMPT NOT OFFERED',
+      detail: 'PWA prerequisites are loaded, but this browser has not offered beforeinstallprompt on this page. This can mean already installed, browser/device policy, an in-app/custom tab, unmet browser criteria, or browser-managed install UI.',
+    };
+  }
+
+  function diagnosticRows() {
+    const diagnosis = installDiagnosis();
+    return [
+      ['Install decision', diagnosis.state, diagnosis.detail],
+      ['Secure context', browserDiagnostics.secureContext ? 'YES' : 'NO', 'HTTPS/browser secure-context evidence'],
+      ['Display mode', browserDiagnostics.displayMode.toUpperCase(), browserDiagnostics.standalone ? 'Standalone evidence detected' : 'Normal browser/tab mode'],
+      ['Manifest', browserDiagnostics.manifest.loaded ? 'LOADED' : (browserDiagnostics.manifest.error ? 'ERROR' : 'CHECKING'), browserDiagnostics.manifest.loaded ? `${browserDiagnostics.manifest.display || 'display unknown'} · icons ${browserDiagnostics.manifest.iconSizes.join(', ') || 'not declared'}` : 'Browser manifest prerequisite'],
+      ['Service worker', browserDiagnostics.serviceWorker.registered ? 'REGISTERED' : (browserDiagnostics.serviceWorker.supported ? 'NOT REGISTERED' : 'UNSUPPORTED'), `active ${browserDiagnostics.serviceWorker.active ? 'yes' : 'no'} · controller ${browserDiagnostics.serviceWorker.controller ? 'yes' : 'no'}`],
+      ['Install event API', browserDiagnostics.installEventApiDetected ? 'DETECTED' : 'NOT DETECTED', `beforeinstallprompt received ${browserDiagnostics.beforeInstallPromptReceived ? 'yes' : 'no'}`],
+      ['Install event', browserDiagnostics.appInstalledEventReceived ? 'APPINSTALLED SEEN' : 'NOT SEEN', `last prompt outcome ${browserDiagnostics.lastPromptOutcome}`],
+      ['Notifications', browserDiagnostics.notifications.supported ? browserDiagnostics.notifications.permission.toUpperCase() : 'UNSUPPORTED', 'Browser notification permission only; no endpoint or keys are displayed'],
+      ['Push subscription', browserDiagnostics.push.supported ? (browserDiagnostics.push.subscribed === true ? 'SUBSCRIBED' : (browserDiagnostics.push.subscribed === false ? 'NOT SUBSCRIBED' : 'UNKNOWN')) : 'UNSUPPORTED', 'Device-local subscription presence only'],
+    ];
+  }
+
+  function renderPwaDiagnostics() {
+    browserDiagnostics.secureContext = Boolean(window.isSecureContext);
+    browserDiagnostics.standalone = standalone();
+    browserDiagnostics.displayMode = currentDisplayMode();
+    if ('Notification' in window) browserDiagnostics.notifications.permission = Notification.permission;
+    const rows = diagnosticRows();
+    document.querySelectorAll('[data-pwa-diagnostics]').forEach(container => {
+      container.replaceChildren();
+      rows.forEach(([label, state, detail]) => {
+        const row = document.createElement('div');
+        row.className = 'pwa-diagnostic-row';
+        const heading = document.createElement('div');
+        heading.className = 'pwa-diagnostic-heading';
+        const name = document.createElement('strong');
+        name.textContent = label;
+        const badge = document.createElement('span');
+        badge.className = 'pwa-state';
+        badge.textContent = state;
+        heading.append(name, badge);
+        const copy = document.createElement('span');
+        copy.className = 'muted small';
+        copy.textContent = detail;
+        row.append(heading, copy);
+        container.appendChild(row);
+      });
+    });
+  }
+
+  async function inspectManifest() {
+    const link = document.querySelector('link[rel~="manifest"]');
+    browserDiagnostics.manifest.linkPresent = Boolean(link?.href);
+    browserDiagnostics.manifest.loaded = false;
+    browserDiagnostics.manifest.error = null;
+    if (!link?.href) return;
+    try {
+      const response = await fetch(link.href, {cache: 'no-store', credentials: 'same-origin'});
+      if (!response.ok) throw new Error('manifest_http_error');
+      const manifest = await response.json();
+      browserDiagnostics.manifest.loaded = true;
+      browserDiagnostics.manifest.id = typeof manifest.id === 'string' ? manifest.id : null;
+      browserDiagnostics.manifest.scope = typeof manifest.scope === 'string' ? manifest.scope : null;
+      browserDiagnostics.manifest.startUrl = typeof manifest.start_url === 'string' ? manifest.start_url : null;
+      browserDiagnostics.manifest.display = typeof manifest.display === 'string' ? manifest.display : null;
+      browserDiagnostics.manifest.iconSizes = Array.isArray(manifest.icons)
+        ? [...new Set(manifest.icons.map(icon => String(icon?.sizes || '')).filter(Boolean))].sort()
+        : [];
+    } catch (_error) {
+      browserDiagnostics.manifest.error = 'load_or_parse_failed';
+    }
+  }
+
+  async function inspectServiceWorker(registration = null) {
+    if (!browserDiagnostics.serviceWorker.supported) return null;
+    try {
+      const current = registration || currentRegistration || await navigator.serviceWorker.getRegistration('/');
+      if (current) currentRegistration = current;
+      browserDiagnostics.serviceWorker.registered = Boolean(current);
+      browserDiagnostics.serviceWorker.active = Boolean(current?.active);
+      browserDiagnostics.serviceWorker.waiting = Boolean(current?.waiting);
+      browserDiagnostics.serviceWorker.installing = Boolean(current?.installing);
+      browserDiagnostics.serviceWorker.controller = Boolean(navigator.serviceWorker.controller);
+      if (current?.scope) {
+        try { browserDiagnostics.serviceWorker.scopePath = new URL(current.scope).pathname; }
+        catch (_error) { browserDiagnostics.serviceWorker.scopePath = '/'; }
+      }
+      if (current?.pushManager) {
+        try { browserDiagnostics.push.subscribed = Boolean(await current.pushManager.getSubscription()); }
+        catch (_error) { browserDiagnostics.push.subscribed = null; }
+      }
+      return current;
+    } catch (_error) {
+      browserDiagnostics.serviceWorker.registered = false;
+      browserDiagnostics.serviceWorker.active = false;
+      browserDiagnostics.serviceWorker.controller = Boolean(navigator.serviceWorker.controller);
+      return null;
+    }
+  }
+
+  async function refreshPwaDiagnostics(registration = null) {
+    await Promise.all([inspectManifest(), inspectServiceWorker(registration)]);
+    const diagnosis = installDiagnosis();
+    setInstallState(diagnosis.state, diagnosis.detail);
+    renderPwaDiagnostics();
+  }
+
+  function diagnosticSnapshot() {
+    const diagnosis = installDiagnosis();
+    return {
+      schema: browserDiagnostics.schema,
+      version: browserDiagnostics.version,
+      install: {
+        state: diagnosis.state,
+        secure_context: browserDiagnostics.secureContext,
+        display_mode: browserDiagnostics.displayMode,
+        standalone: browserDiagnostics.standalone,
+        install_event_api_detected: browserDiagnostics.installEventApiDetected,
+        beforeinstallprompt_received: browserDiagnostics.beforeInstallPromptReceived,
+        appinstalled_received: browserDiagnostics.appInstalledEventReceived,
+        last_prompt_outcome: browserDiagnostics.lastPromptOutcome,
+      },
+      manifest: {...browserDiagnostics.manifest},
+      service_worker: {...browserDiagnostics.serviceWorker},
+      notifications: {...browserDiagnostics.notifications},
+      push: {...browserDiagnostics.push},
+      privacy: 'device-local capability state only; no hostname, credentials, subscription endpoint, household policy or activity data',
+    };
+  }
+
+  async function copyDiagnostics(button) {
+    const text = JSON.stringify(diagnosticSnapshot(), null, 2);
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch (_error) { copied = false; }
+    if (!copied) {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      try { copied = document.execCommand('copy'); } catch (_error) { copied = false; }
+      area.remove();
+    }
+    const status = document.querySelector('[data-pwa-diagnostics-copy-status]');
+    if (status) status.textContent = copied ? 'Diagnostic summary copied.' : 'Copy was blocked by the browser; use DevTools window.ZEN_PWA_DIAGNOSTICS().';
+    if (button) button.textContent = copied ? 'Copied' : 'Copy unavailable';
+    setTimeout(() => { if (button) button.textContent = 'Copy diagnostics'; }, 1800);
+  }
+
+  window.ZEN_PWA_DIAGNOSTICS = () => diagnosticSnapshot();
 
   function setPushState(state, detail = '', options = {}) {
     document.querySelectorAll('[data-push-state]').forEach(el => {
@@ -69,10 +306,15 @@
         });
       });
       navigator.serviceWorker.addEventListener('controllerchange', () => window.location.reload());
-      setInstallState(standalone() ? 'INSTALLED' : 'READY', standalone() ? `Standalone app · v${RELEASE}` : `Installable web app · v${RELEASE}`);
+      currentRegistration = registration;
+      await inspectServiceWorker(registration);
+      const diagnosis = installDiagnosis();
+      setInstallState(diagnosis.state, diagnosis.detail);
       return registration;
     } catch (_error) {
+      browserDiagnostics.serviceWorker.registered = false;
       setInstallState('UNAVAILABLE', 'Service worker registration failed; normal browser access still works.');
+      renderPwaDiagnostics();
       return null;
     }
   }
@@ -201,24 +443,47 @@
   window.addEventListener('beforeinstallprompt', event => {
     event.preventDefault();
     deferredInstallPrompt = event;
-    setInstallState('READY TO INSTALL', `Android/browser install available · v${RELEASE}`);
+    browserDiagnostics.beforeInstallPromptReceived = true;
+    browserDiagnostics.lastPromptOutcome = 'not_run';
+    setInstallState('READY TO INSTALL', `The browser offered an install prompt on this page · v${RELEASE}`);
+    renderPwaDiagnostics();
   });
 
   window.addEventListener('appinstalled', () => {
     deferredInstallPrompt = null;
-    setInstallState('INSTALLED', `Standalone app · v${RELEASE}`);
+    browserDiagnostics.appInstalledEventReceived = true;
+    browserDiagnostics.lastPromptOutcome = 'accepted';
+    setInstallState('INSTALLED', `Standalone app installed · v${RELEASE}`);
+    renderPwaDiagnostics();
   });
 
   document.addEventListener('click', async event => {
     const installButton = event.target.closest('[data-pwa-install]');
     if (installButton && deferredInstallPrompt) {
       installButton.disabled = true;
-      deferredInstallPrompt.prompt();
-      await deferredInstallPrompt.userChoice;
+      const prompt = deferredInstallPrompt;
+      try {
+        await prompt.prompt();
+        const choice = await prompt.userChoice;
+        browserDiagnostics.lastPromptOutcome = choice?.outcome || 'unknown';
+      } catch (_error) {
+        browserDiagnostics.lastPromptOutcome = 'error';
+      }
       deferredInstallPrompt = null;
-      setInstallState(standalone() ? 'INSTALLED' : 'READY', `Install prompt completed · v${RELEASE}`);
+      const diagnosis = installDiagnosis();
+      setInstallState(diagnosis.state, diagnosis.detail);
+      await refreshPwaDiagnostics(currentRegistration);
       return;
     }
+    const diagnosticsRefresh = event.target.closest('[data-pwa-diagnostics-refresh]');
+    if (diagnosticsRefresh) {
+      diagnosticsRefresh.disabled = true;
+      try { await refreshPwaDiagnostics(currentRegistration); }
+      finally { diagnosticsRefresh.disabled = false; }
+      return;
+    }
+    const diagnosticsCopy = event.target.closest('[data-pwa-diagnostics-copy]');
+    if (diagnosticsCopy) { await copyDiagnostics(diagnosticsCopy); return; }
     const pushEnable = event.target.closest('[data-push-enable]');
     if (pushEnable) { await enablePush(pushEnable); return; }
     const pushDisable = event.target.closest('[data-push-disable]');
@@ -229,7 +494,15 @@
 
   document.addEventListener('DOMContentLoaded', async () => {
     setInstallState(standalone() ? 'INSTALLED' : 'CHECKING', `ZEN Control PWA · v${RELEASE}`);
-    await registerServiceWorker();
+    renderPwaDiagnostics();
+    const registration = await registerServiceWorker();
+    await refreshPwaDiagnostics(registration);
     await refreshPushState();
+    setTimeout(() => { refreshPwaDiagnostics(currentRegistration); }, 1500);
+  });
+
+  window.addEventListener('pageshow', () => { refreshPwaDiagnostics(currentRegistration); });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refreshPwaDiagnostics(currentRegistration);
   });
 })();

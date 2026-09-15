@@ -24,6 +24,8 @@ jobs:
         run: python3 -m py_compile app/*.py telemetry/ingest/*.py
       - name: UX validation
         run: python3 scripts/ux_validate.py
+      - name: PWA JavaScript syntax
+        run: node --check app/static/pwa.js
       - name: Public-source audit
         run: python3 scripts/public_release_audit.py
       - name: Unit and hostile tests

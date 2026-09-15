@@ -85,10 +85,11 @@ Current evidence is intentionally split:
 
 - local HTTPS, certificate/hostname validation, HSTS, manifest and root-scope service-worker prerequisites: **qualified**;
 - Android installation: **proven on at least one real device**;
-- tablet/multi-device installability diagnostics: **OPEN / follow-up**;
+- device-local install/reinstall diagnostics: **implemented**;
+- representative tablet/multi-device commissioning closure: **OPEN / follow-up**;
 - installed-PWA browser-push lifecycle across representative devices/restarts: **OPEN / follow-up**.
 
-These follow-up items are **non-blocking for source publication** but remain visible commissioning work. Browser installability is device/profile controlled. Do not mark multi-device commissioning PASS merely because the server or one phone is healthy.
+The device-local diagnostics distinguish server/browser prerequisites from the browser's own install decision and deliberately do not manufacture PASS from missing `beforeinstallprompt` evidence. The remaining representative-device/push follow-up items are **non-blocking for source publication** but remain visible commissioning work. Do not mark multi-device commissioning PASS merely because the server or one phone is healthy.
 
 ## Maintenance-release sequence
 

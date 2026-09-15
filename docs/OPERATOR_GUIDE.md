@@ -113,10 +113,19 @@ Known current state:
 
 - local HTTPS/service-worker/manifest prerequisites are qualified;
 - Android installation is proven on at least one real device;
-- tablet/multi-device installability diagnostics remain open;
+- device-local install/reinstall diagnostics are implemented;
+- representative tablet/multi-device closure remains follow-up evidence;
 - installed-PWA push lifecycle commissioning remains follow-up work.
 
-If a second device has no install option despite using the HTTPS FQDN, confirm it is full Chrome/Chromium rather than an in-app Custom Tab, check whether ZEN is already installed in Android app settings, clear/reset site state when appropriate, and use remote Chromium DevTools to inspect manifest/service-worker/installability errors. ZEN cannot legitimately force a native install prompt if the browser does not emit one.
+For a second device with no install option, open **Settings → Parent access → Install / reinstall diagnostics** before clearing anything. Interpret the main states as follows:
+
+- **READY TO INSTALL** — the browser emitted `beforeinstallprompt`; ZEN can present its Install button.
+- **PROMPT NOT OFFERED** — secure context/manifest/service worker are present but Chromium has not offered the install event. Check already-installed state, full browser vs Custom Tab/in-app browser, browser/device policy and browser-specific installability diagnostics.
+- **BROWSER-MANAGED** — this browser does not expose the Chromium install-event API; use its native Install/Add to Home Screen UI.
+- **PROMPT DISMISSED** — the current install event was consumed/dismissed; ZEN cannot reuse it and must wait for the browser to offer another.
+- **INSTALL ACCEPTED / INSTALLED** — browser acceptance or standalone/appinstalled evidence has been observed.
+
+Use **Copy diagnostics** or `window.ZEN_PWA_DIAGNOSTICS()` to compare devices. The report contains browser capability/state only; it intentionally excludes hostnames, credentials, household policy/activity and push endpoint/key material. ZEN cannot legitimately force a native install prompt if the browser does not emit one.
 
 ## Backup and upgrade
 

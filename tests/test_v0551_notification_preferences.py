@@ -222,7 +222,7 @@ class NotificationPreferenceSurfaceTests(unittest.TestCase):
 
     def test_release_identity_is_v0551(self):
         self.assertIn('version="0.59.0"', self.main)
-        self.assertIn("Current maintenance release: **v0.59.0.6**", (ROOT / "README.md").read_text())
+        self.assertIn("`v0.59.0.x`", (ROOT / "README.md").read_text())
         self.assertIn("## v0.55.2", (ROOT / "CHANGELOG.md").read_text())
         self.assertIn('PWA_RELEASE = "0.59.0"', (ROOT / "app" / "pwa.py").read_text())
 

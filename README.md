@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current maintenance release: **v0.59.0.6**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.6 is documentation-only and follows the v0.59.0.5 Starlette template-rendering hotfix.
+> Current maintenance release: **v0.59.0.8**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.8 adds device-local PWA install/reinstall diagnostics and follows the v0.59.0.7 CI/runtime acceptance hardening release.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -52,6 +52,7 @@ ZEN currently provides:
 - Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls, cooldown-based noise suppression, correlation groups, escalation rules, lifecycle timelines, explanation provenance, digest/noise analytics, browser push, SMTP email and signed webhook delivery.
 - TOTP parent authentication, recovery codes and shared-display locking.
 - Progressive Web App support for tablet/mobile use, including standard encrypted browser/PWA push notifications that respect ZEN attention preferences.
+- Device-local PWA install/reinstall diagnostics that distinguish secure-context, manifest, service-worker, install-event, standalone, notification and push-subscription evidence without sending browser diagnostics back to ZEN.
 - Cloudflare Access/Tunnel remote access and split-DNS local HTTPS.
 - Controlled migration from MikroTik Kid Control with guarded cutover and rollback.
 - Revisioned configuration state, optimistic concurrency, a transactional outbox and durable read-side background jobs.
