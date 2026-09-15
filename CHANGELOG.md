@@ -7,6 +7,7 @@
 - Keeps RouterOS unavailable by design in CI (`127.0.0.1:8728`) so the smoke can prove the recovery/UI path without acquiring or exercising RouterOS mutation authority.
 - Always captures application logs and removes CI containers/volumes, including when runtime acceptance fails.
 - Adds regression coverage for the acceptance client and CI contract so a future framework/template incompatibility cannot be hidden by green source tests and health APIs alone.
+- Retries transient raw socket resets during container startup so the runtime smoke honors its startup timeout instead of failing in the first milliseconds before Uvicorn is ready.
 - Application/PWA release remains `0.59.0`; policy, database, telemetry and RouterOS authority semantics are unchanged.
 
 ## v0.59.0.6 — Documentation Hardening & Public Operations Clarity

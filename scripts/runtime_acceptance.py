@@ -39,6 +39,13 @@ def _request(opener, req: request.Request, *, timeout: float):
         raise AcceptanceError(
             f"{req.get_method()} {req.full_url} failed: {exc.reason}"
         ) from exc
+    except OSError as exc:
+        # A freshly-started container can accept the TCP connection and then
+        # reset it before Uvicorn is ready to answer HTTP. Normalize those raw
+        # socket/OS transport failures into the retryable acceptance error path.
+        raise AcceptanceError(
+            f"{req.get_method()} {req.full_url} failed: {exc}"
+        ) from exc
 
 
 def _get_json(opener, base_url: str, path: str, *, timeout: float) -> dict:

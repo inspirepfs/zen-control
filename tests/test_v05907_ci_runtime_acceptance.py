@@ -1,4 +1,5 @@
 import http.server
+import importlib.util
 import json
 import os
 import subprocess
@@ -9,6 +10,39 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_runtime_acceptance_module():
+    path = ROOT / "scripts" / "runtime_acceptance.py"
+    spec = importlib.util.spec_from_file_location("zen_runtime_acceptance", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class _JsonResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return json.dumps({"ok": True, "status": "alive", "version": "0.59.0"}).encode()
+
+
+class _ResetThenHealthyOpener:
+    def __init__(self):
+        self.calls = 0
+
+    def open(self, _req, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return _JsonResponse()
 
 
 class _AcceptanceHandler(http.server.BaseHTTPRequestHandler):
@@ -77,6 +111,21 @@ class _AcceptanceHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.send_header("Set-Cookie", "zen_session=ok; Path=/; HttpOnly")
         self.end_headers()
+
+
+class RuntimeAcceptanceStartupRetryTests(unittest.TestCase):
+    def test_connection_reset_during_container_startup_is_retried(self):
+        runtime_acceptance = _load_runtime_acceptance_module()
+        opener = _ResetThenHealthyOpener()
+        result = runtime_acceptance._wait_for_json(
+            opener,
+            "http://127.0.0.1:8080",
+            "/health/live",
+            timeout=2,
+            request_timeout=1,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(opener.calls, 2)
 
 
 class RuntimeAcceptanceScriptTests(unittest.TestCase):
