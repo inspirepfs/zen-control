@@ -188,10 +188,18 @@ class RuntimeAcceptanceWorkflowContractTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "quality.yml").read_text()
         self.assertIn("runtime-container-smoke:", workflow)
         self.assertIn("needs: source-quality", workflow)
+        self.assertIn("up -d telemetry-db", workflow)
+        self.assertIn("State.Health.Status", workflow)
+        self.assertIn('status" = "healthy"', workflow)
         self.assertIn("up -d --build mikrotik-control", workflow)
+        self.assertLess(
+            workflow.index("up -d telemetry-db"),
+            workflow.index("up -d --build mikrotik-control"),
+        )
         self.assertIn("scripts/runtime_acceptance.py", workflow)
         self.assertIn("--expect-version 0.59.0", workflow)
         self.assertIn("Application logs", workflow)
+        self.assertIn("Telemetry database logs", workflow)
         self.assertIn("if: always()", workflow)
         self.assertIn("down -v --remove-orphans", workflow)
 

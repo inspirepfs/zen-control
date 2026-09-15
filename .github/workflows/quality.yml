@@ -54,6 +54,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Start telemetry database
+        run: |
+          docker compose --env-file .env.example up -d telemetry-db
+          for attempt in $(seq 1 60); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' mikrotik-telemetry-db 2>/dev/null || true)"
+            if [ "$status" = "healthy" ]; then
+              echo "telemetry-db is healthy"
+              break
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              echo "telemetry-db became unhealthy" >&2
+              docker compose --env-file .env.example logs --no-color --tail=100 telemetry-db || true
+              exit 1
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "telemetry-db did not become healthy within 60 seconds" >&2
+              docker compose --env-file .env.example logs --no-color --tail=100 telemetry-db || true
+              exit 1
+            fi
+            sleep 1
+          done
       - name: Build and start application container
         run: docker compose --env-file .env.example up -d --build mikrotik-control
       - name: Runtime and rendered-HTML acceptance
@@ -67,6 +88,9 @@ jobs:
       - name: Application logs
         if: always()
         run: docker compose --env-file .env.example logs --no-color --tail=250 mikrotik-control || true
+      - name: Telemetry database logs
+        if: always()
+        run: docker compose --env-file .env.example logs --no-color --tail=100 telemetry-db || true
       - name: Tear down runtime smoke
         if: always()
         run: docker compose --env-file .env.example down -v --remove-orphans || true

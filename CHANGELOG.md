@@ -8,6 +8,7 @@
 - Always captures application logs and removes CI containers/volumes, including when runtime acceptance fails.
 - Adds regression coverage for the acceptance client and CI contract so a future framework/template incompatibility cannot be hidden by green source tests and health APIs alone.
 - Retries transient raw socket resets during container startup so the runtime smoke honors its startup timeout instead of failing in the first milliseconds before Uvicorn is ready.
+- Starts the real telemetry PostgreSQL service and waits for its health check before launching `mikrotik-control`, so strict `/health/runtime` acceptance evaluates a complete read-model runtime instead of an intentionally incomplete CI topology.
 - Application/PWA release remains `0.59.0`; policy, database, telemetry and RouterOS authority semantics are unchanged.
 
 ## v0.59.0.6 — Documentation Hardening & Public Operations Clarity
