@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.59.0.6 — Documentation Hardening & Public Operations Clarity
+
+- Reworks the public documentation around three clear journeys: first installation, day-2 operation/recovery, and contribution/security review.
+- Separates the application/PWA version (`0.59.0`) from maintenance release tags (`v0.59.0.x`) so hotfix releases are described accurately without implying a runtime-version change.
+- Expands installation, environment, operator, RouterOS, security and contribution guidance with network flows, health interpretation, backup/recovery, failure triage, secret lifecycle and release-smoke expectations.
+- Updates PWA status to reflect real-device evidence: Android installation is proven on at least one device, while tablet/multi-device installability diagnostics and installed-PWA push commissioning remain open follow-up work.
+- Adds an explicit rendered-HTML smoke gate after framework/dependency changes, closing the documentation/process gap exposed by the v0.59.0.4 Starlette TemplateResponse regression.
+- Documentation/in-app-help maintenance release: application/PWA version remains `0.59.0`; RouterOS authority, policy semantics, telemetry, database schema and dependency floors are unchanged.
+
 ## v0.59.0.5 — Starlette TemplateResponse Compatibility Hotfix
 
 - Fixes HTTP 500 responses on dashboard, login and other server-rendered HTML surfaces after the v0.59.0.4 upgrade to Starlette 1.6.0 removed the deprecated `TemplateResponse(name, context)` signature.

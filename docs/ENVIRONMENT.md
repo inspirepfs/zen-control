@@ -18,6 +18,32 @@ python3 scripts/env_validate.py
 
 If `.env` exists, the second form validates it as well. Output contains variable names and contract state only; values from `.env` are never printed.
 
+## Safe configuration workflow
+
+1. Copy `.env.example` to `.env`; never edit `.env.example` with deployment values.
+2. Replace all required placeholders and generate independent random authentication/encryption secrets.
+3. Run `python3 scripts/env_validate.py` before `docker compose config`.
+4. Review the rendered Compose configuration for topology only; do not paste it into public issues because secret interpolation may be present.
+5. Recreate affected services after changing environment values. A running container does not automatically receive changes made to the host `.env`.
+6. Preserve long-lived encryption/signing material across backup/restore where the owning subsystem requires it.
+
+A good operational rule is: **configuration names may be documented; deployment values are private unless explicitly designed as public identity.**
+
+## Configuration groups
+
+The public `.env.example` is the canonical variable list. The most important groups are:
+
+| Group | Examples | Notes |
+| --- | --- | --- |
+| Parent authentication | `ADMIN_USER`, `ADMIN_PASSWORD`, `SESSION_SECRET` | `ADMIN_PASSWORD` and `SESSION_SECRET` are secrets. |
+| TOTP encryption | `OTP_ENCRYPTION_KEY`, `OTP_ISSUER` | Keep the encryption key stable after enrolment and across database restore. |
+| RouterOS API | `MIKROTIK_HOST`, `MIKROTIK_PORT`, `MIKROTIK_USER`, `MIKROTIK_PASSWORD` | Use a dedicated API account and trusted management path. |
+| Telemetry/PostgreSQL | `TELEMETRY_DB_*`, `PIHOLE_PASSWORD` | Treat retained telemetry as household-sensitive data. |
+| Local HTTPS | `ZEN_LOCAL_HOST`, `ZEN_LAN_BIND_IP`, `ZEN_LAN_CIDRS`, `CADDY_CF_API_TOKEN` | DNS API token is secret and is isolated to Caddy. |
+| Remote access | `ZEN_REMOTE_ACCESS_ENABLED`, `ZEN_PUBLIC_HOST`, `CLOUDFLARE_TUNNEL_TOKEN_FILE` | Remote mode also requires Access protection, secure cookies and allowed-host coverage. |
+| Notifications | `ZEN_SMTP_*`, `ZEN_WEBHOOK_*`, `ZEN_PUSH_*` | Secrets remain environment/file backed; destination metadata may live in SQLite where documented. |
+| Performance/reconciler tuning | `ZEN_PERF_*`, `ZEN_ROUTER_OBSERVE_WORKERS` | Tuning never grants extra RouterOS write concurrency. |
+
 ## Contract classes
 
 ZEN uses these configuration classes:
@@ -57,8 +83,28 @@ Subsystems whose enablement lives in `policy.db` rather than `.env` still valida
 
 The check runs in both `scripts/release_patch.py` and the GitHub `Quality` workflow. A newly introduced environment variable therefore cannot silently bypass the documented configuration contract.
 
+## Change and restart semantics
+
+Host-side Compose interpolation happens when the service is created. After changing `.env`, validate again and recreate the affected service(s), for example:
+
+```bash
+python3 scripts/env_validate.py
+docker compose config >/dev/null
+docker compose up -d --force-recreate mikrotik-control
+```
+
+Use the release helper for qualified software upgrades because it also performs backup/restore smoke and topology/runtime proof. Manual recreation is appropriate for deliberate local configuration changes when you understand the affected service.
+
 ## Secrets
 
 `.env.example` must contain blank values or obvious placeholders for secrets. Real deployment secrets belong in the untracked `.env` or the existing file-backed secret mechanism where documented.
 
 Never paste live passwords, API tokens, signing secrets, VAPID private keys or tunnel tokens into `.env.example`, source files, test fixtures, issue reports or support bundles.
+
+## Rotation notes
+
+- Rotate `ADMIN_PASSWORD`, RouterOS API passwords, database passwords and external-delivery credentials if exposure is suspected.
+- Changing `SESSION_SECRET` invalidates existing sessions.
+- Changing `OTP_ENCRYPTION_KEY` without a controlled re-enrolment/migration makes existing encrypted authenticator material unreadable.
+- Treat a leaked Cloudflare API/tunnel token as compromised even if it is later removed from a file or Git history.
+- After credential rotation, recreate the owning service and prove the associated health path before considering the rotation complete.

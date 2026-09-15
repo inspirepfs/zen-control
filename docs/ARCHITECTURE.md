@@ -8,6 +8,52 @@ The guiding concurrency rule is:
 
 > Parallelise observation and computation where it is safe; serialize authority changes.
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    U[Browser / PWA] -->|HTTPS| Z[ZEN Control]
+    R[MikroTik RouterOS] -->|IPFIX| G[GoFlow2]
+    P[Pi-hole DNS] --> I[Telemetry ingest]
+    G --> I
+    I --> PG[(PostgreSQL activity)]
+    Z -->|read / bounded writes| R
+    Z --> S[(SQLite policy + durable control state)]
+    Z -->|read| PG
+    Z --> N[Push / SMTP / signed webhook]
+```
+
+The control plane owns **policy intent and orchestration**. RouterOS owns **network enforcement**. PostgreSQL/Pi-hole/IPFIX provide **retained observation**. Notification/reporting layers consume evidence but do not become enforcement authority.
+
+## Trust and data boundaries
+
+| Boundary | Trusted for | Not trusted as |
+| --- | --- | --- |
+| Browser/PWA session | authenticated parent interaction | RouterOS execution proof |
+| ZEN application | policy computation, bounded orchestration, durable control state | arbitrary router administration |
+| RouterOS | live enforcement state | historical telemetry store |
+| SQLite `policy.db` | desired policy/configuration, audit, incidents, jobs, migration state | raw retained network-flow store |
+| PostgreSQL telemetry | retained IPFIX/DNS-derived activity evidence | browser history, user identity or policy authority |
+| Background workers | read-side preparation, notifications, reconciliation intent consumption as explicitly designed | independent RouterOS authority |
+
+Household activity, device identity and configuration metadata should be treated as sensitive even when they are not credentials.
+
+## RouterOS mutation lifecycle
+
+The normal mutation contract is intentionally stronger than "calculate then write":
+
+```text
+serialized mutation ownership
+  → fresh security/authority proof
+  → fresh relevant RouterOS reread
+  → calculate minimal change
+  → write
+  → post-write verification
+  → durable audit/evidence
+```
+
+Prepared views, cached observations, telemetry, notifications and historical checkpoints cannot substitute for the fresh evidence required by a write path.
+
 ## Components
 
 ### Control application
@@ -53,6 +99,16 @@ The most important boundaries are:
 5. Kid Control migration may toggle the exact validated legacy profile `disabled` field but does not edit/delete legacy device rows or schedules.
 6. A failed migration restores legacy authority before local migration-owned state is unwound.
 
+## Failure model
+
+ZEN generally fails closed at authority boundaries and fails **honestly degraded** at observation boundaries:
+
+- If authority/security cannot be proven, affected RouterOS writes are held.
+- If telemetry is unavailable, reporting becomes unavailable/degraded; policy enforcement is not silently disabled.
+- If a prepared read model is stale/missing, the UI reports that state or queues bounded refresh work instead of inventing current evidence.
+- If external notification delivery fails, the source incident/notification truth remains durable.
+- If a framework/UI path fails, health endpoints may still be green; rendered-route smoke is therefore part of release qualification.
+
 ## Evidence model
 
 Desired policy, live RouterOS state and retained network evidence are separate evidence classes.
@@ -67,7 +123,7 @@ Examples:
 
 ## Current persistence and background-work model
 
-v0.54.1 uses:
+The current control-plane model uses:
 
 - SQLite for policy/configuration and durable control-plane state;
 - a monotonic configuration revision journal for revision-aware writes;
@@ -104,7 +160,11 @@ Operational telemetry is deliberately read-only. Prepared-view consumers count e
 v0.54.5 binds the application release gate to the architecture actually running after v0.54.4. The gate remains exactly eight current checks and reaches final readiness only at **PASS 8 / PENDING 0 / FAIL 0**. Runtime readiness combines normal database/RouterOS/reconciler readiness with the minimal v0.54.3 embedded-worker and mutation-lane health contract. Live performance consumes the complete `zen_formal_performance_acceptance_v1` result, so request latency alone cannot satisfy release readiness when prepared-view, background-worker, parallel-observation, mutation-lane or canonical-threshold evidence is missing or failing.
 
 The portable `zen_release_readiness_v2` artifact carries bounded blocker attribution and rejects contradictory state/counts through `scripts/release_acceptance.py`. Source-qualified closure history remains separate from live evidence. HTTPS/public-edge commissioning remains outside the eight application checks and cannot manufacture application readiness. Notification Centre is a read-side attention capability and likewise cannot manufacture readiness or RouterOS authority. No RouterOS write authority, background write authority or mutation concurrency is added by this closure.
-## v0.55.0 — Navigation tail-latency closure
+## Architecture evolution notes
+
+The following sections retain implementation history where it explains why current boundaries exist. They are not separate deployment modes.
+
+### v0.55.0 — Navigation tail-latency closure
 
 Normal navigation now completes the read/write separation introduced by v0.54.5.1–v0.54.5.2.1. Dashboard favourite cards consume the same revision-bound desired-policy projection already produced during reconciler observation instead of re-running effective-policy resolution for every managed device. Settings → Operations consumes a revision-bound managed-state inventory seeded at startup and refreshed by the reconciler outside the browser request path. An explicit inventory API remains the operator-owned live verification path.
 
@@ -112,7 +172,7 @@ The shared `index.html` template is compiled during startup so one-time Jinja pa
 
 These optimisations are query-side only. Advisory policy and inventory evidence never enters mutation authority; writes retain serialized mutation lane → fresh security proof → fresh RouterOS reread → calculation → write → verification.
 
-## v0.54.5.2.1 — Prepared read-path and fan-out closure
+### v0.54.5.2.1 — Prepared read-path and fan-out closure
 
 Normal Dashboard, Activity and Managed Devices navigation is a query-side concern, not a RouterOS authority boundary. These surfaces consume revision-bound prepared evidence produced by the durable analytics worker and by the reconciler's already-fresh observation phase. A same-revision `ready` row may be served after its freshness TTL only as explicitly **STALE** evidence within a bounded grace window while a refresh is requested; evidence beyond that grace becomes MISSING/PREPARING, and a configuration-revision mismatch is never served.
 
@@ -120,7 +180,7 @@ Activity preparation executes related PostgreSQL queries inside one coherent rea
 
 This optimisation does not widen authority. Prepared RouterOS observations are advisory display evidence only. Mutation paths never consume them and retain the established sequence: serialized mutation lane → fresh security proof → fresh RouterOS reread → calculation → write → post-write verification.
 
-## v0.54.5.1 — Request-path decoupling and durable reconciliation intent
+### v0.54.5.1 — Request-path decoupling and durable reconciliation intent
 
 Declarative policy apply is now a command/worker boundary rather than a synchronous RouterOS HTTP transaction. The request validates CSRF/role, durably records a reconciliation intent against the current configuration revision, wakes the reconciler and returns. `AutoReconciler` is the only consumer that can convert that intent into RouterOS mutation authority. It owns the existing reconciliation cycle lock and serialized mutation lane, freshly re-proves security posture, freshly re-reads desired/live state, applies the minimal drift and verifies convergence. A desired-state revision change during the operation marks the request superseded and queues the latest revision for another fresh pass.
 

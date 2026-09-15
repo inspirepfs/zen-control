@@ -13,7 +13,7 @@ class NotificationDeliveryNavigationHotfixTests(unittest.TestCase):
 
     def test_release_identity_is_v05542(self):
         self.assertIn('version="0.59.0"', self.main)
-        self.assertIn("Current release: **v0.59.0**", self.readme)
+        self.assertIn("Current maintenance release: **v0.59.0.6**", self.readme)
 
     def test_backend_allows_delivery_subsection(self):
         self.assertIn(

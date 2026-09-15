@@ -32,8 +32,8 @@ class PublicReleaseClosureTests(unittest.TestCase):
     def test_release_version_and_public_closure_label(self):
         self.assertIn('version="0.59.0"', (ROOT / "app/main.py").read_text())
         self.assertIn('PWA_RELEASE = "0.59.0"', (ROOT / "app/pwa.py").read_text())
-        self.assertIn("Current release: **v0.59.0**", self.readme)
-        self.assertIn("Public Release Closure", self.readme)
+        self.assertIn("Current maintenance release: **v0.59.0.6**", self.readme)
+        self.assertIn("application/PWA reports version **0.59.0**", self.readme)
 
     def test_agpl_license_is_selected_not_left_as_manual_gate(self):
         license_text = (ROOT / "LICENSE").read_text()
@@ -53,15 +53,17 @@ class PublicReleaseClosureTests(unittest.TestCase):
 
     def test_android_pwa_manual_gate_is_explicitly_open_and_non_blocking(self):
         joined = "\n".join((self.readme, self.public, self.install, self.operator))
-        self.assertIn("OPEN / DEFERRED", joined)
-        self.assertIn("non-blocking", joined)
-        self.assertIn("installed-PWA", joined)
+        self.assertIn("Android installation: **proven on at least one real device**", joined)
+        self.assertIn("tablet/multi-device installability diagnostics: **OPEN / follow-up**", joined)
+        self.assertIn("installed-PWA browser-push lifecycle", joined)
+        self.assertIn("non-blocking for source publication", joined)
         self.assertNotIn("Android PWA commissioning: PASS", joined)
 
     def test_screenshots_are_deliberately_deferred(self):
-        self.assertIn("Screenshots are intentionally **not part of the initial release**", self.public)
-        self.assertIn("synthetic UI imagery", self.public)
-        self.assertIn("Screenshots are **not required for the initial public release**", (ROOT / "docs/screenshots/README.md").read_text())
+        self.assertIn("Screenshots, if added, are real sanitized captures", self.public)
+        screenshots = (ROOT / "docs/screenshots/README.md").read_text()
+        self.assertIn("Screenshots are **optional post-release documentation**", screenshots)
+        self.assertIn("synthetic UI imagery", screenshots)
 
     def test_pihole_split_dns_is_parameterized_not_literal(self):
         match = re.search(r"FTLCONF_dns_hosts:\s*\|-\s*\n\s*([^\n]+)", self.compose)

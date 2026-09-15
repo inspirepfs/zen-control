@@ -4,9 +4,21 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current release: **v0.59.0** — Public Release Closure: consolidates operator documentation and RouterOS setup templates, selects AGPL-3.0-or-later, parameterizes deployment-specific split DNS, and adds current-tree/history secret + depersonalization checks. Android/installed-PWA manual validation remains explicitly OPEN for later testing.
+> Current maintenance release: **v0.59.0.6**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.6 is documentation-only and follows the v0.59.0.5 Starlette template-rendering hotfix.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
+
+## Start here
+
+If you are new to ZEN, use the documentation in this order:
+
+1. **Understand the safety model** in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [routeros/README.md](routeros/README.md).
+2. **Prepare and install** with [docs/INSTALL.md](docs/INSTALL.md) and the reviewed [RouterOS setup bundle](routeros/setup/README.md).
+3. **Configure safely** with [.env.example](.env.example) and [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
+4. **Operate and recover** with [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
+5. **Contribute or review security-sensitive changes** with [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
+
+ZEN is designed for technically confident operators. It intentionally exposes evidence and failure states instead of hiding them behind a one-click appliance model.
 
 ## Why ZEN exists
 
@@ -96,9 +108,11 @@ If authority validation fails, automatic enforcement is held closed for the affe
 
 ## Public-release status
 
-The initial public source release is intentionally text-first. Screenshots are deferred until real product captures can be sanitized and reviewed; screenshot absence is **not** a release gate.
+ZEN Control is publicly released under AGPL-3.0-or-later. Maintenance releases on the `v0.59.0.x` line keep the application/PWA runtime identity at `0.59.0` unless a release explicitly says otherwise.
 
-The Android/installed-PWA commissioning check is also deliberately **OPEN / DEFERRED** while representative device testing continues. Server-side HTTPS/PWA prerequisites are qualified, but install/standalone/push behaviour must not be presented as PASS until real-device evidence exists. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
+The project remains text-first. Screenshots are deferred until real product captures can be sanitized and reviewed; screenshot absence is **not** a functional or release-readiness signal.
+
+Local HTTPS, the manifest/service-worker prerequisites and Android installation have been proven on at least one real device. **Tablet/multi-device installability diagnostics and installed-PWA push commissioning remain open follow-up work.** That limitation is documented rather than being turned into a synthetic PASS. See [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md) and [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
 
 The consolidated RouterOS bootstrap/recovery templates live in [routeros/setup/](routeros/setup/README.md). They cover core authority, global modes, all current built-in service classifiers, known-DoH hardening, FastTrack guidance, a dedicated API-user pattern, IPFIX, split DNS and DHCP identity.
 
@@ -114,6 +128,18 @@ A typical deployment needs:
 - Optional: a Cloudflare zone/API token for local DNS-01 HTTPS and Cloudflare Access/Tunnel for remote access.
 
 ZEN is currently an enthusiast/technical-user project rather than a one-click appliance. Review the RouterOS authority model before applying it to a production network.
+
+### Network exposure
+
+Do **not** publish port `8080` directly to the Internet. The intended local path is HTTPS through the bundled Caddy service; optional remote access is Cloudflare Access → Tunnel → ZEN. RouterOS API reachability should be limited to the ZEN management host/path, and PostgreSQL/Pi-hole/telemetry services should remain on trusted Docker/LAN networks unless you deliberately redesign the deployment.
+
+### Important limitations
+
+- TLS/SNI service controls are useful but cannot identify every protocol, VPN, ECH or application path.
+- Activity is retained network evidence, not browser history or proof of user intent.
+- Telemetry degradation does not mean RouterOS policy stopped enforcing.
+- ZEN does not silently repair malformed operator-owned critical RouterOS rules.
+- PWA installability is partly browser/device controlled; one Android installation is proven, while the tablet/multi-device diagnostic path remains open.
 
 ## Quick start
 
@@ -212,7 +238,8 @@ Optional scheduled delivery consumes the same Parent Summary contract rather tha
 
 Important endpoints include:
 
-- `/health/live` — process liveness
+- `/health/live` — process liveness only
+- `/health/runtime` — embedded worker/runtime health used by the release workflow
 - `/health/ready` — policy DB, RouterOS/security and worker readiness
 - `/api/operations/diagnostics` — sanitized operational diagnostic contract
 - `/api/security/posture` — RouterOS enforcement/security posture

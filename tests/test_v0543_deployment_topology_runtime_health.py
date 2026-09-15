@@ -106,7 +106,7 @@ class V0543SourceContractTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         changelog = (ROOT / "CHANGELOG.md").read_text()
         self.assertIn('version="0.59.0"', main)
-        self.assertIn("Current release: **v0.59.0**", readme)
+        self.assertIn("Current maintenance release: **v0.59.0.6**", readme)
         self.assertIn("## v0.54.3 — Deployment topology & runtime-health closure", changelog)
 
 

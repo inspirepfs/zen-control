@@ -271,14 +271,14 @@ _TOPICS = {
     ),
     "settings_operations": _topic(
         "settings_operations", "Settings", "Operations, backup and recovery",
-        "Operations contains readiness/integrity evidence, configuration snapshots, import/export, diagnostics, performance tooling and the v0.50 core release gate.",
+        "Operations contains readiness/integrity evidence, configuration snapshots, import/export, diagnostics, performance tooling and the current formal release-readiness gate.",
         does=("Supports semantic configuration backup/restore, sanitized diagnostic export and evidence-led release acceptance."),
         watch=("Operational history such as audit, incidents and policy-history checkpoints is not rewritten as configuration identity during restore.", "A PENDING release check means evidence or commissioning is still outstanding; it is never treated as PASS."),
         related=(("Release readiness", "/release-readiness"), ("Diagnostics", "/diagnostics"), ("Performance", "/performance"), ("Import preview", "/help?topic=import_preview")),
     ),
     "release_readiness": _topic(
         "release_readiness", "Operations", "Final release readiness",
-        "The v0.50 release gate composes existing runtime, diagnostics, performance, recovery and shared-display evidence without creating a second enforcement authority.",
+        "Release Readiness composes current runtime, diagnostics, performance, recovery and shared-display evidence without creating a second enforcement authority.",
         does=("Runs a non-destructive export/import/reopen smoke against a temporary policy database.", "Names bounded sanitized diagnostic warning/blocker identities directly in release evidence so a PENDING/FAIL dependency gate explains what requires review.", "Requires affirmative live performance and controlled-restart evidence before reporting PASS."),
         watch=("PENDING is not PASS and missing evidence is never converted to healthy state.", "HTTPS/PWA secure transport remains post-core commissioning; local TLS, browser PWA evidence and optional public Access proof remain separate from RouterOS authority and Notification Centre attention."),
         related=(("Diagnostics", "/diagnostics"), ("Performance", "/performance"), ("Operations", "/?view=settings&section=operations#settings/operations")),
@@ -340,7 +340,7 @@ _TOPICS = {
     ),
     "performance": _topic(
         "performance", "Operations", "Performance evidence",
-        "Performance retains bounded route/component timings and v0.39 acceptance budgets so responsiveness closure is based on measured p50/p95/p99 rather than feel alone.",
+        "Performance retains bounded route/component timings and the formal acceptance budgets so responsiveness is judged from measured p50/p95/p99 rather than feel alone.",
         does=("Shows request latency, RouterOS/SQLite/PostgreSQL/template timings, slow-request breakdowns and PASS/PENDING/FAIL acceptance classes."),
         watch=("Acceptance budgets never authorize skipping RouterOS fresh reads or post-write validation; optimize a slow safety path rather than weakening it."),
         related=(("Diagnostics", "/diagnostics"),),
@@ -368,9 +368,9 @@ _TOPICS = {
     "pwa": _topic(
         "pwa", "Tablet & access", "Installed Android/tablet app",
         "ZEN's PWA provides an installable standalone shell for Android/shared displays while keeping policy data and mutation authority online-only.",
-        does=("Caches only versioned presentation assets and a sanitized offline screen.", "Preserves server-side parent lock, CSRF and authentication."),
-        watch=("Authenticated HTML/API data is never service-worker cached and mutations are never queued for later replay.", "Android/Chromium installation requires a secure HTTPS origin (localhost is a development exception)."),
-        related=(("Parent access", "/?view=settings&section=parents#settings/parents"),),
+        does=("Caches only versioned presentation assets and a sanitized offline screen.", "Preserves server-side parent lock, CSRF and authentication.", "Android installation has been proven on at least one real device; installability is evaluated independently by each browser/device."),
+        watch=("Authenticated HTML/API data is never service-worker cached and mutations are never queued for later replay.", "Android/Chromium installation requires a secure HTTPS origin (localhost is a development exception).", "A missing install option on another tablet/device is not evidence that the phone install consumed a global entitlement. Check whether the app is already installed, use a full browser tab rather than an in-app Custom Tab, and inspect browser manifest/service-worker/installability diagnostics. ZEN cannot force a native install prompt that the browser does not offer.", "Installed-PWA push lifecycle commissioning remains separate evidence from installability."),
+        related=(("Parent access", "/?view=settings&section=parents#settings/parents"), ("Diagnostics", "/diagnostics")),
     ),
     "glossary": _topic(
         "glossary", "Reference", "ZEN terminology and evidence boundaries",

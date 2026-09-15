@@ -1,31 +1,28 @@
-# Public Release Checklist
+# Release and Maintenance Checklist
 
-ZEN Control v0.59.0 is the public-release closure line. Product feature development is frozen for the initial public release; remaining work is qualification and publication hygiene.
+ZEN Control is already public. This document is now the **repeatable maintenance-release gate** rather than an initial-publication plan.
+
+The application/PWA currently reports version `0.59.0`; maintenance releases are tagged `v0.59.0.x`. A tag can contain documentation, dependency, compatibility or release-process fixes without changing the runtime/PWA version.
 
 ## Release decision
 
-A public release is allowed only after the current source tree and target host pass the final qualification. Do not turn a warning, unavailable dependency, missing evidence or manual test into a synthetic PASS.
+A public maintenance release is allowed only after the exact source tree and target host pass qualification. Do not turn a warning, unavailable dependency, missing evidence or manual test into a synthetic PASS.
 
-## Closed source/repository gates
+For security-sensitive changes, prefer a narrow forward hotfix over moving/deleting an already-public tag.
 
-- Product-first README and operator/install/architecture documentation are present.
-- RouterOS setup bundle is versioned under `routeros/setup/` and mirrors the current authority/service contracts.
-- Deployment-specific Pi-hole split DNS is parameterized through `ZEN_LAN_BIND_IP` and `ZEN_LOCAL_HOST`; no household hostname/IP is embedded in Compose.
-- Public-source audit checks current Git-visible files and can additionally scan reachable history and local deployment markers.
-- License selected: **GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`)**.
-- Screenshots are intentionally **not part of the initial release**. Do not block publication waiting for screenshots and do not substitute synthetic UI imagery for real product evidence.
+## Source and repository gates
 
-## License choice
-
-ZEN Control is a self-hosted, network-facing control plane. AGPL-3.0-or-later is chosen so recipients can use and modify the software while modified versions offered to users over a network remain subject to the Affero source-availability requirement. The repository `LICENSE` notice links to the official GNU license text.
-
-Contributions are accepted under the same project license unless explicitly stated otherwise.
-
-The sign-in page and authenticated navigation expose a **Source** link to `https://github.com/inspirepfs/zen-control` so network users have a direct path to the corresponding public source.
+- Documentation matches the behaviour being released.
+- `.env.example`, Compose interpolation and source environment references pass `env_validate.py`.
+- RouterOS setup templates match the current authority/service contracts.
+- Deployment-specific hostnames/IPs/secrets are absent from the current tree.
+- License remains **GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`)**.
+- Public Source links continue to point users at this repository.
+- Screenshots, if added, are real sanitized captures and contain no household data. Screenshot absence is not a release failure.
 
 ## Security and depersonalization gate
 
-Run both:
+Run:
 
 ```bash
 python3 scripts/public_release_audit.py
@@ -38,14 +35,14 @@ Policy:
 
 - current-tree secret or deployment-marker finding: **FAIL**;
 - high-confidence secret in reachable Git history: **FAIL**;
-- deployment identity in historical commits: **WARN / explicit review** because history rewriting is a separate consequential operation;
-- local `.env` absent: warning only for the marker portion; current static audit still runs.
+- deployment identity in historical commits: **WARN / explicit review**;
+- local `.env` absent: marker portion warns, current static audit still runs.
 
-Credentials known to have been exposed outside the repository should still be rotated when practical. The audit does not claim that absence of a match proves a secret never existed.
+Credentials known to have been exposed outside the repository should still be rotated. Audit absence is not proof that a credential was never exposed elsewhere.
 
 ## Host and quality gate
 
-The final candidate should pass:
+The candidate should pass:
 
 ```bash
 python3 scripts/env_validate.py
@@ -56,42 +53,54 @@ python3 -m unittest discover -s tests -t . -v
 docker compose config >/dev/null
 ```
 
-Then use the normal release helper so backup/restore smoke, affected-service deployment, health/runtime/topology proof, exact Git commit and GitHub Quality evidence are preserved.
+Use the normal release helper so backup/restore smoke, affected-service deployment, runtime/topology proof, exact Git commit and GitHub Quality evidence are preserved.
+
+## Mandatory rebuilt-runtime smoke
+
+After a release rebuilds `mikrotik-control`, source/unit tests are not enough. Verify the **actual container**:
+
+1. `/health/live` returns HTTP 200;
+2. `/health/runtime` returns HTTP 200;
+3. `/login` renders successfully;
+4. an authenticated dashboard route renders successfully;
+5. Settings → Security/Diagnostics remain coherent;
+6. the expected dependency versions are present when dependency floors changed.
+
+This gate exists because v0.59.0.4 passed source tests and health routes while Starlette 1.6.0 had removed the legacy `TemplateResponse(name, context)` signature used by ZEN. v0.59.0.5 fixed the rendered-HTML compatibility boundary. Future framework/dependency changes must prove both API health **and actual HTML rendering**.
 
 ## RouterOS final check
 
-Before relying on the public release as an enforcement system:
+Before relying on a release as an enforcement system:
 
-1. confirm RouterOS is on a vendor security-fixed release; for the September 2026 MikroTrick advisory that means stable `7.24.2+` or long-term `7.23.4+` (or a later vendor-supported security-fixed release);
+1. confirm RouterOS is on a vendor security-fixed release; for the September 2026 advisory that means stable `7.24.2+`, long-term `7.23.4+`, or later fixed release;
 2. run `routeros/setup/99-verify.rsc`;
 3. confirm Settings → Security is enforcement-ready;
 4. confirm Operational Diagnostics has no unexplained critical failure;
 5. confirm FastTrack cannot bypass `Restricted_Devices`;
-6. retain Kid Control rollback state until you deliberately retire it in your own installation.
+6. retain Kid Control rollback state until deliberately retired for that installation.
 
-## Explicitly open manual gate: Android / installed PWA
+## PWA/browser commissioning status
 
-**Status: OPEN / DEFERRED — non-blocking for initial public source release.**
+Current evidence is intentionally split:
 
-Already proven server-side prerequisites include local HTTPS, certificate/hostname validation, security headers, HSTS, root service worker and manifest delivery. The following evidence still requires representative device testing and must not be marked PASS yet:
+- local HTTPS, certificate/hostname validation, HSTS, manifest and root-scope service-worker prerequisites: **qualified**;
+- Android installation: **proven on at least one real device**;
+- tablet/multi-device installability diagnostics: **OPEN / follow-up**;
+- installed-PWA browser-push lifecycle across representative devices/restarts: **OPEN / follow-up**.
 
-- Android/Chromium install prompt and installation;
-- standalone installed-PWA launch/upgrade behaviour;
-- browser notification permission from the installed PWA;
-- installed-PWA push receipt across normal lifecycle/restart cases.
+These follow-up items are **non-blocking for source publication** but remain visible commissioning work. Browser installability is device/profile controlled. Do not mark multi-device commissioning PASS merely because the server or one phone is healthy.
 
-Track this after release and close it only with real device evidence.
+## Maintenance-release sequence
 
-## Screenshots
+1. Start from a clean tagged/qualified baseline.
+2. Apply one coherent patch with exact `-p0 --fuzz=0` semantics.
+3. Run focused tests plus the complete quality gate.
+4. Run `release_patch.py` so affected services, backup/restore smoke and CI/tagging are handled consistently.
+5. Verify the rebuilt runtime, including rendered HTML when the app container changed.
+6. Review public-source audit warnings explicitly.
+7. Publish a new immutable maintenance tag/release; do not move a previously public tag.
+8. For a release that changes public behaviour or setup, perform a fresh-clone/read-the-docs smoke from the public repository.
 
-No screenshots are required for the initial public release. Add real, deliberately sanitized product captures later after the public release is stable. The old screenshot capture checklist remains useful as privacy guidance, but screenshot absence is not a gate.
+## Release evidence to retain
 
-## Initial publication sequence
-
-1. Complete v0.59.0 host qualification.
-2. Review any audit warnings explicitly.
-3. Confirm GitHub Quality for the exact candidate commit.
-4. Create/push the release tag through the normal release workflow.
-5. Change repository visibility only when the exact released commit is the intended public tree.
-6. Perform one fresh-clone smoke test from the public repository.
-7. Return later to the documented Android/PWA manual gate.
+For significant release/security closure, retain the exact commit/tag, test summary, audit output, container dependency evidence where relevant and any upgrade/backup acceptance evidence. Never retain `.env`, live databases, credentials or household telemetry in a public release artifact.

@@ -201,7 +201,7 @@ class FormalPerformanceSourceContractTests(unittest.TestCase):
         self.assertIn("zen_performance_acceptance_v2", self.performance)
         self.assertIn("zen_formal_performance_acceptance_v1", self.performance)
         self.assertIn("ZEN Control v0.54.4 formal performance acceptance", self.script)
-        self.assertIn("Current release: **v0.59.0**", self.readme)
+        self.assertIn("Current maintenance release: **v0.59.0.6**", self.readme)
         self.assertIn("## v0.54.4 — Formal performance acceptance", self.changelog)
 
     def test_prepared_view_hit_miss_fallback_evidence_is_explicit(self):

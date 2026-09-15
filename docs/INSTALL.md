@@ -1,16 +1,32 @@
 # Installation and Commissioning
 
-This document describes the supported Docker Compose deployment at a high level. ZEN is not yet a one-click appliance; RouterOS authority must be understood and prepared deliberately.
+This document describes the supported Docker Compose deployment from an empty host through first operational acceptance. ZEN is not a one-click appliance; RouterOS authority must be understood and prepared deliberately. The application currently reports version `0.59.0`; maintenance tags such as `v0.59.0.6` identify qualified fixes/documentation on that runtime line.
 
 ## 1. Host prerequisites
 
 Use a Linux host with:
 
 - Docker Engine and Docker Compose v2;
-- a stable LAN address;
+- a stable/reserved LAN address;
 - outbound Internet access for image pulls/certificate issuance;
-- network reachability to the MikroTik RouterOS API;
-- enough storage for PostgreSQL telemetry retention.
+- network reachability to the MikroTik RouterOS API over a trusted management path;
+- enough storage for PostgreSQL telemetry retention and external policy-database backups;
+- system time/NTP configured correctly for TLS, TOTP and scheduled-policy behaviour.
+
+RouterOS must be on a vendor security-fixed v7 release. For the September 2026 MikroTik advisory covered by this release line, use stable `7.24.2+`, long-term `7.23.4+`, or a later vendor-supported fixed release.
+
+### Network flows to plan
+
+| Source | Destination | Typical port | Purpose |
+| --- | --- | ---: | --- |
+| Browser/PWA | Caddy/ZEN host | 443/TCP | Normal local UI/API access over HTTPS. |
+| ZEN container | RouterOS | 8728/TCP by default | RouterOS API management path; restrict to ZEN host. |
+| RouterOS | ZEN/GoFlow2 | 2055/UDP | Optional Traffic Flow/IPFIX telemetry. |
+| Telemetry ingest | PostgreSQL | Docker-internal | Retained activity storage. |
+| ZEN/Caddy | Internet | outbound | Image pulls, DNS-01/API, optional external delivery and tunnel. |
+| Cloudflare Tunnel | ZEN | Docker-internal 8080/TCP | Optional outbound-only remote-access path. |
+
+Do **not** create a public port-forward to ZEN `8080` or RouterOS API merely to make remote access easier.
 
 ## 2. Clone and configure
 
@@ -151,7 +167,7 @@ python3 scripts/transport_acceptance.py \
   --require-hsts
 ```
 
-A local PASS proves the HTTPS health route, browser-security headers, HSTS, root-scope service worker and manifest prerequisites. It does **not** manufacture browser evidence. For the initial public source release, Android/installed-PWA install, standalone and installed-PWA push evidence is explicitly **OPEN / DEFERRED** and non-blocking while representative device testing continues. Return to this gate later and close it only with real browser/device evidence.
+A local PASS proves the HTTPS health route, browser-security headers, HSTS, root-scope service worker and manifest prerequisites. It does **not** manufacture browser evidence. Android installation has been proven on at least one real device. Multi-device/tablet installability diagnostics, standalone lifecycle across representative devices and installed-PWA push commissioning remain open follow-up work; browser installability is partly device/browser controlled and must not be inferred from server readiness alone.
 
 ## 6. Optional Cloudflare remote access
 
@@ -200,7 +216,36 @@ Before relying on automatic enforcement:
 5. Exercise a read-only policy explanation/Device 360 path.
 6. Perform one explicitly approved guarded write and confirm post-write state.
 7. Review Operational Diagnostics and Release Readiness.
+8. Render both `/login` and an authenticated dashboard page after any framework/dependency change; health APIs alone do not prove the Jinja/UI path is compatible.
+
+### First-run acceptance checklist
+
+A new installation is not commissioned merely because containers are running. Before relying on it, confirm:
+
+- `/health/live` and `/health/runtime` return HTTP 200;
+- the login page renders and authentication/TOTP work;
+- an authenticated dashboard route renders without HTTP 500;
+- Settings → Security reports the expected RouterOS authority posture;
+- RouterOS verification scripts show the intended rule/list/queue structure;
+- at least one managed device has stable DHCP identity and its policy explanation is understandable;
+- one deliberately approved test change converges and post-write verification agrees with RouterOS;
+- telemetry degradation, if present, is shown as degraded/unavailable rather than zero activity.
+
+## Common commissioning failures
+
+**`Invalid host header` / login loop after enabling Secure cookies** — check `ZEN_ALLOWED_HOSTS`, DNS resolution, the exact HTTPS hostname and whether the service was recreated after `.env` changes.
+
+**HTTPS works but PWA install is unavailable** — confirm the browser is using the HTTPS FQDN, the manifest and root service worker load, and the browser/device has not already installed the app. ZEN cannot force `beforeinstallprompt`; use browser diagnostics for multi-device/tablet cases.
+
+**Health is green but HTML returns 500** — inspect `docker compose logs mikrotik-control`. Framework/template compatibility can fail independently of health endpoints; this is why rendered-route smoke is part of maintenance qualification.
+
+**Settings → Security holds enforcement** — do not bypass the gate. Run the RouterOS inspect/verify scripts and repair the proven static-authority defect.
+
+**No activity data** — verify IPFIX/GoFlow2, PostgreSQL and Pi-hole evidence separately. Do not treat missing telemetry as proof of no usage.
 
 ## Backup and recovery
 
 The normal `scripts/release_patch.py` workflow now creates and validates an external SQLite backup before any release that rebuilds `mikrotik-control`, then runs an offline restore/upgrade smoke before container recreation. Backups default to `../zen-backups` and can be redirected with `--backup-dir`; `--skip-policy-backup` is an explicit emergency override and should not be used for routine releases. Keep authentication secrets and tunnel credentials outside source control. A restored `policy.db` without the matching `OTP_ENCRYPTION_KEY` cannot decrypt enrolled authenticator secrets.
+
+
+For day-2 backup, upgrade, incident and recovery procedures continue with [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md).
