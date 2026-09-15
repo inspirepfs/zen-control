@@ -6236,30 +6236,41 @@ class PolicyStore:
             supported_service_keys=supported_service_keys,
         )
 
+    def _schedule_plan_dict(self, row):
+        item = dict(row)
+        item["days"] = json.loads(item["days"] or "[]")
+        item["enabled"] = bool(item.get("enabled", 1))
+        if item["action_type"] == "service":
+            try:
+                _, service_key, state = self._normalize_service_schedule_action(
+                    item["action_value"]
+                )
+                item["action_service"] = service_key
+                item["action_state"] = state
+            except ValueError:
+                item["action_service"] = ""
+                item["action_state"] = "invalid"
+        return item
+
     def list_schedule_plans(self):
         with self._db() as db:
             rows = db.execute(
                 "SELECT * FROM schedule_plans ORDER BY clock_time, label COLLATE NOCASE"
             ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["days"] = json.loads(item["days"] or "[]")
-            item["enabled"] = bool(item.get("enabled", 1))
-            if item["action_type"] == "service":
-                try:
-                    _, service_key, state = self._normalize_service_schedule_action(
-                        item["action_value"]
-                    )
-                    item["action_service"] = service_key
-                    item["action_state"] = state
-                except ValueError:
-                    item["action_service"] = ""
-                    item["action_state"] = "invalid"
-            result.append(item)
-        return result
+        return [self._schedule_plan_dict(row) for row in rows]
 
-    def create_schedule_plan(
+    def get_schedule_plan(self, plan_id):
+        try:
+            plan_id = int(plan_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid schedule plan id") from exc
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM schedule_plans WHERE id=?", (plan_id,)
+            ).fetchone()
+        return self._schedule_plan_dict(row) if row else None
+
+    def _normalize_schedule_plan_fields(
         self,
         label,
         target_type,
@@ -6275,15 +6286,20 @@ class PolicyStore:
         action_type = str(action_type or "").strip().lower()
         if action_type not in {"mode", "service"}:
             raise ValueError("Invalid schedule action")
-        if not label.strip():
+
+        label = str(label or "").strip()
+        if not label:
             raise ValueError("Schedule label is required")
+
         clean_days = []
-        for day in days:
+        for day in days or []:
             day = str(day).lower().strip()
             if day in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"} and day not in clean_days:
                 clean_days.append(day)
         if not clean_days:
             raise ValueError("Select at least one day")
+
+        clock_time = str(clock_time or "").strip()
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", clock_time):
             raise ValueError("Time must be HH:MM")
 
@@ -6292,22 +6308,84 @@ class PolicyStore:
         else:
             action_value, _, _ = self._normalize_service_schedule_action(action_value)
 
+        return {
+            "label": label[:60],
+            "target_type": target_type,
+            "target_value": target_value,
+            "action_type": action_type,
+            "action_value": action_value,
+            "clock_time": clock_time,
+            "days": clean_days,
+        }
+
+    def create_schedule_plan(
+        self,
+        label,
+        target_type,
+        target_value,
+        action_type,
+        action_value,
+        clock_time,
+        days,
+    ):
+        values = self._normalize_schedule_plan_fields(
+            label, target_type, target_value, action_type, action_value, clock_time, days
+        )
         with self.config_write(scope="schedules", reason="Schedule plan created") as db:
             cur = db.execute(
                 """INSERT INTO schedule_plans
                    (label, target_type, target_value, action_type, action_value, clock_time, days)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    label.strip()[:60],
-                    target_type,
-                    target_value,
-                    action_type,
-                    action_value,
-                    clock_time,
-                    json.dumps(clean_days),
+                    values["label"],
+                    values["target_type"],
+                    values["target_value"],
+                    values["action_type"],
+                    values["action_value"],
+                    values["clock_time"],
+                    json.dumps(values["days"]),
                 ),
             )
         return cur.lastrowid
+
+    def update_schedule_plan(
+        self,
+        plan_id,
+        label,
+        target_type,
+        target_value,
+        action_type,
+        action_value,
+        clock_time,
+        days,
+    ):
+        try:
+            plan_id = int(plan_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid schedule plan id") from exc
+        values = self._normalize_schedule_plan_fields(
+            label, target_type, target_value, action_type, action_value, clock_time, days
+        )
+        with self.config_write(scope="schedules", reason="Schedule plan updated") as db:
+            cur = db.execute(
+                """UPDATE schedule_plans
+                   SET label=?, target_type=?, target_value=?, action_type=?,
+                       action_value=?, clock_time=?, days=?
+                   WHERE id=?""",
+                (
+                    values["label"],
+                    values["target_type"],
+                    values["target_value"],
+                    values["action_type"],
+                    values["action_value"],
+                    values["clock_time"],
+                    json.dumps(values["days"]),
+                    plan_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Schedule plan not found")
+        return self.get_schedule_plan(plan_id)
 
     def set_schedule_plan_enabled(self, plan_id, enabled):
         with self.config_write(scope="schedules", reason="Schedule plan state updated") as db:

@@ -4601,17 +4601,63 @@ def local_schedule_plan_add(
         mode_action_value if action_type == "mode" else service_action_value
     )
     try:
-        policy_store.create_schedule_plan(
+        plan_id = policy_store.create_schedule_plan(
             label, target_type, target_value, action_type, action_value, clock_time, days
         )
         audit(
             "POLICY_SCHEDULE_CREATED",
             user["username"],
-            f"{label}: {target_type}={target_value or 'all'} {action_type}={action_value} {clock_time}",
+            f"id={plan_id} {label}: {target_type}={target_value or 'all'} {action_type}={action_value} {clock_time}",
         )
+        auto_reconciler.wake()
     except ValueError as exc:
         return redirect_error("schedules/planner", str(exc))
     return redirect_ok("schedules/planner", "Policy schedule created")
+
+
+@app.post("/local/schedule-plans/update")
+def local_schedule_plan_update(
+    request: Request,
+    plan_id: int = Form(...),
+    label: str = Form(...),
+    target_type: str = Form(...),
+    target_value: str = Form(""),
+    action_type: str = Form(...),
+    mode_action_value: str = Form(""),
+    service_action_value: str = Form(""),
+    clock_time: str = Form(...),
+    days: list[str] = Form([]),
+    csrf: str = Form(...),
+    user=Depends(require_role("admin")),
+):
+    if not csrf_ok(request, csrf):
+        return redirect_error("schedules/planner", "CSRF validation failed")
+    action_value = (
+        mode_action_value if action_type == "mode" else service_action_value
+    )
+    try:
+        before = policy_store.get_schedule_plan(plan_id)
+        if not before:
+            raise ValueError("Schedule plan not found")
+        updated = policy_store.update_schedule_plan(
+            plan_id, label, target_type, target_value, action_type,
+            action_value, clock_time, days,
+        )
+        audit(
+            "POLICY_SCHEDULE_UPDATED",
+            user["username"],
+            (
+                f"id={plan_id} label={before['label']}->{updated['label']} "
+                f"target={updated['target_type']}:{updated['target_value'] or 'all'} "
+                f"action={updated['action_type']}:{updated['action_value']} "
+                f"time={updated['clock_time']} days={','.join(updated['days'])} "
+                f"enabled={updated['enabled']}"
+            ),
+        )
+        auto_reconciler.wake()
+    except ValueError as exc:
+        return redirect_error("schedules/planner", str(exc))
+    return redirect_ok("schedules/planner", "Policy schedule updated")
 
 
 @app.post("/local/schedule-plans/toggle")
@@ -4632,6 +4678,7 @@ def local_schedule_plan_toggle(
             user["username"],
             f"id={plan_id} enabled={desired}",
         )
+        auto_reconciler.wake()
     except ValueError as exc:
         return redirect_error("schedules/planner", str(exc))
     return redirect_ok("schedules/planner", "Policy schedule updated")
@@ -4649,6 +4696,7 @@ def local_schedule_plan_delete(
     try:
         policy_store.delete_schedule_plan(plan_id)
         audit("POLICY_SCHEDULE_DELETED", user["username"], f"id={plan_id}")
+        auto_reconciler.wake()
     except ValueError as exc:
         return redirect_error("schedules/planner", str(exc))
     return redirect_ok("schedules/planner", "Policy schedule deleted")

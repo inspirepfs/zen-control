@@ -137,7 +137,7 @@ _TOPICS = {
     "schedules_planner": _topic(
         "schedules_planner", "Schedules", "Targeted schedule planner",
         "Schedules apply time-based mode or service decisions to all devices, a profile, a device or a concrete/aggregate service target according to deterministic precedence.",
-        does=("Shows the live policy clock and lets authorised parents define recurring schedule windows."),
+        does=("Shows the live policy clock and lets authorised parents create, edit, pause, enable and delete recurring schedule windows without changing schedule identity."),
         watch=("More-specific schedules can intentionally shadow broader schedules; equal-precedence contradictions are conflicts. On DST fallback, an ambiguous wall time uses the first physical occurrence; on spring-forward, a nonexistent time moves to the first valid local instant after the gap."),
         related=(("Simulation", "/policy/simulate"), ("Policy quality", "/policy/quality")),
     ),

@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current maintenance release: **v0.59.0.8**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.8 adds device-local PWA install/reinstall diagnostics and follows the v0.59.0.7 CI/runtime acceptance hardening release.
+> Current maintenance release: **v0.59.0.9**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.9 closes targeted schedule-planner CRUD with in-place editing and prompt reconciliation wake-up; v0.59.0.8 added device-local PWA install/reinstall diagnostics.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 

@@ -17,8 +17,8 @@ class PwaInstallDiagnosticsTests(unittest.TestCase):
         cls.readme = (ROOT / "README.md").read_text()
         cls.workflow = (ROOT / ".github/workflows/quality.yml").read_text()
 
-    def test_current_maintenance_release_is_v05908(self):
-        self.assertIn("Current maintenance release: **v0.59.0.8**", self.readme)
+    def test_maintenance_release_stays_on_v059_runtime_line(self):
+        self.assertRegex(self.readme, r"Current maintenance release: \*\*v0\.59\.0\.\d+\*\*")
         self.assertIn("application/PWA reports version **0.59.0**", self.readme)
 
     def test_browser_diagnostic_contract_is_device_local_and_sanitized(self):

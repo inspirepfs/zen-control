@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.59.0.9 — Schedule Edit & Planner CRUD Closure
+
+- Adds in-place editing for targeted policy schedules, preserving the existing schedule identity and paused/enabled state instead of requiring delete-and-recreate.
+- Reuses the same target, action, time, weekday and service validation for create and update so edited schedules cannot bypass existing policy/DST contracts.
+- Adds a mobile-friendly inline editor pre-populated with the current schedule target, action, time and weekdays, with target/action controls that stay synchronized when their type changes.
+- Wakes the automatic reconciler after successful schedule create, edit, pause/enable and delete operations so ENFORCE mode observes schedule-policy changes promptly through the existing authority path.
+- Adds dedicated audit evidence for schedule updates while retaining existing configuration-revision history and conflict detection.
+- Application/PWA runtime remains `0.59.0`; database schema and RouterOS authority primitives are unchanged.
+
 ## v0.59.0.8 — PWA Install/Reinstall Diagnostics
 
 - Adds device-local browser diagnostics for secure-context, display-mode/standalone, manifest loading, root service-worker registration/control, Chromium install-event delivery, app-installed events, notification permission and push-subscription presence.

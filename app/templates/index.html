@@ -1690,8 +1690,8 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     {% endfor %}
 
     {% for p in schedule_plans %}
-      <div class="simple-config-row" data-ux-focus="schedule:{{p.id}}">
-        <div>
+      <div class="simple-config-row schedule-plan-row" data-ux-focus="schedule:{{p.id}}">
+        <div class="schedule-plan-main">
           <strong>{{p.label}}</strong>
           <span class="schedule-plan-state {{ 'enabled' if p.enabled else 'disabled' }}">{{ 'ENABLED' if p.enabled else 'PAUSED' }}</span>
           <div class="muted small">
@@ -1711,43 +1711,100 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
           <input type="hidden" name="plan_id" value="{{p.id}}">
           <button class="danger-soft compact">Delete</button>
         </form>
+        <details class="schedule-plan-edit">
+          <summary class="button-link compact secondary">Edit</summary>
+          <form method="post" action="/local/schedule-plans/update" class="profile-editor schedule-plan-edit-form" data-schedule-form>
+            <input type="hidden" name="csrf" value="{{csrf}}">
+            <input type="hidden" name="plan_id" value="{{p.id}}">
+            <label>Schedule name
+              <input name="label" value="{{p.label}}" maxlength="60" required>
+            </label>
+            <div class="schedule-form-grid">
+              <label>Target type
+                <select name="target_type" data-schedule-target-type>
+                  <option value="all" {% if p.target_type == 'all' %}selected{% endif %}>All restricted</option>
+                  <option value="profile" {% if p.target_type == 'profile' %}selected{% endif %}>Profile</option>
+                  <option value="device" {% if p.target_type == 'device' %}selected{% endif %}>Device</option>
+                </select>
+              </label>
+              <label>Target
+                <select name="target_value" data-schedule-target-value>
+                  <option value="" data-target-kind="all" {% if p.target_type == 'all' %}selected{% endif %}>All restricted</option>
+                  {% for profile in local_profiles %}<option value="{{profile.id}}" data-target-kind="profile" {% if p.target_type == 'profile' and p.target_value == (profile.id|string) %}selected{% endif %}>Profile: {{profile.name}}</option>{% endfor %}
+                  {% for d in devices %}<option value="{{d.ip}}" data-target-kind="device" {% if p.target_type == 'device' and p.target_value == d.ip %}selected{% endif %}>Device: {{d.name}} · {{d.ip}}</option>{% endfor %}
+                </select>
+              </label>
+              <label>Action type
+                <select name="action_type" data-schedule-action-type>
+                  <option value="mode" {% if p.action_type == 'mode' %}selected{% endif %}>Mode</option>
+                  <option value="service" {% if p.action_type == 'service' %}selected{% endif %}>Service</option>
+                </select>
+              </label>
+              <label data-schedule-mode-action>Mode action
+                <select name="mode_action_value">
+                  {% for value,label in [('normal','Normal'),('slow','Slow'),('blocked','Blocked')] %}
+                    <option value="{{value}}" {% if p.action_type == 'mode' and p.action_value == value %}selected{% endif %}>{{label}}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label data-schedule-service-action>Service action
+                <select name="service_action_value">
+                  {% for key,name in services %}
+                    {% set block_value = key ~ ':block' %}{% set allow_value = key ~ ':allow' %}
+                    <option value="{{block_value}}" {% if p.action_type == 'service' and p.action_value == block_value %}selected{% endif %}>Block {{name}}</option>
+                    <option value="{{allow_value}}" {% if p.action_type == 'service' and p.action_value == allow_value %}selected{% endif %}>Allow {{name}}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>Time
+                <input type="time" name="clock_time" value="{{p.clock_time}}" required>
+              </label>
+            </div>
+            <div class="weekday-picker">
+              {% for value,label in [('mon','Mon'),('tue','Tue'),('wed','Wed'),('thu','Thu'),('fri','Fri'),('sat','Sat'),('sun','Sun')] %}
+                <label class="day-chip"><input type="checkbox" name="days" value="{{value}}" {% if value in p.days %}checked{% endif %}><span>{{label}}</span></label>
+              {% endfor %}
+            </div>
+            <div class="row-actions"><button class="primary" type="submit">Save schedule changes</button></div>
+          </form>
+        </details>
       </div>
     {% else %}
       <p class="muted">No targeted policy schedules yet.</p>
     {% endfor %}
 
-    <form method="post" action="/local/schedule-plans/add" class="profile-editor">
+    <form method="post" action="/local/schedule-plans/add" class="profile-editor" data-schedule-form>
       <input type="hidden" name="csrf" value="{{csrf}}">
       <input name="label" placeholder="YouTube bedtime" required>
       <div class="schedule-form-grid">
         <label>Target type
-          <select name="target_type" id="schedule-target-type">
+          <select name="target_type" id="schedule-target-type" data-schedule-target-type>
             <option value="all">All restricted</option>
             <option value="profile">Profile</option>
             <option value="device">Device</option>
           </select>
         </label>
         <label>Target
-          <select name="target_value" id="schedule-target-value">
+          <select name="target_value" id="schedule-target-value" data-schedule-target-value>
             <option value="" data-target-kind="all">All restricted</option>
             {% for p in local_profiles %}<option value="{{p.id}}" data-target-kind="profile">Profile: {{p.name}}</option>{% endfor %}
             {% for d in devices %}<option value="{{d.ip}}" data-target-kind="device">Device: {{d.name}} · {{d.ip}}</option>{% endfor %}
           </select>
         </label>
         <label>Action type
-          <select name="action_type" id="schedule-action-type">
+          <select name="action_type" id="schedule-action-type" data-schedule-action-type>
             <option value="mode">Mode</option>
             <option value="service">Service</option>
           </select>
         </label>
-        <label id="schedule-mode-action">Mode action
+        <label id="schedule-mode-action" data-schedule-mode-action>Mode action
           <select name="mode_action_value">
             <option value="normal">Normal</option>
             <option value="slow">Slow</option>
             <option value="blocked">Blocked</option>
           </select>
         </label>
-        <label id="schedule-service-action" hidden>Service action
+        <label id="schedule-service-action" data-schedule-service-action hidden>Service action
           <select name="service_action_value">
             {% for key,name in services %}
               <option value="{{key}}:block">Block {{name}}</option>
@@ -3792,22 +3849,7 @@ function filterDiscovery(value){
 
 <script>
 (function () {
-  const type = document.getElementById('schedule-action-type');
-  const mode = document.getElementById('schedule-mode-action');
-  const service = document.getElementById('schedule-service-action');
-  if (type && mode && service) {
-    const syncAction = () => {
-      const isService = type.value === 'service';
-      mode.hidden = isService;
-      service.hidden = !isService;
-    };
-    type.addEventListener('change', syncAction);
-    syncAction();
-  }
-
-  const bindTarget = (typeId, valueId) => {
-    const targetType = document.getElementById(typeId);
-    const targetValue = document.getElementById(valueId);
+  const bindTarget = (targetType, targetValue) => {
     if (!targetType || !targetValue) return;
     const syncTarget = () => {
       const wanted = targetType.value;
@@ -3830,8 +3872,30 @@ function filterDiscovery(value){
     syncTarget();
   };
 
-  bindTarget('schedule-target-type', 'schedule-target-value');
-  bindTarget('exception-target-type', 'exception-target-value');
+  const bindScheduleForm = form => {
+    const type = form.querySelector('[data-schedule-action-type]');
+    const mode = form.querySelector('[data-schedule-mode-action]');
+    const service = form.querySelector('[data-schedule-service-action]');
+    if (type && mode && service) {
+      const syncAction = () => {
+        const isService = type.value === 'service';
+        mode.hidden = isService;
+        service.hidden = !isService;
+      };
+      type.addEventListener('change', syncAction);
+      syncAction();
+    }
+    bindTarget(
+      form.querySelector('[data-schedule-target-type]'),
+      form.querySelector('[data-schedule-target-value]')
+    );
+  };
+
+  document.querySelectorAll('[data-schedule-form]').forEach(bindScheduleForm);
+  bindTarget(
+    document.getElementById('exception-target-type'),
+    document.getElementById('exception-target-value')
+  );
 })();
 </script>
 
