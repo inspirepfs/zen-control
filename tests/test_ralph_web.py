@@ -133,6 +133,7 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(gate["id"], "HG-0021-03")
             self.assertTrue(gate["policy_review"])
             self.assertEqual(gate["test_change_policy"], "add-only")
+            self.assertIn("authority mismatch", gate["recommendation"])
 
     def test_event_tail_is_bounded(self):
         with WebHarness() as h:
@@ -189,6 +190,40 @@ class ActionAuthorityTests(unittest.TestCase):
             web.command_for_action({"action": "reconcile_push"}, self.base_state("COMMITTED"))
 
 
+class AuthenticationTests(unittest.TestCase):
+    def test_session_auth_login_logout_and_wrong_password(self):
+        auth = web.SessionAuth("peter", "correct-horse-battery", session_hours=1)
+        self.assertIsNone(auth.login("peter", "wrong-password-value"))
+        token = auth.login("peter", "correct-horse-battery")
+        self.assertIsNotNone(token)
+        self.assertTrue(auth.valid(token))
+        auth.logout(token)
+        self.assertFalse(auth.valid(token))
+
+    def test_password_file_requires_private_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "password"
+            path.write_text("correct-horse-battery\n", encoding="utf-8")
+            path.chmod(0o644)
+            with self.assertRaisesRegex(web.WebConsoleError, "chmod 600"):
+                web._password_from_file(str(path))
+            path.chmod(0o600)
+            self.assertEqual(web._password_from_file(str(path)), "correct-horse-battery")
+
+
+class UsageMonitorTests(unittest.TestCase):
+    def test_monitor_uses_read_only_usage_refresh(self):
+        payload = {"codex_limits": {"plan_type": "plus", "windows": []}, "ledger": {"current_plan": {"input_tokens": 42}}}
+        completed = mock.Mock(stdout=json.dumps(payload), returncode=0)
+        monitor = web.UsageMonitor(60)
+        with mock.patch.object(web.subprocess, "run", return_value=completed) as run:
+            report = monitor.refresh()
+        self.assertEqual(report["ledger"]["current_plan"]["input_tokens"], 42)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-3:], ["usage", "--json", "--no-save"])
+        self.assertIn("--no-save", argv)
+
+
 class HttpSurfaceTests(unittest.TestCase):
     def test_health_and_snapshot_are_available_but_write_requires_csrf(self):
         with WebHarness() as h:
@@ -233,16 +268,13 @@ class HttpSurfaceTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=3)
 
-    def test_lan_surface_requires_access_token_for_api(self):
+    def test_lan_surface_uses_username_password_session_for_api(self):
         with WebHarness() as h:
             h.state()
             with mock.patch.object(web, "git_snapshot", return_value={"branch": "main", "upstream": "origin/main", "head": "abc", "dirty": False, "dirty_count": 0, "status": []}):
-                server = web.build_server(
-                    "127.0.0.1", 0,
-                    csrf_token="known-csrf",
-                    access_token="known-access",
-                )
+                server = web.build_server("127.0.0.1", 0, csrf_token="known-csrf")
                 server.lan_mode = True
+                server.auth = web.SessionAuth("peter", "correct-horse-battery")
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 host, port = server.server_address[:2]
@@ -251,9 +283,16 @@ class HttpSurfaceTests(unittest.TestCase):
                     with self.assertRaises(urllib.error.HTTPError) as ctx:
                         urllib.request.urlopen(request, timeout=3)
                     self.assertEqual(ctx.exception.code, 401)
+                    login = urllib.request.Request(
+                        f"http://{host}:{port}/api/login",
+                        data=json.dumps({"username": "peter", "password": "correct-horse-battery"}).encode(),
+                        headers={"Content-Type": "application/json", "X-RALPH-CSRF": "known-csrf"}, method="POST",
+                    )
+                    response = urllib.request.urlopen(login, timeout=3)
+                    cookie = response.headers.get("Set-Cookie").split(";", 1)[0]
+                    self.assertIn(web.SESSION_COOKIE + "=", cookie)
                     request = urllib.request.Request(
-                        f"http://{host}:{port}/api/snapshot",
-                        headers={"X-RALPH-AUTH": "known-access"},
+                        f"http://{host}:{port}/api/snapshot", headers={"Cookie": cookie},
                     )
                     snap = json.load(urllib.request.urlopen(request, timeout=3))
                     self.assertEqual(snap["controller"]["status"], "APPROVED")
@@ -267,7 +306,14 @@ class HttpSurfaceTests(unittest.TestCase):
         for label in ("Plan Progress", "Human Control", "Live Activity", "Completion Report", "Controller Output"):
             self.assertIn(label, page)
         self.assertIn("abc123", page)
-        self.assertIn("X-RALPH-AUTH", page)
+        self.assertIn("Usage / Token Economy", page)
+        self.assertIn("@media(max-width:720px)", page)
+        self.assertIn("Acceptance criteria", page)
+        self.assertIn("Approval review", page)
+        self.assertIn("renderActionResult", page)
+        self.assertIn("actionResult", page)
+        self.assertNotIn("alert((j.stdout", page)
+        self.assertNotIn("X-RALPH-AUTH", page)
 
 
 class BackgroundJobTests(unittest.TestCase):

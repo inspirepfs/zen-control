@@ -418,6 +418,17 @@ python3 scripts/ralph.py usage --json
 
 RALPH preserves a configured quota reserve and can pause without another model turn when backend limits say execution should stop.
 
+RALPH-Lite v0.3.2 also keeps a bounded local usage ledger at `.ralph/usage-ledger.jsonl`. Each completed Codex turn records observed input, cached-input, cache-write, output and reasoning token counters together with its plan/step/loop. The web console uses that ledger to show:
+
+- current-plan cumulative input/output/reasoning usage;
+- cached versus non-cached input and cache ratio;
+- recent per-plan consumption;
+- observed token consumption inside each live backend quota window.
+
+Quota percentages and reset times still come from the Codex usage backend. The local token ledger is **observed RALPH activity**, not a claim that token counts map one-to-one to backend quota/billing units. Window token counters are filtered from the backend window start, so they roll over automatically when the corresponding backend reset advances.
+
+The web console refreshes live usage independently of the controller state by running `ralph.py usage --json --no-save`. The default refresh interval is 60 seconds and may be changed with `serve --usage-refresh-seconds`, with a 15-second minimum. The read-only refresh never writes controller state, avoiding a race with an active development loop.
+
 The development loop uses bounded/delta-oriented context rather than repeatedly ingesting the entire repository.
 
 ## Files
@@ -427,7 +438,7 @@ The development loop uses bounded/delta-oriented context rather than repeatedly 
 | `scripts/ralph.py` | deterministic supervisor/state machine |
 | `scripts/ralph_gate.py` | read-only human-gate review surface |
 | `scripts/ralph_tui.py` | dependency-free terminal renderer |
-| `scripts/ralph_web.py` | loopback-only local operator web console |
+| `scripts/ralph_web.py` | local operator web console with trusted-LAN session authentication |
 | `.ralph/policy.md` | controller policy contract |
 | `.ralph/plan.md` | current immutable approved/proposed plan |
 | `.ralph/state.json` | controller state |
@@ -435,6 +446,7 @@ The development loop uses bounded/delta-oriented context rather than repeatedly 
 | `.ralph/journal.md` | durable loop/human decision journal |
 | `.ralph/live.log` | plain-text live trace |
 | `.ralph/events.jsonl` | structured event stream |
+| `.ralph/usage-ledger.jsonl` | bounded per-turn/per-plan observed token ledger |
 | `.ralph/ideas.md` | out-of-scope ideas bucket |
 | `.ralph/recovery/` | approval-time recovery checkpoints |
 | `.ralph/reports/` | completion reports |
@@ -479,9 +491,9 @@ Treat it as a real release/engineering failure. Do not manufacture a PASS or wea
 
 ## Local web console
 
-RALPH-Lite v0.3.0 adds a zero-dependency local web console on top of the same controller state and structured event stream used by the TUI. It is an operator surface, **not** a second state machine. Every state-changing action invokes the existing `scripts/ralph.py` command path and therefore retains the same plan hashes, authority checks, test policy, recovery checkpoints, human gates and Git publication guards.
+RALPH-Lite v0.3.x provides a zero-dependency operator web console on top of the same controller state and structured event stream used by the TUI. It is an operator surface, **not** a second state machine. Every state-changing action invokes the existing `scripts/ralph.py` command path and therefore retains the same plan hashes, authority checks, test policy, recovery checkpoints, human gates and Git publication guards.
 
-Start it with:
+Start the loopback console with:
 
 ```bash
 python3 scripts/ralph.py serve
@@ -499,30 +511,52 @@ An alternate loopback port is allowed:
 python3 scripts/ralph.py serve --port 8877
 ```
 
-Loopback remains the default. For a trusted home-lab LAN, v0.3.1 supports an explicit private-LAN mode bound to one specific RFC1918/ULA address. Wildcard binds such as `0.0.0.0`/`::` and public addresses remain refused.
+Loopback remains authentication-free and is the safest default. For a trusted home-lab LAN, v0.3.2 replaces the v0.3.1 URL access token with a normal username/password login. LAN mode still requires an explicit private RFC1918/ULA bind address; wildcard binds such as `0.0.0.0`/`::` and public addresses remain refused.
 
-Example:
+A convenient interactive start is:
 
 ```bash
-python3 scripts/ralph.py serve --host 192.168.2.10 --allow-lan
+python3 scripts/ralph.py serve \
+  --host 192.168.2.10 \
+  --allow-lan \
+  --username pfsykes
 ```
 
-LAN mode generates a fresh browser access token on every server start and prints a URL such as:
+RALPH prompts for the password without putting it in shell history. The username defaults to `ralph` if `--username`/`RALPH_WEB_USERNAME` is not supplied. Passwords must be at least 10 characters.
 
-```text
-http://192.168.2.10:8765/#<access-token>
+For unattended startup, prefer a mode-`0600` password file:
+
+```bash
+install -m 600 /dev/null ~/.config/ralph-web-password
+printf '%s\n' 'choose-a-strong-home-lab-password' > ~/.config/ralph-web-password
+chmod 600 ~/.config/ralph-web-password
+
+python3 scripts/ralph.py serve \
+  --host 192.168.2.10 \
+  --allow-lan \
+  --username pfsykes \
+  --password-file ~/.config/ralph-web-password
 ```
 
-The token is carried in the browser URL fragment, removed from the visible address bar after page load, and sent to Ralph only in the `X-RALPH-AUTH` request header. API reads and all state-changing actions require that token in LAN mode, while writes continue to require the independent per-process CSRF token as well. Host-header validation permits only the exact configured bind IP, limiting DNS-rebinding exposure.
+`RALPH_WEB_PASSWORD` is also supported for controlled service environments, but a password file or interactive prompt avoids leaving the credential in normal command history. Never commit the password file.
 
-LAN mode is intended for a trusted private home-lab network. It is not an Internet exposure mode and does not enable wildcard/public binds.
+After a successful login the server issues a random in-memory session cookie. The cookie is HttpOnly and SameSite=Strict and expires after 12 hours by default; use `--session-hours` to change that. Passwords are verified using a salted PBKDF2-HMAC-SHA256 verifier held only in the running process. State-changing actions still require the independent per-process CSRF token. Exact Host-header validation permits only the configured bind IP, retaining the DNS-rebinding protection added in v0.3.1.
+
+LAN mode is intended for a **trusted private home-lab network**. The built-in server uses plain HTTP, so the password is transmitted over that trusted LAN during login. Do not expose it directly to the Internet or an untrusted network. Put an authenticated HTTPS reverse proxy in front if the trust boundary changes.
 
 ### Web console views
+
+The desktop dashboard deliberately uses a wide layout (up to roughly 2400px) to reduce vertical scrolling while keeping dense engineering information visible. Responsive breakpoints collapse cards for tablets and phones, enlarge touch targets, keep form controls mobile-zoom-safe and shorten live-log panes so the same console remains usable from a handset.
 
 The dashboard shows:
 
 - controller state, active plan hash, current step and loop count;
-- Codex quota headroom and last context-efficiency result;
+- live Codex quota headroom and reset times;
+- current-plan input, non-cached input, cached input, output and reasoning token totals;
+- observed per-window input/output counters aligned to backend reset windows;
+- recent per-plan token consumption and observed-turn count;
+- model/plan-type usage metadata where supplied by the backend;
+- last context-efficiency result;
 - Git branch/upstream/dirty state;
 - approval-time recovery checkpoint;
 - full plan progress and per-step test authority;
@@ -532,11 +566,33 @@ The dashboard shows:
 - bounded controller output;
 - the current completion-report preview when available.
 
-The browser polls local state; it does not ask Codex another question merely to refresh the display.
+The browser polls local state and quota evidence; it does not ask Codex another question merely to refresh the display. Live quota refresh defaults to 60 seconds and can be tuned, for example:
+
+```bash
+python3 scripts/ralph.py serve \
+  --host 192.168.2.10 \
+  --allow-lan \
+  --username pfsykes \
+  --usage-refresh-seconds 30
+```
+
+The minimum is 15 seconds to avoid turning quota display into noisy polling.
+
+### Usage and token accounting
+
+The web console separates two different kinds of evidence rather than conflating them:
+
+1. **Backend quota windows** — remaining percentage, reset timestamp/window duration, model and plan type returned by the Codex usage service.
+2. **RALPH observed token ledger** — token counters reported by Codex turns that Ralph actually ran.
+
+For each live quota window Ralph derives the window start from the backend reset and window duration and sums only ledger turns whose timestamps fall inside that interval. When the backend reset moves forward, that displayed counter naturally starts again from the new window. Per-plan totals remain available separately, so a plan can be compared with earlier plans even after quota-window turnover.
+
+This accounting is for engineering efficiency/observability. It is not a substitute for provider billing records and does not infer hidden provider accounting from tokens.
 
 ### Web actions
 
-The console exposes the normal supervised lifecycle where the current controller state makes the action meaningful:
+The console exposes the normal supervised lifecycle where the current controller state makes the action meaningful. Approval and gate views are intentionally human-readable: proposed steps show objectives, acceptance criteria and test-change authority; human gates show why Ralph stopped, the relevant acceptance criteria and a recommended bounded next action. CLI JSON/box output is normalized into an inline action-result card rather than being dumped into a browser alert.
+
 
 - propose a new bounded goal;
 - approve or reject a proposal;
@@ -553,13 +609,19 @@ Exceptional commit/push reconciliation remains available through the CLI. The br
 
 The local server:
 
-- binds to loopback only;
+- binds to loopback by default and requires `--allow-lan` for one explicit private LAN address;
+- refuses wildcard and public binds;
+- requires username/password authentication for LAN mode;
+- stores only an in-process salted password verifier and in-memory random sessions;
+- issues an HttpOnly SameSite=Strict session cookie;
 - generates a new in-memory CSRF token on every server start;
 - requires the CSRF token on all state-changing HTTP requests;
+- validates the exact Host header to reduce DNS-rebinding exposure;
 - exposes no CORS permission for external origins;
 - applies no policy bypass or force-push surface;
 - requires explicit text confirmation before retire, commit and push operations;
 - permits only one background Ralph job at a time;
+- refreshes quota data through a read-only `usage --json --no-save` path;
 - writes background runner output to local ignored `.ralph/web-run.log`;
 - writes local runner metadata to ignored `.ralph/web-job.json`.
 
@@ -570,3 +632,4 @@ The existing CLI remains the authoritative recovery surface if a browser session
 `propose` and `run` can take long enough that the browser request should not remain open. The console therefore starts those commands as a single local background Ralph job and continues rendering progress from the event/state files. A second background run is refused while the first process is alive.
 
 The web process itself does not own or infer plan completion. `scripts/ralph.py` continues to update the same durable controller state.
+

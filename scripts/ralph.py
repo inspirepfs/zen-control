@@ -41,6 +41,7 @@ CONTEXT = RALPH / "context.json"
 EVENTS = RALPH / "events.jsonl"
 RECOVERY = RALPH / "recovery"
 REPORTS = RALPH / "reports"
+USAGE_LEDGER = RALPH / "usage-ledger.jsonl"
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
@@ -55,6 +56,7 @@ EFFICIENCY_MAX_REPORTED_FILES = 8
 USAGE_RESERVE_PERCENT = 5.0
 USAGE_APP_SERVER_TIMEOUT_SECONDS = 15
 USAGE_POLL_SECONDS = 300
+USAGE_LEDGER_MAX_ROWS = 20_000
 _CODEX_PREFIX: list[str] | None = None
 EXCLUDED_DIRS = {
     ".git", ".ralph", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -1179,6 +1181,7 @@ def init_files() -> None:
     RECOVERY.mkdir(parents=True, exist_ok=True)
     REPORTS.mkdir(parents=True, exist_ok=True)
     EVENTS.touch(exist_ok=True)
+    USAGE_LEDGER.touch(exist_ok=True)
     if not STATE.exists():
         save_state(default_state())
     if not PLAN.exists():
@@ -1899,7 +1902,7 @@ def query_codex_rate_limits(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS
         _app_server_send(proc.stdin, {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "clientInfo": {"name": "ralph-lite", "title": "RALPH-Lite", "version": "0.1.7"},
+                "clientInfo": {"name": "ralph-lite", "title": "RALPH-Lite", "version": "0.3.2"},
                 "capabilities": {"experimentalApi": True},
             },
         })
@@ -2093,6 +2096,155 @@ def ensure_codex_usage_capacity(state: dict, *, wait: bool = True, poll_seconds:
             return False
 
 
+def _usage_metric_row(metrics: dict | None) -> dict[str, int]:
+    metrics = dict(metrics or {})
+    return {
+        "input_tokens": int(metrics.get("input_tokens") or 0),
+        "cached_input_tokens": int(metrics.get("cached_input_tokens") or 0),
+        "cache_write_input_tokens": int(metrics.get("cache_write_input_tokens") or 0),
+        "output_tokens": int(metrics.get("output_tokens") or 0),
+        "reasoning_output_tokens": int(metrics.get("reasoning_output_tokens") or 0),
+    }
+
+
+def append_usage_ledger(
+    metrics: dict | None,
+    *,
+    plan_hash_value: str | None,
+    goal: str = "",
+    scope: str,
+    loop: int | None = None,
+    step: int | None = None,
+    phase: str = "",
+) -> None:
+    """Persist one completed Codex turn for reset-aware and per-plan accounting.
+
+    The ledger records only token counters and bounded plan metadata. It does not
+    contain prompts, model output, credentials, account identifiers, or source.
+    """
+    usage = _usage_metric_row(metrics)
+    if not any(usage.values()):
+        return
+    RALPH.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema": "zen_ralph_usage_turn_v1",
+        "recorded_at": utc_now(),
+        "epoch": int(dt.datetime.now(dt.timezone.utc).timestamp()),
+        "plan_hash": str(plan_hash_value or "") or None,
+        "goal": " ".join(str(goal or "").split())[:240],
+        "scope": str(scope or "unknown")[:40],
+        "loop": int(loop) if loop is not None else None,
+        "step": int(step) if step is not None else None,
+        "phase": str(phase or "")[:40],
+        **usage,
+    }
+    with USAGE_LEDGER.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+    try:
+        if USAGE_LEDGER.stat().st_size > 8 * 1024 * 1024:
+            rows = USAGE_LEDGER.read_text(encoding="utf-8", errors="replace").splitlines()[-USAGE_LEDGER_MAX_ROWS:]
+            tmp = USAGE_LEDGER.with_suffix(".tmp")
+            tmp.write_text("\n".join(rows) + ("\n" if rows else ""), encoding="utf-8")
+            os.replace(tmp, USAGE_LEDGER)
+    except OSError:
+        pass
+
+
+def usage_ledger_rows(limit: int = USAGE_LEDGER_MAX_ROWS) -> list[dict]:
+    if not USAGE_LEDGER.exists():
+        return []
+    rows: list[dict] = []
+    for raw in USAGE_LEDGER.read_text(encoding="utf-8", errors="replace").splitlines()[-max(1, int(limit)):]:
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("schema") == "zen_ralph_usage_turn_v1":
+            rows.append(item)
+    return rows
+
+
+def _sum_usage_rows(rows: Iterable[dict]) -> dict[str, int]:
+    keys = (
+        "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+        "output_tokens", "reasoning_output_tokens",
+    )
+    total = {key: 0 for key in keys}
+    count = 0
+    for row in rows:
+        count += 1
+        for key in keys:
+            total[key] += int(row.get(key) or 0)
+    total["turns"] = count
+    total["noncached_input_tokens"] = max(0, total["input_tokens"] - total["cached_input_tokens"])
+    return total
+
+
+def _fallback_current_plan_usage(state: dict) -> dict[str, int]:
+    rows: list[dict] = []
+    for item in _step_results_from_state(state):
+        stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+        if stats:
+            rows.append(stats)
+    return _sum_usage_rows(rows)
+
+
+def usage_ledger_report(state: dict, snapshot: dict | None = None) -> dict:
+    """Return reset-aligned token tickers and bounded per-plan consumption."""
+    rows = usage_ledger_rows()
+    current_hash = str(state.get("plan_hash") or "")
+    current_rows = [row for row in rows if str(row.get("plan_hash") or "") == current_hash] if current_hash else []
+    current = _sum_usage_rows(current_rows)
+    source = "ledger"
+    if current_hash and not current_rows:
+        current = _fallback_current_plan_usage(state)
+        source = "step-results-fallback" if current.get("turns") else "ledger"
+
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        key = str(row.get("plan_hash") or "unassigned")
+        group = grouped.setdefault(key, {"rows": [], "goal": str(row.get("goal") or ""), "last_epoch": 0})
+        group["rows"].append(row)
+        if row.get("goal"):
+            group["goal"] = str(row.get("goal") or "")
+        group["last_epoch"] = max(int(group.get("last_epoch") or 0), int(row.get("epoch") or 0))
+    plans: list[dict] = []
+    for key, group in grouped.items():
+        totals = _sum_usage_rows(group["rows"])
+        plans.append({
+            "plan_hash": None if key == "unassigned" else key,
+            "goal": group.get("goal") or "",
+            "last_epoch": int(group.get("last_epoch") or 0),
+            **totals,
+        })
+    plans.sort(key=lambda item: int(item.get("last_epoch") or 0), reverse=True)
+
+    windows: list[dict] = []
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    for window in (snapshot or {}).get("windows", []) if isinstance((snapshot or {}).get("windows"), list) else []:
+        if not isinstance(window, dict):
+            continue
+        reset = window.get("resets_at")
+        minutes = window.get("window_minutes")
+        try:
+            reset_i = int(reset) if reset is not None else None
+            minutes_i = int(minutes) if minutes is not None else None
+        except (TypeError, ValueError):
+            reset_i, minutes_i = None, None
+        start = reset_i - (minutes_i * 60) if reset_i and minutes_i else None
+        period_rows = [row for row in rows if start is not None and int(row.get("epoch") or 0) >= start and int(row.get("epoch") or 0) <= now]
+        windows.append({**window, "window_started_at": start, "observed_tokens": _sum_usage_rows(period_rows)})
+
+    return {
+        "current_plan": current,
+        "current_plan_source": source,
+        "plans": plans[:20],
+        "windows": windows,
+        "ledger_rows": len(rows),
+        "last_event_at": max((int(row.get("epoch") or 0) for row in rows), default=None),
+    }
+
+
 def _usage_numbers(line: str) -> dict[str, int] | None:
     def number(pattern: str) -> int:
         found = re.search(pattern, line)
@@ -2183,6 +2335,7 @@ def usage_report_data(state: dict, snapshot: dict | None = None) -> dict:
         },
         "reserve_percent": USAGE_RESERVE_PERCENT,
         "codex_limits": snapshot,
+        "ledger": usage_ledger_report(state, snapshot),
     }
     if snapshot:
         guard, findings = codex_usage_guard(snapshot)
@@ -2201,8 +2354,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
     error = None
     try:
         snapshot = query_codex_rate_limits()
-        state["codex_usage"] = snapshot
-        save_state(state)
+        if not getattr(args, "no_save", False):
+            state["codex_usage"] = snapshot
+            save_state(state)
     except Exception as exc:
         error = str(exc)
         cached = state.get("codex_usage")
@@ -2328,6 +2482,10 @@ def cmd_propose(args: argparse.Namespace) -> int:
     plan = run_codex(plan_prompt(args.goal), PLAN_SCHEMA, "read-only", context="PLAN PROPOSAL")
     validate_plan(plan)
     digest = plan_hash(plan)
+    append_usage_ledger(
+        plan.get("_ralph_metrics") if isinstance(plan, dict) else {},
+        plan_hash_value=digest, goal=args.goal, scope="planning", phase="proposal",
+    )
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
     state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None})
@@ -2690,7 +2848,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         import ralph_web
     except ImportError as exc:
         raise RuntimeError("RALPH web console module is unavailable") from exc
-    return int(ralph_web.serve(args.host, args.port, allow_lan=bool(args.allow_lan)))
+    return int(ralph_web.serve(
+        args.host, args.port, allow_lan=bool(args.allow_lan),
+        username=args.username, password_file=args.password_file,
+        session_hours=args.session_hours, usage_refresh_seconds=args.usage_refresh_seconds,
+    ))
 
 
 def cmd_status(_: argparse.Namespace) -> int:
@@ -2773,9 +2935,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         protected_before = protected_snapshot()
         try:
             result = run_codex(step_prompt(state, step, active_fp, repair_no), RESULT_SCHEMA, "workspace-write", context=f"LOOP {loop_no:04d} STEP {step['id']} {'REPAIR' if active_fp else 'IMPLEMENT'}")
+            append_usage_ledger(
+                result.get("_ralph_metrics") if isinstance(result, dict) else {},
+                plan_hash_value=str(state.get("plan_hash") or ""),
+                goal=str((state.get("plan") or {}).get("goal") or ""),
+                scope="implementation", loop=loop_no, step=int(step["id"]), phase=phase,
+            )
         except EnvironmentBlocked as exc:
             reason = str(exc)
             live_write(reason, "ENV")
+            append_usage_ledger(
+                exc.metrics, plan_hash_value=str(state.get("plan_hash") or ""),
+                goal=str((state.get("plan") or {}).get("goal") or ""),
+                scope="implementation", loop=loop_no, step=int(step["id"]), phase=phase,
+            )
             env_result = {"_ralph_metrics": exc.metrics, "context": {}}
             append_journal(loop_no, step["id"], phase, "BLOCKED_ENVIRONMENT", summary=reason, repair=repair_no, next_action="fix environment then resume approved plan", stats=loop_stats(loop_started, env_result, repair=repair_no))
             block_environment(state, reason)
@@ -3105,6 +3278,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage = sub.add_parser("usage", help="show RALPH context/token usage and live Codex remaining limits")
     usage.add_argument("--details", action="store_true", help="include per-loop token usage")
     usage.add_argument("--json", action="store_true", help="emit machine-readable report")
+    usage.add_argument("--no-save", action="store_true", help=argparse.SUPPRESS)
     usage.set_defaults(func=cmd_usage)
     serve = sub.add_parser("serve", help="run the local operator web console")
     serve.add_argument("--host", default="127.0.0.1", help="bind address; default 127.0.0.1")
@@ -3112,8 +3286,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--allow-lan",
         action="store_true",
-        help="explicitly allow one private LAN bind; LAN mode requires a per-start browser access token",
+        help="explicitly allow one private LAN bind; LAN mode requires username/password authentication",
     )
+    serve.add_argument("--username", default=None, help="LAN login username; defaults to RALPH_WEB_USERNAME or ralph")
+    serve.add_argument("--password-file", default=None, help="read LAN login password from a mode-0600 file instead of prompting")
+    serve.add_argument("--session-hours", type=float, default=12.0, help="LAN browser session lifetime; default 12 hours")
+    serve.add_argument("--usage-refresh-seconds", type=int, default=60, help="live Codex limit refresh interval; minimum 15 seconds")
     serve.set_defaults(func=cmd_serve)
     sub.add_parser("status").set_defaults(func=cmd_status)
     return parser
@@ -3125,6 +3303,10 @@ def main() -> int:
         raise SystemExit("--max-loops must be >= 1")
     if getattr(args, "usage_poll_seconds", USAGE_POLL_SECONDS) < 15:
         raise SystemExit("--usage-poll-seconds must be >= 15")
+    if getattr(args, "usage_refresh_seconds", 60) < 15:
+        raise SystemExit("--usage-refresh-seconds must be >= 15")
+    if getattr(args, "session_hours", 12.0) <= 0:
+        raise SystemExit("--session-hours must be > 0")
     try:
         return args.func(args)
     except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:

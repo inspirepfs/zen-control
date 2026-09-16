@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -423,6 +424,52 @@ class CodexUsageGuardTests(unittest.TestCase):
         snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=10, allowed=False), "gpt-5.6-terra")
         status, _ = ralph.codex_usage_guard(snapshot)
         self.assertEqual(status, "PAUSE")
+
+    def test_usage_ledger_tracks_per_plan_and_reset_window_tokens(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_ralph, old_ledger = ralph.RALPH, ralph.USAGE_LEDGER
+            try:
+                ralph.RALPH = Path(td)
+                ralph.USAGE_LEDGER = Path(td) / "usage-ledger.jsonl"
+                ralph.append_usage_ledger(
+                    {"input_tokens": 1000, "cached_input_tokens": 800, "output_tokens": 120, "reasoning_output_tokens": 30},
+                    plan_hash_value="plan-a", goal="Plan A", scope="implementation", loop=1, step=1, phase="implement",
+                )
+                ralph.append_usage_ledger(
+                    {"input_tokens": 500, "cached_input_tokens": 250, "output_tokens": 50, "reasoning_output_tokens": 10},
+                    plan_hash_value="plan-b", goal="Plan B", scope="planning", phase="proposal",
+                )
+                now = int(ralph.dt.datetime.now(ralph.dt.timezone.utc).timestamp())
+                snapshot = {"windows": [{"name": "5h", "remaining_percent": 70.0, "window_minutes": 300, "resets_at": now + 3600}]}
+                report = ralph.usage_ledger_report({"plan_hash": "plan-a", "step_results": []}, snapshot)
+                self.assertEqual(report["current_plan"]["input_tokens"], 1000)
+                self.assertEqual(report["current_plan"]["output_tokens"], 120)
+                self.assertEqual(report["windows"][0]["observed_tokens"]["input_tokens"], 1500)
+                self.assertEqual({p["plan_hash"] for p in report["plans"]}, {"plan-a", "plan-b"})
+            finally:
+                ralph.RALPH, ralph.USAGE_LEDGER = old_ralph, old_ledger
+
+    def test_usage_window_counter_excludes_turns_before_window_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_ledger = ralph.USAGE_LEDGER
+            try:
+                ralph.USAGE_LEDGER = Path(td) / "usage-ledger.jsonl"
+                now = int(ralph.dt.datetime.now(ralph.dt.timezone.utc).timestamp())
+                rows = [
+                    {"schema": "zen_ralph_usage_turn_v1", "epoch": now - 20_000, "plan_hash": "p", "input_tokens": 900, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 90, "reasoning_output_tokens": 0},
+                    {"schema": "zen_ralph_usage_turn_v1", "epoch": now - 100, "plan_hash": "p", "input_tokens": 100, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0},
+                ]
+                ralph.USAGE_LEDGER.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+                snapshot = {"windows": [{"name": "5h", "window_minutes": 300, "resets_at": now + 60, "remaining_percent": 80.0}]}
+                report = ralph.usage_ledger_report({"plan_hash": "p", "step_results": []}, snapshot)
+                self.assertEqual(report["windows"][0]["observed_tokens"]["input_tokens"], 100)
+                self.assertEqual(report["windows"][0]["observed_tokens"]["output_tokens"], 10)
+            finally:
+                ralph.USAGE_LEDGER = old_ledger
+
+    def test_usage_parser_supports_read_only_refresh(self):
+        args = ralph.build_parser().parse_args(["usage", "--json", "--no-save"])
+        self.assertTrue(args.no_save)
 
     def test_live_usage_report_aggregates_old_and_new_usage_formats(self):
         with tempfile.TemporaryDirectory() as td:
