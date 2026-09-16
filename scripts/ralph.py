@@ -13,11 +13,13 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from typing import Iterable
 
@@ -41,6 +43,9 @@ EFFICIENCY_MAX_COMMANDS = 8
 EFFICIENCY_MAX_CUMULATIVE_INPUT = 600_000
 EFFICIENCY_MAX_NONCACHED_INPUT = 100_000
 EFFICIENCY_MAX_REPORTED_FILES = 8
+USAGE_RESERVE_PERCENT = 5.0
+USAGE_APP_SERVER_TIMEOUT_SECONDS = 15
+USAGE_POLL_SECONDS = 300
 _CODEX_PREFIX: list[str] | None = None
 EXCLUDED_DIRS = {
     ".git", ".ralph", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -873,6 +878,386 @@ If safe completion requires breaking policy or human judgement, make no speculat
 """
 
 
+
+def configured_codex_model() -> str | None:
+    """Read only the configured model name; never retain other Codex config."""
+    path = Path.home() / ".codex" / "config.toml"
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    model = data.get("model") if isinstance(data, dict) else None
+    return str(model).strip() if isinstance(model, str) and model.strip() else None
+
+
+def _app_server_send(handle, payload: dict) -> None:
+    handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    handle.flush()
+
+
+def _app_server_read_response(proc: subprocess.Popen, request_id: int, timeout: float) -> dict:
+    """Read line-delimited app-server JSON-RPC until the matching response arrives."""
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            events = selector.select(remaining)
+            if not events:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") != request_id:
+                continue
+            if message.get("error"):
+                raise RuntimeError(f"Codex app-server request failed: {message['error']}")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("Codex app-server returned an invalid result")
+            return result
+    finally:
+        selector.close()
+    stderr = ""
+    if proc.poll() is not None and proc.stderr is not None:
+        try:
+            stderr = proc.stderr.read()[-1200:]
+        except OSError:
+            pass
+    raise RuntimeError(f"timed out waiting for Codex app-server rate limits{': ' + stderr if stderr else ''}")
+
+
+def query_codex_rate_limits(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS) -> dict:
+    """Read live ChatGPT/Codex account limits through the supported app-server surface.
+
+    This performs no model turn and deliberately discards account identifiers from the
+    returned state. The app-server contract is account/rateLimits/read.
+    """
+    codex = shutil.which("codex")
+    if not codex:
+        raise RuntimeError("codex not found")
+    proc = subprocess.Popen(
+        [codex, "app-server", "--stdio"],
+        cwd=ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert proc.stdin is not None
+        _app_server_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "ralph-lite", "title": "RALPH-Lite", "version": "0.1.7"},
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        _app_server_read_response(proc, 1, timeout)
+        _app_server_send(proc.stdin, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        _app_server_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read",
+            "params": {"supportsLunaReserve": False, "excludeResetCreditDetails": True},
+        })
+        raw = _app_server_read_response(proc, 2, timeout)
+        return normalise_codex_usage(raw, configured_codex_model())
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def _usage_window_name(minutes: int | None, fallback: str) -> str:
+    if minutes is None:
+        return fallback
+    if 285 <= minutes <= 315:
+        return "5h"
+    if 9_576 <= minutes <= 10_584:
+        return "weekly"
+    if 1_368 <= minutes <= 1_512:
+        return "daily"
+    return f"{minutes}m"
+
+
+def normalise_codex_usage(raw: dict, model: str | None = None) -> dict:
+    """Reduce the app-server response to non-sensitive quota state used by RALPH."""
+    by_id = raw.get("rateLimitsByLimitId") if isinstance(raw.get("rateLimitsByLimitId"), dict) else {}
+    fallback = raw.get("rateLimits") if isinstance(raw.get("rateLimits"), dict) else None
+    if not by_id and fallback:
+        by_id = {str(fallback.get("limitId") or "codex"): fallback}
+    windows: list[dict] = []
+    plan_type = None
+    for limit_id, snapshot in by_id.items():
+        if not isinstance(snapshot, dict):
+            continue
+        if plan_type is None and snapshot.get("planType") is not None:
+            plan_type = str(snapshot.get("planType"))
+        relevant = str(limit_id).lower() == "codex"
+        if model:
+            relevant = relevant or snapshot.get("limitName") == model or snapshot.get("normalModelSlug") == model
+        if not relevant:
+            continue
+        for slot in ("primary", "secondary"):
+            window = snapshot.get(slot)
+            if not isinstance(window, dict) or window.get("usedPercent") is None:
+                continue
+            try:
+                used = float(window["usedPercent"])
+            except (TypeError, ValueError):
+                continue
+            minutes = window.get("windowDurationMins")
+            try:
+                minutes = int(minutes) if minutes is not None else None
+            except (TypeError, ValueError):
+                minutes = None
+            reset = window.get("resetsAt")
+            try:
+                reset = int(reset) if reset is not None else None
+            except (TypeError, ValueError):
+                reset = None
+            windows.append({
+                "limit_id": str(limit_id),
+                "name": _usage_window_name(minutes, slot),
+                "slot": slot,
+                "used_percent": max(0.0, min(100.0, used)),
+                "remaining_percent": max(0.0, min(100.0, 100.0 - used)),
+                "window_minutes": minutes,
+                "resets_at": reset,
+            })
+    reset_summary = raw.get("rateLimitResetCredits") if isinstance(raw.get("rateLimitResetCredits"), dict) else {}
+    available_resets = reset_summary.get("availableCount")
+    try:
+        available_resets = int(available_resets) if available_resets is not None else None
+    except (TypeError, ValueError):
+        available_resets = None
+    return {
+        "captured_at": utc_now(),
+        "model": model,
+        "plan_type": plan_type,
+        "ordinary_usage_allowed": raw.get("ordinaryUsageAllowed") if isinstance(raw.get("ordinaryUsageAllowed"), bool) else None,
+        "windows": windows,
+        "available_reset_credits": available_resets,
+    }
+
+
+def codex_usage_guard(snapshot: dict, reserve_percent: float = USAGE_RESERVE_PERCENT) -> tuple[str, list[str]]:
+    """Return SAFE, PAUSE, or UNKNOWN using backend authority plus visible windows."""
+    ordinary = snapshot.get("ordinary_usage_allowed")
+    windows = snapshot.get("windows") if isinstance(snapshot.get("windows"), list) else []
+    if ordinary is False:
+        return "PAUSE", ["backend ordinary usage is not allowed"]
+    if ordinary is None:
+        return "UNKNOWN", ["backend ordinaryUsageAllowed is unavailable"]
+    if not windows:
+        return "UNKNOWN", ["no relevant Codex rate-limit windows were returned"]
+    low = [w for w in windows if float(w.get("remaining_percent", 100.0)) <= reserve_percent]
+    if low:
+        return "PAUSE", [f"{w.get('name', 'usage')} remaining {float(w.get('remaining_percent', 0.0)):.1f}% <= {reserve_percent:.1f}% reserve" for w in low]
+    return "SAFE", []
+
+
+def usage_poll_delay(snapshot: dict, default_seconds: int = USAGE_POLL_SECONDS) -> int:
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    resets = [int(w["resets_at"]) for w in snapshot.get("windows", []) if isinstance(w, dict) and isinstance(w.get("resets_at"), int) and int(w["resets_at"]) > now]
+    if not resets:
+        return max(15, default_seconds)
+    return max(15, min(default_seconds, min(resets) - now + 5))
+
+
+def _format_reset(epoch: int | None) -> str:
+    if not isinstance(epoch, int):
+        return "unknown"
+    return dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def usage_snapshot_line(snapshot: dict) -> str:
+    windows = snapshot.get("windows") if isinstance(snapshot.get("windows"), list) else []
+    if not windows:
+        return "limits=unavailable"
+    return " ".join(f"{w['name']}={w['remaining_percent']:.1f}%left reset={_format_reset(w.get('resets_at'))}" for w in windows)
+
+
+def record_usage_pause(state: dict, snapshot: dict, findings: list[str]) -> None:
+    state["status"] = "PAUSED_USAGE_LIMIT"
+    state["block_reason"] = "; ".join(findings) or "Codex usage reserve reached"
+    state["codex_usage"] = snapshot
+    state["usage_pause"] = {
+        "recorded_at": utc_now(),
+        "reserve_percent": USAGE_RESERVE_PERCENT,
+        "reason": state["block_reason"],
+        "snapshot": snapshot,
+    }
+    save_state(state)
+    with JOURNAL.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"## Usage pause — {utc_now()}\n\n"
+            f"- Plan: `{state.get('plan_hash') or '-'}`\n"
+            f"- Step: {state.get('current_step')}\n"
+            f"- Reserve: {USAGE_RESERVE_PERCENT:.1f}% remaining\n"
+            f"- Reason: {state['block_reason']}\n"
+            f"- Snapshot: {usage_snapshot_line(snapshot)}\n"
+            "- State: recorded; no new Codex model turn will start until limits recover\n\n"
+        )
+
+
+def ensure_codex_usage_capacity(state: dict, *, wait: bool = True, poll_seconds: int = USAGE_POLL_SECONDS) -> bool:
+    """Guard every model turn; optionally wait and automatically resume after reset."""
+    was_paused = state.get("status") == "PAUSED_USAGE_LIMIT"
+    while True:
+        try:
+            snapshot = query_codex_rate_limits()
+            guard, findings = codex_usage_guard(snapshot)
+        except Exception as exc:
+            snapshot = {"captured_at": utc_now(), "model": configured_codex_model(), "plan_type": None, "ordinary_usage_allowed": None, "windows": [], "available_reset_credits": None}
+            guard, findings = "UNKNOWN", [f"rate-limit read failed: {exc}"]
+        state["codex_usage"] = snapshot
+        if guard == "SAFE":
+            state["usage_pause"] = None
+            state["block_reason"] = None
+            if state.get("status") == "PAUSED_USAGE_LIMIT":
+                state["status"] = "APPROVED"
+                live_write(f"Codex limits recovered; resuming approved plan · {usage_snapshot_line(snapshot)}", "USAGE")
+                with JOURNAL.open("a", encoding="utf-8") as handle:
+                    handle.write(f"## Usage resumed — {utc_now()}\n\n- Snapshot: {usage_snapshot_line(snapshot)}\n- Next action: continue approved plan\n\n")
+            save_state(state)
+            return True
+        if not was_paused or state.get("status") != "PAUSED_USAGE_LIMIT":
+            record_usage_pause(state, snapshot, findings)
+            was_paused = True
+        detail = "; ".join(findings)
+        live_write(f"Codex usage guard={guard}: {detail} · {usage_snapshot_line(snapshot)}", "USAGE")
+        if not wait:
+            print(f"PAUSED_USAGE plan={state.get('plan_hash') or '-'} step={state.get('current_step')} reason={detail}")
+            return False
+        delay = usage_poll_delay(snapshot, poll_seconds)
+        live_write(f"waiting {delay}s before zero-model rate-limit recheck; Ctrl-C is safe because state is recorded", "WAIT")
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            print("PAUSED_USAGE state recorded; rerun `python3 scripts/ralph.py run` to continue waiting/resume")
+            return False
+
+
+def live_usage_by_loop() -> dict[int, dict[str, int]]:
+    """Recover cumulative per-turn usage from the operator trace, including older loops."""
+    if not LIVE.exists():
+        return {}
+    current_loop = None
+    totals: dict[int, dict[str, int]] = {}
+    for line in LIVE.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.search(r"\bRALPH\s+loop=(\d+)", line)
+        if match:
+            current_loop = int(match.group(1))
+            continue
+        if current_loop is None or " USAGE " not in line:
+            continue
+        def number(pattern: str) -> int:
+            found = re.search(pattern, line)
+            return int(found.group(1)) if found else 0
+        input_tokens = number(r"(?:cumulative_)?input=(\d+)")
+        cached = number(r"cached=(\d+)")
+        if not input_tokens:
+            continue
+        totals[current_loop] = {
+            "input": input_tokens,
+            "cached": cached,
+            "noncached": max(0, input_tokens - cached),
+            "cache_write": number(r"cache_write=(\d+)"),
+            "output": number(r"output=(\d+)"),
+            "reasoning": number(r"reasoning=(\d+)"),
+        }
+    return totals
+
+
+def usage_report_data(state: dict, snapshot: dict | None = None) -> dict:
+    turns = live_usage_by_loop()
+    fields = ("input", "cached", "noncached", "cache_write", "output", "reasoning")
+    total = {field: sum(item.get(field, 0) for item in turns.values()) for field in fields}
+    context = load_context()
+    raw_context_bytes = len(CONTEXT.read_bytes()) if CONTEXT.exists() else 0
+    result = {
+        "plan_hash": state.get("plan_hash"),
+        "status": state.get("status"),
+        "loop_count": state.get("loop_count", 0),
+        "observed_codex_turns": len(turns),
+        "turns": turns,
+        "totals": total,
+        "cache_ratio_percent": (total["cached"] / total["input"] * 100.0) if total["input"] else 0.0,
+        "handoff_context": {
+            "bytes": raw_context_bytes,
+            "relevant_files": len(context.get("relevant_files") or []),
+            "accepted_findings": len(context.get("accepted_findings") or []),
+            "last_step": context.get("last_step"),
+        },
+        "reserve_percent": USAGE_RESERVE_PERCENT,
+        "codex_limits": snapshot,
+    }
+    if snapshot:
+        guard, findings = codex_usage_guard(snapshot)
+        result["guard"] = guard
+        result["guard_findings"] = findings
+    else:
+        result["guard"] = "UNKNOWN"
+        result["guard_findings"] = ["live Codex rate limits unavailable"]
+    return result
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    init_files()
+    state = load_state()
+    snapshot = None
+    error = None
+    try:
+        snapshot = query_codex_rate_limits()
+        state["codex_usage"] = snapshot
+        save_state(state)
+    except Exception as exc:
+        error = str(exc)
+        cached = state.get("codex_usage")
+        snapshot = cached if isinstance(cached, dict) else None
+    report = usage_report_data(state, snapshot)
+    if args.json:
+        if error:
+            report["live_limit_error"] = error
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if snapshot else 2
+    totals = report["totals"]
+    print("RALPH-Lite Context / Usage Report")
+    print(f"plan={report['plan_hash'] or '-'} status={report['status']} loops={report['loop_count']} observed_codex_turns={report['observed_codex_turns']}")
+    print(
+        "tokens cumulative: "
+        f"input={totals['input']:,} cached={totals['cached']:,} non-cached={totals['noncached']:,} "
+        f"output={totals['output']:,} reasoning={totals['reasoning']:,} cache={report['cache_ratio_percent']:.1f}%"
+    )
+    handoff = report["handoff_context"]
+    print(f"handoff context: bytes={handoff['bytes']:,} relevant_files={handoff['relevant_files']} accepted_findings={handoff['accepted_findings']} last_step={handoff['last_step']}")
+    if snapshot:
+        print(f"codex limits: model={snapshot.get('model') or '-'} plan={snapshot.get('plan_type') or '-'} ordinary_usage_allowed={snapshot.get('ordinary_usage_allowed')}")
+        for window in snapshot.get("windows", []):
+            headroom = float(window["remaining_percent"]) - USAGE_RESERVE_PERCENT
+            print(f"  {window['name']}: {window['remaining_percent']:.1f}% left (reserve {USAGE_RESERVE_PERCENT:.1f}%, headroom {headroom:.1f}pp), resets {_format_reset(window.get('resets_at'))}")
+        print(f"guard={report['guard']} findings={'; '.join(report['guard_findings']) if report['guard_findings'] else '-'}")
+    else:
+        print(f"codex limits: UNAVAILABLE ({error or 'no cached snapshot'})")
+    if args.details:
+        for loop_no, item in sorted(report["turns"].items()):
+            ratio = (item["cached"] / item["input"] * 100.0) if item["input"] else 0.0
+            print(f"  loop {loop_no:04d}: input={item['input']:,} non-cached={item['noncached']:,} output={item['output']:,} reasoning={item['reasoning']:,} cache={ratio:.1f}%")
+    return 0 if snapshot else 2
+
 def block(state: dict, reason: str) -> None:
     state["status"] = "BLOCKED_HUMAN"
     state["block_reason"] = reason
@@ -944,21 +1329,29 @@ def cmd_status(_: argparse.Namespace) -> int:
     state = load_state()
     total = len((state.get("plan") or {}).get("steps") or [])
     efficiency = state.get("last_efficiency") if isinstance(state.get("last_efficiency"), dict) else {}
-    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} block={state.get('block_reason') or '-'} efficiency={efficiency.get('status') or '-'}")
+    usage = state.get("codex_usage") if isinstance(state.get("codex_usage"), dict) else {}
+    guard, _ = codex_usage_guard(usage) if usage else ("-", [])
+    windows = usage.get("windows") if isinstance(usage.get("windows"), list) else []
+    remaining = min((float(w.get("remaining_percent", 100.0)) for w in windows), default=None)
+    quota = f"{guard}:{remaining:.1f}%min" if remaining is not None else guard
+    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} block={state.get('block_reason') or '-'} efficiency={efficiency.get('status') or '-'} quota={quota}")
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     init_files()
     state = load_state()
-    if state.get("status") not in {"APPROVED", "RUNNING"}:
-        raise RuntimeError(f"run requires APPROVED/RUNNING status, found {state.get('status')}")
+    if state.get("status") not in {"APPROVED", "RUNNING", "PAUSED_USAGE_LIMIT"}:
+        raise RuntimeError(f"run requires APPROVED/RUNNING/PAUSED_USAGE_LIMIT status, found {state.get('status')}")
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
         block(state, "approved plan file changed")
         raise RuntimeError("approved plan file changed; blocked for human review")
 
     loops_this_run = 0
     while state["current_step"] <= len(state["plan"]["steps"]):
+        if not ensure_codex_usage_capacity(state, wait=args.wait_for_limits, poll_seconds=args.usage_poll_seconds):
+            return 0
+        state = load_state()
         if loops_this_run >= args.max_loops:
             state["status"] = "APPROVED"
             save_state(state)
@@ -1075,6 +1468,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     state["status"] = "PLAN_COMPLETE"
     state["block_reason"] = None
+    try:
+        state["codex_usage"] = query_codex_rate_limits()
+    except Exception:
+        pass
     save_state(state)
     with JOURNAL.open("a", encoding="utf-8") as handle:
         handle.write(f"## Plan complete — {utc_now()}\n\n- Plan: `{state['plan_hash']}`\n- Loops: {state['loop_count']}\n- Steps: {len(state['plan']['steps'])}\n- Status: PLAN_COMPLETE\n- Next action: human review and approve a new 5-10 step plan\n\n")
@@ -1170,6 +1567,8 @@ def build_parser() -> argparse.ArgumentParser:
     approve.set_defaults(func=cmd_approve)
     run = sub.add_parser("run")
     run.add_argument("--max-loops", type=int, default=DEFAULT_MAX_LOOPS)
+    run.add_argument("--wait-for-limits", action=argparse.BooleanOptionalAction, default=True, help="wait and automatically resume after Codex usage limits recover")
+    run.add_argument("--usage-poll-seconds", type=int, default=USAGE_POLL_SECONDS, help="maximum zero-model usage recheck interval while paused")
     run.set_defaults(func=cmd_run)
     resume = sub.add_parser("resume")
     resume.add_argument("plan_hash")
@@ -1178,6 +1577,10 @@ def build_parser() -> argparse.ArgumentParser:
     recover = sub.add_parser("recover-validation-block")
     recover.add_argument("plan_hash")
     recover.set_defaults(func=cmd_recover_validation_block)
+    usage = sub.add_parser("usage", help="show RALPH context/token usage and live Codex remaining limits")
+    usage.add_argument("--details", action="store_true", help="include per-loop token usage")
+    usage.add_argument("--json", action="store_true", help="emit machine-readable report")
+    usage.set_defaults(func=cmd_usage)
     sub.add_parser("status").set_defaults(func=cmd_status)
     return parser
 
@@ -1186,6 +1589,8 @@ def main() -> int:
     args = build_parser().parse_args()
     if getattr(args, "max_loops", 1) < 1:
         raise SystemExit("--max-loops must be >= 1")
+    if getattr(args, "usage_poll_seconds", USAGE_POLL_SECONDS) < 15:
+        raise SystemExit("--usage-poll-seconds must be >= 15")
     try:
         return args.func(args)
     except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:

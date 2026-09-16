@@ -344,6 +344,74 @@ class ControllerQualificationAuthorityTests(unittest.TestCase):
         self.assertIn("validation_notes", required)
 
 
+class CodexUsageGuardTests(unittest.TestCase):
+    def sample_usage(self, *, used_primary=90, used_secondary=20, allowed=True):
+        return {
+            "ordinaryUsageAllowed": allowed,
+            "rateLimits": {},
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "planType": "plus",
+                    "primary": {"usedPercent": used_primary, "windowDurationMins": 300, "resetsAt": 2_000_000_000},
+                    "secondary": {"usedPercent": used_secondary, "windowDurationMins": 10080, "resetsAt": 2_000_100_000},
+                }
+            },
+            "rateLimitResetCredits": {"availableCount": 0},
+        }
+
+    def test_normalise_codex_usage_keeps_only_non_sensitive_limit_state(self):
+        raw = self.sample_usage()
+        raw["accountId"] = "must-not-be-retained"
+        snapshot = ralph.normalise_codex_usage(raw, "gpt-5.6-terra")
+        self.assertEqual(snapshot["plan_type"], "plus")
+        self.assertTrue(snapshot["ordinary_usage_allowed"])
+        self.assertEqual([w["name"] for w in snapshot["windows"]], ["5h", "weekly"])
+        self.assertEqual(snapshot["windows"][0]["remaining_percent"], 10.0)
+        self.assertNotIn("account_id", snapshot)
+        self.assertNotIn("must-not-be-retained", str(snapshot))
+
+    def test_guard_pauses_at_exactly_five_percent_remaining(self):
+        snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=95), "gpt-5.6-terra")
+        status, findings = ralph.codex_usage_guard(snapshot)
+        self.assertEqual(status, "PAUSE")
+        self.assertIn("5h remaining 5.0% <= 5.0% reserve", findings)
+
+    def test_guard_is_safe_above_reserve(self):
+        snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=94, used_secondary=40), "gpt-5.6-terra")
+        self.assertEqual(ralph.codex_usage_guard(snapshot), ("SAFE", []))
+
+    def test_guard_does_not_infer_recovery_without_backend_authority(self):
+        snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=10, allowed=None), "gpt-5.6-terra")
+        status, findings = ralph.codex_usage_guard(snapshot)
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIn("ordinaryUsageAllowed", findings[0])
+
+    def test_backend_disallow_pauses_even_when_percentages_have_headroom(self):
+        snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=10, allowed=False), "gpt-5.6-terra")
+        status, _ = ralph.codex_usage_guard(snapshot)
+        self.assertEqual(status, "PAUSE")
+
+    def test_live_usage_report_aggregates_old_and_new_usage_formats(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_live = ralph.LIVE
+            try:
+                ralph.LIVE = Path(td) / "live.log"
+                ralph.LIVE.write_text(
+                    "[x] RALPH    loop=0001 step=1/7\n"
+                    "[x] USAGE    input=100 cached=80 output=10 reasoning=3\n"
+                    "[x] RALPH    loop=0002 step=2/7\n"
+                    "[x] USAGE    cumulative_input=200 cached=150 cache_write=4 output=20 reasoning=5\n",
+                    encoding="utf-8",
+                )
+                usage = ralph.live_usage_by_loop()
+                self.assertEqual(usage[1]["noncached"], 20)
+                self.assertEqual(usage[2]["input"], 200)
+                self.assertEqual(sum(x["input"] for x in usage.values()), 300)
+            finally:
+                ralph.LIVE = old_live
+
+
 class SnapshotTests(unittest.TestCase):
     def test_changed_paths_reports_added_modified_deleted(self):
         before = {"a": "1", "b": "2"}
