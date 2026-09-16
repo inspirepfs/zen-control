@@ -226,12 +226,32 @@ class ReleaseReadinessContractTests(unittest.TestCase):
         self.assertTrue(any("Notification Centre is an implemented" in note for note in result["notes"]))
         self.assertEqual("pass", result["state"])
 
-    def test_push_enablement_before_human_gate_breaks_pwa_safety_contract(self):
+    def test_server_controlled_push_preserves_pwa_safety_contract(self):
         values = self.inputs()
         values["pwa"]["push_notifications"] = True
         result = self.build(**values)
         row = next(item for item in result["checks"] if item["key"] == "pwa_security")
-        self.assertEqual("fail", row["state"])
+        self.assertEqual("pass", row["state"])
+        self.assertEqual("pass", result["state"])
+
+    def test_each_pwa_security_invariant_independently_blocks_release(self):
+        hostile_values = (
+            ("mode", "offline_first"),
+            ("cached_private_data", True),
+            ("offline_mutations", True),
+            ("background_sync", True),
+            ("server_auth_required", False),
+            ("shared_display_lock_server_enforced", False),
+        )
+        for field, value in hostile_values:
+            with self.subTest(field=field):
+                values = self.inputs()
+                values["pwa"]["push_notifications"] = True
+                values["pwa"][field] = value
+                result = self.build(**values)
+                row = next(item for item in result["checks"] if item["key"] == "pwa_security")
+                self.assertEqual("fail", row["state"])
+                self.assertEqual("fail", result["state"])
 
     def test_release_report_does_not_echo_raw_startup_exception_text(self):
         values = self.inputs()

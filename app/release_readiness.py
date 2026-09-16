@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,42 @@ def _bounded_text(value: Any, limit: int) -> str:
     return text[: max(1, int(limit))]
 
 
+_SENSITIVE_EVIDENCE = re.compile(r"(?i)\b(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|bearer)\s*[:=]\s*[^\s,;]+")
+_URL_EVIDENCE = re.compile(r"(?i)\b(?:https?|wss?)://[^\s,;]+")
+_IPV4_EVIDENCE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_HOSTNAME_EVIDENCE = re.compile(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63})\b")
+_RAW_EXCEPTION_EVIDCE = re.compile(r"(?i)\b(?:traceback|stack trace|exception|[a-z_]*error)\b\s*[:][^\n]*")
+_SAFE_EVIDENCE_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _sanitized_evidence_text(value: Any, limit: int, fallback: str) -> str:
+    """Return a bounded human-readable field without portable sensitive detail."""
+    text = " ".join(str(value or "").split())
+    text = _RAW_EXCEPTION_EVIDCE.sub("diagnostic detail redacted", text)
+    text = _SENSITIVE_EVIDENCE.sub("sensitive value redacted", text)
+    text = _URL_EVIDENCE.sub("endpoint redacted", text)
+    text = _IPV4_EVIDENCE.sub("address redacted", text)
+    text = _HOSTNAME_EVIDENCE.sub("hostname redacted", text)
+    return (text or fallback)[: max(1, int(limit))]
+
+
+def _sanitized_evidence_key(value: Any, fallback: str) -> str:
+    """Keep only stable check identifiers; never turn arbitrary text into a key."""
+    key = _bounded_text(value, 64).lower()
+    return key if _SAFE_EVIDENCE_KEY.fullmatch(key) else fallback
+
+
+def _recognized_schema(value: Any, expected: str) -> str:
+    return expected if value == expected else "unrecognized"
+
+
+def _safe_count(value: Any) -> int:
+    try:
+        return min(1_000_000, max(0, int(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _diagnostic_gate_findings(diagnostics: dict[str, Any], states: set[str]) -> list[dict[str, str]]:
     """Carry only bounded, already-sanitized diagnostic identity into release evidence.
 
@@ -78,17 +115,17 @@ def _diagnostic_gate_findings(diagnostics: dict[str, Any], states: set[str]) -> 
     exception material into the portable release artifact.
     """
     findings: list[dict[str, str]] = []
-    for item in list((diagnostics or {}).get("checks") or [])[:20]:
+    for item in list((diagnostics or {}).get("checks") or []):
         if not isinstance(item, dict):
             continue
         state = str(item.get("state") or "").strip().lower()
         if state not in states:
             continue
         findings.append({
-            "key": _bounded_text(item.get("key") or "unknown", 64),
-            "label": _bounded_text(item.get("label") or "Diagnostic check", 120),
+            "key": _sanitized_evidence_key(item.get("key"), "unrecognized_check"),
+            "label": _sanitized_evidence_text(item.get("label"), 120, "Diagnostic check"),
             "state": state,
-            "summary": _bounded_text(item.get("summary") or "Review diagnostic evidence", 240),
+            "summary": _sanitized_evidence_text(item.get("summary"), 240, "Review diagnostic evidence"),
         })
     return findings
 
@@ -206,15 +243,15 @@ def _performance_gate_findings(performance: dict[str, Any]) -> list[dict[str, st
             "label": "Request-class performance",
             "state": request_state,
         })
-    for item in list(formal.get("evidence_targets") or [])[:12]:
+    for item in list(formal.get("evidence_targets") or []):
         if not isinstance(item, dict):
             continue
         state = _state(item.get("state"), {"pass", "pending", "fail"}, "pending")
         if state == "pass":
             continue
         findings.append({
-            "key": _bounded_text(item.get("key") or "performance_evidence", 64),
-            "label": _bounded_text(item.get("label") or "Performance evidence", 120),
+            "key": _sanitized_evidence_key(item.get("key"), "unrecognized_performance_evidence"),
+            "label": _sanitized_evidence_text(item.get("label"), 120, "Performance evidence"),
             "state": state,
         })
     return findings
@@ -285,7 +322,11 @@ def build_release_readiness(
     ))
 
     diagnostic_state = str((diagnostics or {}).get("overall") or "offline").lower()
-    diagnostic_counts = dict((diagnostics or {}).get("counts") or {})
+    raw_diagnostic_counts = dict((diagnostics or {}).get("counts") or {})
+    diagnostic_counts = {
+        key: _safe_count(raw_diagnostic_counts.get(key))
+        for key in ("healthy", "warning", "critical", "offline")
+    }
     warning_checks = _diagnostic_gate_findings(diagnostics, {"warning"})
     blocking_checks = _diagnostic_gate_findings(diagnostics, {"critical", "offline"})
     expected_detail_count = (
@@ -354,9 +395,9 @@ def build_release_readiness(
             "Formal performance evidence is incomplete; PENDING cannot become release readiness"
             if performance_state == "pending" else "One or more formal performance requirements fail"
         ),
-        formal_schema=formal.get("schema"),
-        request_acceptance_schema=acceptance.get("schema"),
-        request_state=formal.get("request_state"),
+        formal_schema=_recognized_schema(formal.get("schema"), "zen_formal_performance_acceptance_v1"),
+        request_acceptance_schema=_recognized_schema(acceptance.get("schema"), "zen_performance_acceptance_v2"),
+        request_state=_state(formal.get("request_state"), {"pass", "pending", "fail"}, "pending"),
         target_count=len(acceptance.get("targets") or []),
         min_samples=acceptance.get("min_samples"),
         findings=performance_findings,
@@ -390,7 +431,6 @@ def build_release_readiness(
         (pwa or {}).get("cached_private_data") is False,
         (pwa or {}).get("offline_mutations") is False,
         (pwa or {}).get("background_sync") is False,
-        (pwa or {}).get("push_notifications") is False,
         bool((pwa or {}).get("server_auth_required")),
         bool((pwa or {}).get("shared_display_lock_server_enforced")),
     ))
@@ -404,6 +444,14 @@ def build_release_readiness(
         cached_private_data=bool((pwa or {}).get("cached_private_data")),
         offline_mutations=bool((pwa or {}).get("offline_mutations")),
         server_auth_required=bool((pwa or {}).get("server_auth_required")),
+        invariants=[
+            {"key": "online_first", "state": "pass" if str((pwa or {}).get("mode") or "") == "online_first" else "fail"},
+            {"key": "cached_private_data", "state": "fail" if bool((pwa or {}).get("cached_private_data")) else "pass"},
+            {"key": "offline_mutations", "state": "fail" if bool((pwa or {}).get("offline_mutations")) else "pass"},
+            {"key": "background_sync", "state": "fail" if bool((pwa or {}).get("background_sync")) else "pass"},
+            {"key": "server_auth_required", "state": "pass" if bool((pwa or {}).get("server_auth_required")) else "fail"},
+            {"key": "shared_display_lock_server_enforced", "state": "pass" if bool((pwa or {}).get("shared_display_lock_server_enforced")) else "fail"},
+        ],
     ))
 
     auth_available = (auth or {}).get("available", True) is not False

@@ -120,13 +120,13 @@ class SupportBundlePrivacyTests(unittest.TestCase):
             "token": "tok_123",
             "endpoint": "https://push.example/sub/secret",
             "host": "router.home.example",
-            "ip_address": "192.168.2.26",
-            "detail": "password=hunter2 token=tok_123 user@example.com aa:bb:cc:dd:ee:ff 192.168.2.26 https://x.invalid/path?token=oops",
+            "ip_address": "192.0.2.26",
+            "detail": "password=hunter2 token=tok_123 user@example.com aa:bb:cc:dd:ee:ff 192.0.2.26 https://x.invalid/path?token=oops",
             "safe": "worker healthy",
         }
         cleaned = sanitize_support_payload(hostile, counters=counters)
         dumped = json.dumps(cleaned)
-        for secret in ("hunter2", "tok_123", "push.example/sub/secret", "router.home.example", "192.168.2.26", "user@example.com", "aa:bb:cc:dd:ee:ff", "token=oops"):
+        for secret in ("hunter2", "tok_123", "push.example/sub/secret", "router.home.example", "192.0.2.26", "user@example.com", "aa:bb:cc:dd:ee:ff", "token=oops"):
             self.assertNotIn(secret, dumped)
         self.assertIn("worker healthy", dumped)
         self.assertGreater(counters["secret_fields"], 0)
@@ -137,7 +137,7 @@ class SupportBundlePrivacyTests(unittest.TestCase):
         report = commissioning()
         hostile_diag = diagnostics_with()
         hostile_diag["checks"][0]["facts"] = {
-            "ip": "192.168.2.90",
+            "ip": "192.0.2.90",
             "detail": "password=leak-me",
             "endpoint": "https://push.invalid/subscription/abc",
         }
@@ -145,8 +145,8 @@ class SupportBundlePrivacyTests(unittest.TestCase):
             version="0.59.0",
             commissioning=report,
             diagnostics=hostile_diag,
-            runtime_health={"ok": True, "status": "healthy", "router": {"host": "192.168.2.1"}},
-            secure_transport={"local_host": "zen.private.example", "lan_bind_ip": "192.168.2.10", "url": "https://zen.private.example/?token=abc"},
+            runtime_health={"ok": True, "status": "healthy", "router": {"host": "192.0.2.1"}},
+            secure_transport={"local_host": "zen.private.example", "lan_bind_ip": "192.0.2.10", "url": "https://zen.private.example/?token=abc"},
             pwa={"mode": "online_first", "endpoint": "https://push.invalid/secret"},
             environment={"groups": {"routeros": {"configured_fields": 4, "expected_fields": 4}}},
             audit_summary={"events": {"LOGIN_SUCCESS": 2}},
@@ -157,7 +157,7 @@ class SupportBundlePrivacyTests(unittest.TestCase):
             names = set(archive.namelist())
             self.assertEqual(names, set(manifest["files"]))
             combined = "\n".join(archive.read(name).decode("utf-8") for name in names)
-        for secret in ("leak-me", "192.168.2.90", "192.168.2.1", "192.168.2.10", "zen.private.example", "push.invalid/subscription/abc", "push.invalid/secret", "token=abc"):
+        for secret in ("leak-me", "192.0.2.90", "192.0.2.1", "192.0.2.10", "zen.private.example", "push.invalid/subscription/abc", "push.invalid/secret", "token=abc"):
             self.assertNotIn(secret, combined)
         self.assertIn("raw Docker/application logs", combined)
         self.assertIn("ZEN Control Commissioning", combined)
@@ -167,17 +167,17 @@ class SupportBundlePrivacyTests(unittest.TestCase):
             "ADMIN_USER": "private-admin",
             "ADMIN_PASSWORD": "super-secret",
             "SESSION_SECRET": "session-secret",
-            "MIKROTIK_HOST": "192.168.2.1",
+            "MIKROTIK_HOST": "192.0.2.1",
             "MIKROTIK_PORT": "8728",
             "MIKROTIK_USER": "router-admin",
             "MIKROTIK_PASSWORD": "router-secret",
         })
         audits = audit_event_summary([
-            {"event": "LOGIN_SUCCESS", "actor": "private-admin", "detail": "192.168.2.26 password=oops", "severity": "info"},
+            {"event": "LOGIN_SUCCESS", "actor": "private-admin", "detail": "192.0.2.26 password=oops", "severity": "info"},
             {"event": "LOGIN_SUCCESS", "actor": "someone", "detail": "secret", "severity": "info"},
         ])
         dumped = json.dumps({"env": env, "audits": audits})
-        for value in ("private-admin", "super-secret", "session-secret", "192.168.2.1", "router-admin", "router-secret", "192.168.2.26", "password=oops"):
+        for value in ("private-admin", "super-secret", "session-secret", "192.0.2.1", "router-admin", "router-secret", "192.0.2.26", "password=oops"):
             self.assertNotIn(value, dumped)
         self.assertEqual(audits["events"]["LOGIN_SUCCESS"], 2)
         self.assertEqual(env["groups"]["routeros"]["configured_fields"], 4)
