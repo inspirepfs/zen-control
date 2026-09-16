@@ -84,3 +84,19 @@ backups/
 # Local troubleshooting artefacts - may contain operational evidence even after sanitization
 zen-control-support-*.zip
 zen-control-diagnostics-*.json
+
+# RALPH-Lite local controller state / evidence
+.ralph/*
+!.ralph/policy.md
+
+# Local developer / agent credentials and state
+.codex/
+.npmrc
+.pypirc
+.netrc
+.envrc
+.direnv/
+*.token
+*.secret
+*.secrets
+*.credentials
