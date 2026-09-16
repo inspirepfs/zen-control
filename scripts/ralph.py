@@ -33,6 +33,14 @@ CONTEXT = RALPH / "context.json"
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
+# Codex exec currently has no native max-agent-turns/max-steps control. These
+# budgets therefore act as a safe post-loop circuit breaker: finish the current
+# qualified step, then pause before another model turn if efficiency regresses.
+PROMPT_COMMAND_BUDGET = 6
+EFFICIENCY_MAX_COMMANDS = 8
+EFFICIENCY_MAX_CUMULATIVE_INPUT = 600_000
+EFFICIENCY_MAX_NONCACHED_INPUT = 100_000
+EFFICIENCY_MAX_REPORTED_FILES = 8
 _CODEX_PREFIX: list[str] | None = None
 EXCLUDED_DIRS = {
     ".git", ".ralph", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -325,6 +333,7 @@ def append_journal(loop_no: int, step_no: int, phase: str, result: str, *, summa
     cached_tokens = int(stats.get("cached_input_tokens") or 0)
     noncached = max(0, input_tokens - cached_tokens)
     cache_ratio = (cached_tokens / input_tokens * 100.0) if input_tokens else 0.0
+    efficiency = efficiency_findings(stats) if stats else []
     lines = [
         f"## Loop {loop_no:04d} — {utc_now()}", "",
         f"- Plan step: {step_no}", f"- Phase: {phase}", f"- Result: {result}", f"- Change class: {change_class}", f"- Repair attempt: {repair}",
@@ -338,7 +347,9 @@ def append_journal(loop_no: int, step_no: int, phase: str, result: str, *, summa
             f"- Codex duration: {float(stats.get('codex_seconds') or 0):.1f}s",
             f"- Commands executed: {int(stats.get('commands_executed') or 0)}",
             f"- Files inspected (reported): {int(stats.get('files_inspected') or 0)}",
-            f"- Tokens: input={input_tokens} cached={cached_tokens} non-cached={noncached} output={int(stats.get('output_tokens') or 0)} reasoning={int(stats.get('reasoning_output_tokens') or 0)} cache={cache_ratio:.1f}%",
+            f"- Codex cumulative tokens: input={input_tokens} cached={cached_tokens} non-cached={noncached} cache-write={int(stats.get('cache_write_input_tokens') or 0)} output={int(stats.get('output_tokens') or 0)} reasoning={int(stats.get('reasoning_output_tokens') or 0)} cache={cache_ratio:.1f}%",
+            f"- Efficiency budget: {'WARN' if efficiency else 'PASS'}",
+            f"- Efficiency findings: {'; '.join(efficiency) if efficiency else '-'}",
             f"- Gate durations: {'; '.join(f'{name}={seconds:.1f}s' for name, seconds in gate_times.items()) if gate_times else '-'}",
             f"- First pass: {'yes' if result == 'PASS' and repair == 0 else 'no'}",
         ]
@@ -399,9 +410,10 @@ def codex_event_messages(event: dict) -> list[tuple[str, str]]:
         usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
         messages.append((
             "USAGE",
-            "input={input} cached={cached} output={output} reasoning={reasoning}".format(
+            "cumulative_input={input} cached={cached} cache_write={cache_write} output={output} reasoning={reasoning}".format(
                 input=usage.get("input_tokens", 0),
                 cached=usage.get("cached_input_tokens", 0),
+                cache_write=usage.get("cache_write_input_tokens", 0),
                 output=usage.get("output_tokens", 0),
                 reasoning=usage.get("reasoning_output_tokens", 0),
             ),
@@ -564,6 +576,7 @@ def empty_codex_metrics() -> dict:
         "commands_executed": 0,
         "input_tokens": 0,
         "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
         "output_tokens": 0,
         "reasoning_output_tokens": 0,
     }
@@ -576,7 +589,10 @@ def update_codex_metrics(metrics: dict, event: dict) -> None:
         metrics["commands_executed"] = int(metrics.get("commands_executed") or 0) + 1
     if event_type == "turn.completed":
         usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
-        for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"):
+        for key in (
+            "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+            "output_tokens", "reasoning_output_tokens",
+        ):
             metrics[key] = int(usage.get(key) or 0)
 
 
@@ -726,6 +742,26 @@ def loop_stats(loop_started: float, result: dict | None = None, *, gate_duration
     return metrics
 
 
+def efficiency_findings(stats: dict | None) -> list[str]:
+    """Return stable post-loop efficiency findings without interrupting a live edit."""
+    stats = dict(stats or {})
+    commands = int(stats.get("commands_executed") or 0)
+    files = int(stats.get("files_inspected") or 0)
+    cumulative = int(stats.get("input_tokens") or 0)
+    cached = int(stats.get("cached_input_tokens") or 0)
+    noncached = max(0, cumulative - cached)
+    findings: list[str] = []
+    if commands > EFFICIENCY_MAX_COMMANDS:
+        findings.append(f"commands {commands}>{EFFICIENCY_MAX_COMMANDS}")
+    if files > EFFICIENCY_MAX_REPORTED_FILES:
+        findings.append(f"reported-files {files}>{EFFICIENCY_MAX_REPORTED_FILES}")
+    if cumulative > EFFICIENCY_MAX_CUMULATIVE_INPUT:
+        findings.append(f"cumulative-input {cumulative}>{EFFICIENCY_MAX_CUMULATIVE_INPUT}")
+    if noncached > EFFICIENCY_MAX_NONCACHED_INPUT:
+        findings.append(f"non-cached-input {noncached}>{EFFICIENCY_MAX_NONCACHED_INPUT}")
+    return findings
+
+
 def plan_prompt(goal: str) -> str:
     return f"""You are planning work for ZEN Control under RALPH-Lite. Inspect the repository read-only.
 Goal: {goal}
@@ -754,8 +790,10 @@ Compact handoff from the previous successful loop:
 
 CONTEXT-EFFICIENCY RULES:
 - Start from the handoff's relevant_files and accepted_findings; do not rediscover accepted facts unless this step directly invalidates them.
-- Prefer rg -n plus narrow sed/range reads or targeted symbols. Do not repeatedly read whole large files.
-- Normally inspect no more than 6-8 relevant files before implementation. If more are genuinely required, explain why in the final summary.
+- HARD BUDGET: use at most {PROMPT_COMMAND_BUDGET} shell command executions for this implementation turn. If safe completion genuinely needs more, return needs_human=true with a blocker instead of continuing exploration.
+- Batch related reads into one discovery command. Prefer rg -n plus narrow sed/range reads or targeted symbols; do not repeatedly read whole large files.
+- Aim for one discovery bundle, one implementation/edit bundle, and no more than two focused validation commands. The external controller runs the full authoritative gates.
+- Normally inspect no more than 6-8 relevant files before implementation. If more are genuinely required, stop and request human review rather than expanding silently.
 - Do not broadly scan docs/, README.md, CHANGELOG.md, or Git history unless directly necessary for this step.
 - Stop discovery once there is enough evidence to implement safely.
 - Return context.relevant_files (max 8), context.accepted_findings (max 8), and context.files_inspected (max 16) for the next loop.
@@ -836,7 +874,8 @@ def cmd_status(_: argparse.Namespace) -> int:
     init_files()
     state = load_state()
     total = len((state.get("plan") or {}).get("steps") or [])
-    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} block={state.get('block_reason') or '-'}")
+    efficiency = state.get("last_efficiency") if isinstance(state.get("last_efficiency"), dict) else {}
+    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} block={state.get('block_reason') or '-'} efficiency={efficiency.get('status') or '-'}")
     return 0
 
 
@@ -928,14 +967,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         passed, gates, fp, gate_output, gate_durations = run_gates()
         stats = loop_stats(loop_started, result, gate_durations=gate_durations, repair=repair_no)
         if passed:
+            efficiency = efficiency_findings(stats)
+            next_action = "pause for efficiency review" if efficiency else "next approved step"
             live_write(f"loop={loop_no:04d} step={step['id']} PASS · class={change_class}", "PASS")
-            append_journal(loop_no, step["id"], phase, "PASS", summary=result.get("summary", ""), files=files, gates=gates, repair=repair_no, ideas=result.get("ideas", []), next_action="next approved step", change_class=change_class, stats=stats)
+            append_journal(loop_no, step["id"], phase, "PASS", summary=result.get("summary", ""), files=files, gates=gates, repair=repair_no, ideas=result.get("ideas", []), next_action=next_action, change_class=change_class, stats=stats)
             state["last_result"] = "PASS"
             state["last_failure"] = None
             state["active_failure"] = None
+            state["last_efficiency"] = {"status": "WARN" if efficiency else "PASS", "findings": efficiency}
             update_context_after_pass(state, step, result, files)
             state["current_step"] += 1
+            state["status"] = "APPROVED"
             save_state(state)
+            if efficiency:
+                detail = "; ".join(efficiency)
+                live_write(f"qualified step completed but efficiency budget exceeded: {detail}; pausing before next model turn", "EFFICIENCY")
+                print(f"PAUSED_EFFICIENCY plan={state['plan_hash']} step={state['current_step']} loops={state['loop_count']} findings={detail}")
+                return 0
             continue
 
         live_write(f"loop={loop_no:04d} step={step['id']} FAIL fingerprint={fp}", "FAIL")

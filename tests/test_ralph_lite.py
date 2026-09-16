@@ -173,7 +173,7 @@ class CodexObservabilityTests(unittest.TestCase):
                 "reasoning_output_tokens": 7,
             },
         })
-        self.assertEqual(messages, [("USAGE", "input=100 cached=80 output=20 reasoning=7")])
+        self.assertEqual(messages, [("USAGE", "cumulative_input=100 cached=80 cache_write=0 output=20 reasoning=7")])
 
     def test_metrics_capture_commands_and_token_usage(self):
         metrics = ralph.empty_codex_metrics()
@@ -186,6 +186,7 @@ class CodexObservabilityTests(unittest.TestCase):
             "usage": {
                 "input_tokens": 120,
                 "cached_input_tokens": 90,
+                "cache_write_input_tokens": 5,
                 "output_tokens": 21,
                 "reasoning_output_tokens": 8,
             },
@@ -193,6 +194,7 @@ class CodexObservabilityTests(unittest.TestCase):
         self.assertEqual(metrics["commands_executed"], 1)
         self.assertEqual(metrics["input_tokens"], 120)
         self.assertEqual(metrics["cached_input_tokens"], 90)
+        self.assertEqual(metrics["cache_write_input_tokens"], 5)
         self.assertEqual(metrics["reasoning_output_tokens"], 8)
 
 
@@ -218,6 +220,8 @@ class ContextTests(unittest.TestCase):
                 }
                 prompt = ralph.step_prompt(state, step, None, 0)
                 self.assertIn("address-list takes precedence over DNS", prompt)
+                self.assertIn("HARD BUDGET: use at most 6 shell command executions", prompt)
+                self.assertIn("Batch related reads into one discovery command", prompt)
                 self.assertIn("Normally inspect no more than 6-8 relevant files", prompt)
                 self.assertIn("Do not broadly scan docs/", prompt)
             finally:
@@ -269,6 +273,41 @@ class ContextTests(unittest.TestCase):
                 self.assertIn("Added classifier fixtures", saved["accepted_findings"][0])
             finally:
                 ralph.CONTEXT, ralph.JOURNAL = old_context, old_journal
+
+
+class EfficiencyBudgetTests(unittest.TestCase):
+    def test_healthy_loop_is_within_efficiency_budget(self):
+        stats = {
+            "commands_executed": 5,
+            "files_inspected": 6,
+            "input_tokens": 300000,
+            "cached_input_tokens": 250000,
+        }
+        self.assertEqual(ralph.efficiency_findings(stats), [])
+
+    def test_expensive_loop_reports_each_exceeded_budget(self):
+        stats = {
+            "commands_executed": 12,
+            "files_inspected": 10,
+            "input_tokens": 931164,
+            "cached_input_tokens": 798464,
+        }
+        findings = ralph.efficiency_findings(stats)
+        self.assertIn("commands 12>8", findings)
+        self.assertIn("reported-files 10>8", findings)
+        self.assertIn("cumulative-input 931164>600000", findings)
+        self.assertIn("non-cached-input 132700>100000", findings)
+
+    def test_cached_input_does_not_hide_noncached_budget(self):
+        stats = {
+            "commands_executed": 4,
+            "files_inspected": 4,
+            "input_tokens": 700000,
+            "cached_input_tokens": 590000,
+        }
+        findings = ralph.efficiency_findings(stats)
+        self.assertIn("cumulative-input 700000>600000", findings)
+        self.assertIn("non-cached-input 110000>100000", findings)
 
 
 class SnapshotTests(unittest.TestCase):
