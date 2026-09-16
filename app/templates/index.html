@@ -3417,6 +3417,7 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       </div>
       <div class="operations-tool-links">
         <a class="button-link compact" href="/diagnostics">Run diagnostics</a>
+        <a class="button-link compact primary" href="/local/operations/support-bundle">Support bundle</a>
         <a class="button-link compact secondary" href="/performance">Performance</a>
         <a class="button-link compact secondary" href="/migration/kid-control">Kid Control migration</a>
       </div>
@@ -3511,6 +3512,8 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
         <code>/health/ready</code><span>Policy DB + RouterOS + security posture + reconciler readiness.</span>
         <code>/api/operations/status</code><span>Authenticated startup, readiness, snapshots and inventory state.</span>
         <code>/api/operations/diagnostics</code><span>Sanitized cross-component operational diagnostic contract.</span>
+        <code>/api/operations/commissioning</code><span>PASS/WARN/BLOCKED/UNAVAILABLE commissioning decision from independent evidence.</span>
+        <code>/local/operations/support-bundle</code><span>Admin/operator public-safe ZIP support bundle with defence-in-depth redaction.</span>
         <code>/api/release-readiness</code><span>Core release gate: PASS, PENDING or FAIL from current evidence.</span>
         <code>/api/pwa/status</code><span>Installed-app mode and safe-cache/security contract; no household data.</span>
         <code>/api/security/transport</code><span>Sanitized secure-cookie, Host allowlist and Cloudflare Access commissioning status.</span>
@@ -3553,9 +3556,10 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
         <span class="muted">Container-local SQLite persistence at /data/policy.db.</span>
       </div>
       <div class="setting-item">
-        <strong>Operational diagnostics</strong>
-        <span class="muted">Cross-component health, worker, authority and performance evidence with a sanitized support bundle.</span>
+        <strong>Operational diagnostics &amp; support</strong>
+        <span class="muted">Cross-component health, commissioning state and a public-safe ZIP support bundle with no raw household logs.</span>
         <a class="button-link" href="/diagnostics">Open diagnostics</a>
+        <a class="button-link secondary" href="/local/operations/support-bundle">Download support bundle</a>
       </div>
       <div class="setting-item">
         <strong>Final release readiness</strong>

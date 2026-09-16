@@ -80,3 +80,7 @@ app.backup-*/
 tests.backup-*/
 backup/
 backups/
+
+# Local troubleshooting artefacts - may contain operational evidence even after sanitization
+zen-control-support-*.zip
+zen-control-diagnostics-*.json

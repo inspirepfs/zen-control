@@ -333,9 +333,9 @@ _TOPICS = {
     ),
     "diagnostics": _topic(
         "diagnostics", "Operations", "Operational diagnostics",
-        "Diagnostics gives one fresh cross-component health view across ZEN, SQLite, RouterOS authority, service contracts, PostgreSQL telemetry, traffic-ingest, Pi-hole DNS, IPFIX and background workers.",
-        does=("Supports a sanitized diagnostic JSON bundle for troubleshooting without exporting household DNS/device detail."),
-        watch=("Diagnostics reports failures; it does not auto-repair critical RouterOS authority.", "Each dependency is proved independently: ZEN does not infer healthy Pi-hole, IPFIX or classifier state from another subsystem being reachable."),
+        "Diagnostics gives one fresh cross-component health and commissioning view across ZEN, SQLite, RouterOS authority, service contracts, PostgreSQL telemetry, traffic-ingest, Pi-hole DNS, IPFIX and background workers.",
+        does=("Provides explicit PASS / WARN / BLOCKED / UNAVAILABLE commissioning state.", "Builds a public-safe ZIP support bundle with sanitized runtime evidence, environment-presence counts and aggregate audit event counts.", "Provides a copyable text support summary and an in-container CLI download path."),
+        watch=("Diagnostics and support export are read-only; they do not auto-repair or acquire RouterOS authority.", "Each dependency is proved independently: ZEN does not infer healthy Pi-hole, IPFIX or classifier state from another subsystem being reachable.", "Raw Docker/application logs, household device identities, DNS/activity records, credentials, tokens, sessions and push endpoint/key material are deliberately excluded from the default bundle."),
         related=(("Performance", "/performance"), ("Operations", "/?view=settings&section=operations#settings/operations")),
     ),
     "performance": _topic(

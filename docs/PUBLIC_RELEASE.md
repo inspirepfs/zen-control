@@ -105,3 +105,9 @@ The device-local diagnostics distinguish server/browser prerequisites from the b
 ## Release evidence to retain
 
 For significant release/security closure, retain the exact commit/tag, test summary, audit output, container dependency evidence where relevant and any upgrade/backup acceptance evidence. Never retain `.env`, live databases, credentials or household telemetry in a public release artifact.
+
+## Support-bundle release gate
+
+Maintenance releases that change diagnostics/support export must prove that hostile fake credentials, tokens, push endpoints, private hostnames, IP/MAC identifiers, email addresses and raw exception assignments do not survive the public support-bundle boundary. The default bundle must not embed raw Docker/application logs, DNS/activity rows or raw audit/incident details. Missing commissioning evidence remains `UNAVAILABLE`/`BLOCKED`, never PASS.
+
+Before tagging, exercise both the authenticated browser download and the in-container CLI path where `ADMIN_PASSWORD` is available. The support collector remains read-only and must not acquire RouterOS mutation authority.

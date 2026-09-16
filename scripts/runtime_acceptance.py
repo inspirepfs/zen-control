@@ -14,6 +14,8 @@ import os
 import sys
 import threading
 import time
+import io
+import zipfile
 from http.cookiejar import CookieJar
 from urllib import error, parse, request
 
@@ -72,6 +74,18 @@ def _get_text(opener, base_url: str, path: str, *, timeout: float) -> tuple[str,
             raise AcceptanceError(f"GET {path} returned HTTP {response.status}")
         return response.geturl(), response.read().decode("utf-8", "replace")
 
+
+
+
+def _get_bytes(opener, base_url: str, path: str, *, timeout: float, accept: str) -> bytes:
+    req = request.Request(
+        _url(base_url, path),
+        headers={"Accept": accept, "User-Agent": "zen-runtime-acceptance/1"},
+    )
+    with _request(opener, req, timeout=timeout) as response:
+        if response.status != 200:
+            raise AcceptanceError(f"GET {path} returned HTTP {response.status}")
+        return response.read()
 
 def _wait_for_json(
     opener,
@@ -166,6 +180,34 @@ def run_acceptance(
     if 'data-tab="dashboard"' not in dashboard_html:
         raise AcceptanceError("authenticated response did not render dashboard navigation")
     results.append("authenticated dashboard 200 rendered")
+
+    commissioning = _get_json(
+        opener, base_url, "/api/operations/commissioning", timeout=request_timeout
+    )
+    if commissioning.get("schema") != "zen_commissioning_report_v1":
+        raise AcceptanceError("commissioning endpoint returned an unexpected schema")
+    if commissioning.get("overall") not in {"ready", "ready_with_warnings", "blocked"}:
+        raise AcceptanceError("commissioning endpoint returned an unexpected overall state")
+    if not isinstance(commissioning.get("checks"), list) or not commissioning.get("checks"):
+        raise AcceptanceError("commissioning endpoint returned no checks")
+    results.append(
+        f"commissioning 200 state={commissioning.get('overall')} checks={len(commissioning['checks'])}"
+    )
+
+    bundle = _get_bytes(
+        opener, base_url, "/local/operations/support-bundle",
+        timeout=max(request_timeout, 30.0), accept="application/zip",
+    )
+    try:
+        with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            if manifest.get("schema") != "zen_support_bundle_v1":
+                raise AcceptanceError("support bundle manifest schema is invalid")
+            if "summary.txt" not in archive.namelist():
+                raise AcceptanceError("support bundle is missing summary.txt")
+    except (zipfile.BadZipFile, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AcceptanceError("support bundle endpoint did not return a valid ZIP contract") from exc
+    results.append("support bundle 200 valid-zip sanitized-contract")
 
     return results
 

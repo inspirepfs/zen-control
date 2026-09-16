@@ -131,7 +131,7 @@ class SchedulePlannerCrudContractTests(unittest.TestCase):
         self.assertNotIn("router.remove_", block)
 
     def test_release_and_help_describe_crud_closure(self):
-        self.assertIn("Current maintenance release: **v0.59.0.9**", self.readme)
+        self.assertRegex(self.readme, r"Current maintenance release: \*\*v0\.59\.0\.\d+\*\*")
         self.assertIn("## v0.59.0.9 — Schedule Edit & Planner CRUD Closure", self.changelog)
         self.assertIn("create, edit, pause, enable and delete", self.help)
         self.assertIn("Application/PWA runtime remains `0.59.0`", self.changelog)

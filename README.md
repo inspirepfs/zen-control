@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current maintenance release: **v0.59.0.9**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.9 closes targeted schedule-planner CRUD with in-place editing and prompt reconciliation wake-up; v0.59.0.8 added device-local PWA install/reinstall diagnostics.
+> Current maintenance release: **v0.59.0.10**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.10 adds commissioning diagnostics and a defence-in-depth sanitized support bundle; v0.59.0.9 closed targeted schedule-planner CRUD with in-place editing.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -48,7 +48,7 @@ ZEN currently provides:
 - Historical desired-policy checkpoints correlated with retained network evidence.
 - IPFIX and Pi-hole-backed activity/classification reporting.
 - A stats-heavy Reporting & Analytics workbench with period comparisons, daily trends, device/service movers, classification quality, policy/quota checkpoint signals, notification/incident lifecycle trends and CSV export.
-- Operational diagnostics, incidents, audit evidence and release-readiness checks.
+- Operational diagnostics, explicit commissioning readiness, public-safe support bundles, incidents, audit evidence and release-readiness checks.
 - Notification Centre with durable inbox/history, acknowledgement lifecycle, quiet hours, severity thresholds, source/device filtering, per-event controls, cooldown-based noise suppression, correlation groups, escalation rules, lifecycle timelines, explanation provenance, digest/noise analytics, browser push, SMTP email and signed webhook delivery.
 - TOTP parent authentication, recovery codes and shared-display locking.
 - Progressive Web App support for tablet/mobile use, including standard encrypted browser/PWA push notifications that respect ZEN attention preferences.
@@ -266,6 +266,20 @@ python3 scripts/perf_acceptance.py zen-performance.json --json-out zen-performan
 ```
 
 The JSON report is intentionally sanitized to acceptance/configuration/runtime aggregates rather than retaining individual slow-request paths. The CLI returns non-zero for FAIL, PENDING or an invalid/inconsistent contract unless `--allow-pending` is explicitly used.
+
+## Support and commissioning
+
+For troubleshooting, open **Settings → Operations → Diagnostics**. ZEN reports independent PASS / WARN / BLOCKED / UNAVAILABLE evidence rather than inferring healthy state from a neighbouring component. Admin/operator users can download a sanitized ZIP support bundle containing commissioning state, runtime health, transport/PWA state, environment-presence counts and aggregate audit-event counts.
+
+The default bundle deliberately excludes raw Docker/application logs, credentials, tokens, session/cookie material, push endpoints/keys, device names, raw IP/MAC identities, DNS queries and traffic records. Network/identity values that reach the defence-in-depth sanitizer are pseudonymized. A text summary is available from the same page.
+
+From the running application container, the same bundle can be downloaded without exposing the password on the command line:
+
+```bash
+docker compose exec -T mikrotik-control python -m app.support_cli --output /data/zen-control-support.zip
+```
+
+The CLI authenticates only to `127.0.0.1` using the container's existing `ADMIN_*` environment.
 
 ## Development and testing
 

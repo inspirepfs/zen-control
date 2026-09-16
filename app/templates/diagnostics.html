@@ -23,7 +23,9 @@
       <a class="button-link secondary back-link" href="/?view=settings&amp;section=operations#settings/operations">Back to Operations</a>
       <a class="button-link secondary" href="/performance">Performance</a>
       <a class="button-link" href="/api/operations/diagnostics">JSON</a>
-      <a class="button-link primary" href="/local/operations/diagnostics/export">Download sanitized bundle</a>
+      <a class="button-link secondary" href="/local/operations/diagnostics/export">Diagnostics JSON</a>
+      <a class="button-link primary" href="/local/operations/support-bundle">Download support bundle</a>
+      <button class="button-link secondary" type="button" id="copy-support-summary">Copy support summary</button>
       <a class="button-link secondary" href="/diagnostics">Run again</a>
     </div>
   </header>
@@ -34,6 +36,31 @@
       <strong>{{report.counts.healthy}} healthy · {{report.counts.warning}} warning · {{report.counts.critical}} critical · {{report.counts.offline}} offline</strong>
     </div>
     <div class="muted small">Captured {{report.captured_at}} · ZEN {{report.version}}</div>
+  </section>
+
+  <section class="card commissioning-card state-{{commissioning.overall}}">
+    <div class="card-heading">
+      <div>
+        <h2>Commissioning status</h2>
+        <p class="muted">Operator-facing readiness using explicit PASS / WARN / BLOCKED / UNAVAILABLE evidence. Optional features can remain NOT CONFIGURED without becoming false failures.</p>
+      </div>
+      <span class="diagnostic-pill">{{commissioning.overall|replace('_',' ')|upper}}</span>
+    </div>
+    <div class="diagnostic-kpis">
+      <span><small>Pass</small><strong>{{commissioning.counts['pass']}}</strong></span>
+      <span><small>Warn</small><strong>{{commissioning.counts['warn']}}</strong></span>
+      <span><small>Blocked</small><strong>{{commissioning.counts['blocked']}}</strong></span>
+      <span><small>Unavailable</small><strong>{{commissioning.counts['unavailable']}}</strong></span>
+      <span><small>Not configured</small><strong>{{commissioning.counts['not_configured']}}</strong></span>
+    </div>
+    <div class="commissioning-list">
+      {% for item in commissioning.checks %}
+      <div class="commissioning-row commissioning-{{item.state}}">
+        <div><strong>{{item.label}}</strong><span class="muted small">{{item.summary}}</span>{% if item.remediation and item.state != 'pass' %}<span class="muted small">Next: {{item.remediation}}</span>{% endif %}</div>
+        <span class="diagnostic-pill">{{item.state|replace('_',' ')|upper}}</span>
+      </div>
+      {% endfor %}
+    </div>
   </section>
 
   <section class="diagnostic-grid">
@@ -88,12 +115,40 @@
 
   <section class="card diagnostics-privacy">
     <h2>Sanitized support bundle</h2>
-    <p class="muted">The downloadable bundle is intentionally safe to share for troubleshooting. It includes health states, counts and timings only.</p>
+    <p class="muted">The ZIP support bundle is designed for public troubleshooting. It contains commissioning state, sanitized diagnostics, runtime health, transport/PWA state, environment-presence counts and aggregate audit event counts.</p>
+    <p class="muted small">Raw Docker/application logs are deliberately excluded. If deeper logs are needed, collect them separately after reviewing them for household or credential data.</p>
     <div class="diagnostic-omit-list">
       {% for item in report.privacy.omitted %}<span>Not included: <strong>{{item}}</strong></span>{% endfor %}
     </div>
     <div class="local-only-note">Diagnostics are observational. ZEN will not create, repair or alter critical RouterOS authority from this page.</div>
   </section>
 </main>
+<script>
+(() => {
+  const button = document.getElementById('copy-support-summary');
+  if (!button) return;
+  button.addEventListener('click', async () => {
+    const original = button.textContent;
+    try {
+      const response = await fetch('/local/operations/support-summary', {credentials: 'same-origin', cache: 'no-store'});
+      if (!response.ok) throw new Error('summary unavailable');
+      const text = await response.text();
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = document.createElement('textarea');
+        area.value = text; area.setAttribute('readonly',''); area.style.position='absolute'; area.style.left='-9999px';
+        document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
+      }
+      button.textContent = 'Copied';
+    } catch (error) {
+      button.textContent = 'Copy failed · open summary';
+      setTimeout(() => { window.location.href = '/local/operations/support-summary'; }, 700);
+    } finally {
+      setTimeout(() => { button.textContent = original; }, 2500);
+    }
+  });
+})();
+</script>
 </body>
 </html>

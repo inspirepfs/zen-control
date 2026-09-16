@@ -260,7 +260,8 @@ class DiagnosticsIntegrationAndUxTests(unittest.TestCase):
     def test_standalone_navigation_is_compact_and_contextual(self):
         self.assertIn('Back to Operations', self.template)
         self.assertIn('href="/performance"', self.template)
-        self.assertIn('Download sanitized bundle', self.template)
+        self.assertIn('href="/local/operations/support-bundle"', self.template)
+        self.assertIn('support bundle', self.template.lower())
         self.assertIn('.diagnostics-actions', self.css)
         self.assertIn('@media(max-width:700px)', self.css)
         self.assertIn('.operations-tool-links', self.app_css)

@@ -64,6 +64,10 @@ from app.kid_control_cutover import build_kid_control_cutover_readiness, failed_
 from app.help_content import get_help_topic, help_for_context, help_catalog, help_api_payload, help_owner
 from app.runtime_health import build_runtime_health
 from app.reporting import build_reporting_overview
+from app.support_bundle import (
+    build_commissioning_report, build_support_bundle, commissioning_summary,
+    environment_presence, audit_event_summary, sanitize_support_payload,
+)
 
 
 SECURE_TRANSPORT = SecureTransportConfig.from_mapping()
@@ -1560,6 +1564,75 @@ operational_diagnostics = OperationalDiagnostics(
 )
 
 
+def current_commissioning_report(diagnostics=None, *, include_evidence=False) -> dict:
+    """Compose commissioning state without extending any mutation authority."""
+    diagnostics = diagnostics or operational_diagnostics.capture()
+    try:
+        runtime_health = build_runtime_health(
+            version=app.version,
+            background_worker=background_worker,
+            reconciler=auto_reconciler,
+            incident_monitor=incident_monitor,
+            summary_delivery=summary_delivery,
+            policy_store=policy_store,
+        )
+    except Exception:
+        runtime_health = {"schema": "zen_runtime_health_v1", "ok": False, "status": "degraded"}
+    try:
+        operations = operations_monitor.readiness()
+    except Exception:
+        operations = {"ok": False, "issues": ["runtime readiness probe failed"]}
+    try:
+        transport = current_secure_transport_status()
+    except Exception:
+        transport = {"state": "unavailable", "commissioning_ready": False, "local_https": {}, "pwa": {}}
+    try:
+        push = push_delivery.snapshot()
+    except Exception:
+        push = {"worker_running": False, "subscriptions": {}}
+    pwa = status_contract(app.version)
+    report = build_commissioning_report(
+        version=app.version,
+        diagnostics=diagnostics,
+        runtime_health=runtime_health,
+        operations=operations,
+        secure_transport=transport,
+        pwa=pwa,
+        push=push,
+    )
+    if include_evidence:
+        return {
+            "commissioning": report,
+            "diagnostics": diagnostics,
+            "runtime_health": runtime_health,
+            "operations": operations,
+            "secure_transport": transport,
+            "pwa": pwa,
+            "push": push,
+        }
+    return report
+
+
+def current_support_bundle() -> tuple[bytes, dict, dict]:
+    """Create the public-safe support artefact from bounded read-only evidence."""
+    evidence = current_commissioning_report(include_evidence=True)
+    try:
+        audit_rows = policy_store.list_audit(100)
+    except Exception:
+        audit_rows = []
+    bundle, manifest = build_support_bundle(
+        version=app.version,
+        commissioning=evidence["commissioning"],
+        diagnostics=evidence["diagnostics"],
+        runtime_health=evidence["runtime_health"],
+        secure_transport=evidence["secure_transport"],
+        pwa=evidence["pwa"],
+        environment=environment_presence(),
+        audit_summary=audit_event_summary(audit_rows),
+    )
+    return bundle, manifest, evidence["commissioning"]
+
+
 def current_release_readiness() -> dict:
     """Capture the final application release gate without inventing healthy evidence."""
     try:
@@ -1916,17 +1989,26 @@ def api_operational_diagnostics(
     return operational_diagnostics.capture()
 
 
+@app.get("/api/operations/commissioning")
+def api_commissioning_report(
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    return current_commissioning_report()
+
+
 @app.get("/diagnostics", response_class=HTMLResponse)
 def diagnostics_page(
     request: Request,
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
+    diagnostics = operational_diagnostics.capture()
     return templates.TemplateResponse(
         "diagnostics.html",
         {
             "request": request,
             "user": user,
-            "report": operational_diagnostics.capture(),
+            "report": diagnostics,
+            "commissioning": current_commissioning_report(diagnostics),
         },
     )
 
@@ -1946,6 +2028,44 @@ def diagnostics_export(
         content=report,
         headers={
             "Content-Disposition": f'attachment; filename="zen-control-diagnostics-{stamp}.json"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/local/operations/support-summary")
+def support_summary(
+    user=Depends(require_role("admin", "operator")),
+):
+    report = current_commissioning_report()
+    audit(
+        "SUPPORT_SUMMARY_EXPORTED",
+        user["username"],
+        f"schema={report['schema']} overall={report['overall']} checks={len(report['checks'])}",
+    )
+    return Response(
+        content=sanitize_support_payload(commissioning_summary(report)),
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/local/operations/support-bundle")
+def support_bundle_export(
+    user=Depends(require_role("admin", "operator")),
+):
+    bundle, manifest, commissioning = current_support_bundle()
+    audit(
+        "SUPPORT_BUNDLE_EXPORTED",
+        user["username"],
+        f"schema={manifest['schema']} overall={commissioning['overall']} bytes={len(bundle)}",
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=bundle,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="zen-control-support-{stamp}.zip"',
             "Cache-Control": "no-store",
         },
     )

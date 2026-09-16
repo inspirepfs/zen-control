@@ -6,6 +6,8 @@ import subprocess
 import sys
 import threading
 import unittest
+import io
+import zipfile
 from pathlib import Path
 
 
@@ -96,6 +98,30 @@ class _AcceptanceHandler(http.server.BaseHTTPRequestHandler):
                     '<title>ZEN Control</title><a data-tab="dashboard">Dashboard</a>',
                 )
             return
+        if self.path == "/api/operations/commissioning":
+            if "zen_session=ok" not in self.headers.get("Cookie", ""):
+                self._send(401, "not authenticated")
+            else:
+                self._send(
+                    200,
+                    json.dumps({
+                        "schema": "zen_commissioning_report_v1",
+                        "overall": "blocked",
+                        "checks": [{"key": "routeros_api", "state": "unavailable"}],
+                    }),
+                    content_type="application/json",
+                )
+            return
+        if self.path == "/local/operations/support-bundle":
+            if "zen_session=ok" not in self.headers.get("Cookie", ""):
+                self._send(401, "not authenticated")
+            else:
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w") as archive:
+                    archive.writestr("manifest.json", json.dumps({"schema": "zen_support_bundle_v1"}))
+                    archive.writestr("summary.txt", "ZEN Control Commissioning\n")
+                self._send(200, buffer.getvalue(), content_type="application/zip")
+            return
         self._send(404, "not found")
 
     def do_POST(self):
@@ -174,6 +200,8 @@ class RuntimeAcceptanceScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("PASS · /login 200 rendered", result.stdout)
         self.assertIn("PASS · authenticated dashboard 200 rendered", result.stdout)
+        self.assertIn("PASS · commissioning 200 state=blocked checks=1", result.stdout)
+        self.assertIn("PASS · support bundle 200 valid-zip sanitized-contract", result.stdout)
         self.assertIn("RUNTIME ACCEPTANCE: PASS", result.stdout)
 
     def test_render_failure_blocks_acceptance(self):

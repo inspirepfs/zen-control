@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.59.0.10 — Sanitized Support Bundle & Commissioning Diagnostics
+
+- Adds a commissioning evaluator with explicit PASS, WARN, BLOCKED, UNAVAILABLE and optional NOT CONFIGURED states; missing evidence is never promoted to healthy.
+- Adds a downloadable ZIP support bundle containing commissioning state, sanitized operational diagnostics, runtime health, transport/PWA state, environment-presence counts and aggregate audit event counts.
+- Adds a defence-in-depth recursive sanitizer that removes credential/token/session/push material, strips URL queries and pseudonymizes network/identity values that reach the support boundary.
+- Deliberately excludes raw Docker/application logs, DNS/activity records, raw audit/incident detail and household device identities from the default public support artefact.
+- Adds a copyable human-readable support summary, `/api/operations/commissioning`, and an in-container `python -m app.support_cli` download path that authenticates only to localhost.
+- Keeps commissioning/support collection read-only with no RouterOS mutation or policy-write authority.
+- Application/PWA runtime remains `0.59.0`; database schema and RouterOS authority primitives are unchanged.
+
 ## v0.59.0.9 — Schedule Edit & Planner CRUD Closure
 
 - Adds in-place editing for targeted policy schedules, preserving the existing schedule identity and paused/enabled state instead of requiring delete-and-recreate.

@@ -69,6 +69,8 @@ Particularly important reports include:
 
 Never include `.env`, tunnel tokens, private keys, recovery codes, raw configuration exports, live database files or real household telemetry in an issue or pull request.
 
+The built-in v0.59.0.10 support bundle is designed for public troubleshooting and applies a second defensive redaction boundary over already-sanitized diagnostic contracts. It excludes raw logs, DNS/activity rows, raw audit/incident detail, credentials, sessions and push endpoint/key material; network/identity values that reach the boundary are pseudonymized with process-local keyed markers. Review any artefact before publication, especially after local modifications or plugins that add new diagnostic fields. Raw `docker compose logs` are **not** part of the safe bundle and must be reviewed separately before sharing.
+
 If a credential has been exposed, rotate it even if the repository audit later becomes clean. Deleting a value from the current tree does not revoke it.
 
 ## Public-source secret and depersonalization audit

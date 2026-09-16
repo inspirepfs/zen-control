@@ -57,17 +57,33 @@ For a quick post-change UI smoke, also render `/login` and an authenticated dash
 
 ## Logs and safe diagnostics
 
-Start with bounded logs:
+Use **Settings → Operations → Diagnostics** before collecting raw logs. The commissioning report distinguishes required control-plane readiness from optional integrations and uses explicit `PASS`, `WARN`, `BLOCKED`, `UNAVAILABLE` and `NOT CONFIGURED` states. Missing evidence is never converted to PASS.
+
+Admin/operator users can download a ZIP support bundle from the Diagnostics page. It contains:
+
+- commissioning decisions and remediation hints;
+- sanitized cross-component diagnostics and runtime-worker/database health;
+- secure-transport/PWA server state with identity fields redacted/pseudonymized;
+- environment **presence counts only** (never values);
+- aggregate recent audit event/severity counts (never actors/details);
+- a human-readable `summary.txt` and a manifest recording redaction counts and privacy policy.
+
+The bundle deliberately excludes raw Docker/application logs, credentials/tokens/session material, push endpoints/keys, raw device/IP/MAC identities, DNS queries, traffic records and raw audit/incident details. If a maintainer needs logs, collect them separately and review them before posting publicly:
 
 ```bash
 docker compose logs --tail=200 mikrotik-control
-docker compose logs --tail=200 telemetry-ingest
-docker compose logs --tail=200 goflow2
+docker compose logs --tail=200 traffic-ingest
+docker compose logs --tail=200 telemetry-db
 ```
 
-Service names may vary with optional profiles; `docker compose ps` is the source of truth.
+To create the same bundle from the running application container:
 
-Do not post `.env`, raw databases, RouterOS exports, tunnel tokens, recovery codes or household telemetry publicly. If sharing logs, inspect them for hostnames, addresses, usernames and notification destinations first.
+```bash
+docker compose exec -T mikrotik-control \
+  python -m app.support_cli --output /data/zen-control-support.zip
+```
+
+The CLI authenticates to `127.0.0.1` using the existing container `ADMIN_*` environment and never prints the password. If the deployment intentionally uses only `ADMIN_PASSWORD_HASH` with no `ADMIN_PASSWORD`, use the authenticated browser download instead.
 
 ## Interpreting degraded evidence
 
