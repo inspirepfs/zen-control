@@ -2,7 +2,7 @@ import ipaddress, json, os, queue, socket, sqlite3, threading, time
 from datetime import datetime, timezone
 import dns.resolver
 import psycopg
-from service_map import classify_domain, classifier_status
+from service_map import CLASSIFIER_VERSION, classify_domain, classify_record, classifier_status
 
 DB_HOST=os.getenv('TELEMETRY_DB_HOST','telemetry-db')
 DB_PORT=int(os.getenv('TELEMETRY_DB_PORT','5432'))
@@ -184,7 +184,7 @@ def transform_flow(raw):
         # household Internet accounting.
         return None
 
-    domain, service = lookup_domain(remote_ip)
+    domain, _service = lookup_domain(remote_ip)
 
     proto = str(raw.get("proto") or "")
     if proto.isdigit():
@@ -194,6 +194,12 @@ def transform_flow(raw):
             "1": "ICMP",
             "58": "ICMPv6",
         }.get(proto, proto)
+
+    destination_port = int(raw.get("dst_port") or 0)
+    classification = classify_record({
+        "dns": {"domain": domain},
+        "flow": {"protocol": proto, "destination_port": destination_port},
+    })
 
     return {
         "event_time": ns_to_dt(raw.get("time_received_ns")),
@@ -206,7 +212,7 @@ def transform_flow(raw):
         "src_ip": src,
         "dst_ip": dst,
         "src_port": int(raw.get("src_port") or 0),
-        "dst_port": int(raw.get("dst_port") or 0),
+        "dst_port": destination_port,
         "protocol": proto,
         "bytes": int(raw.get("bytes") or 0),
         "packets": int(raw.get("packets") or 0),
@@ -215,7 +221,11 @@ def transform_flow(raw):
         "in_if": int(raw.get("in_if") or 0),
         "out_if": int(raw.get("out_if") or 0),
         "domain": domain,
-        "service": service,
+        "category": classification["category"],
+        "service": classification["service"],
+        "confidence": classification["confidence"],
+        "classifier_evidence": json.dumps(classification["evidence"], separators=(",", ":")),
+        "classifier_version": CLASSIFIER_VERSION,
     }
 
 def flow_reader():
@@ -284,6 +294,20 @@ def flow_reader():
 def bucket5(dt):
     return dt.replace(minute=(dt.minute//5)*5,second=0,microsecond=0)
 
+
+FLOW_RAW_FIELDS = (
+    'event_time', 'flow_start', 'flow_end', 'sampler_address', 'client_ip',
+    'remote_ip', 'direction', 'src_ip', 'dst_ip', 'src_port', 'dst_port',
+    'protocol', 'bytes', 'packets', 'src_mac', 'dst_mac', 'in_if', 'out_if',
+    'domain', 'category', 'service', 'confidence', 'classifier_evidence',
+    'classifier_version',
+)
+
+
+def flow_raw_values(row):
+    """Return the persisted flow sample in the schema's column order."""
+    return tuple(row[field] for field in FLOW_RAW_FIELDS)
+
 def flow_writer():
     batch=[]; last=time.time()
     while True:
@@ -293,7 +317,7 @@ def flow_writer():
             try:
                 raw=[]; agg5={}; device_daily={}; service_daily={}
                 for row in batch:
-                    raw.append(tuple(row[k] for k in ('event_time','flow_start','flow_end','sampler_address','client_ip','remote_ip','direction','src_ip','dst_ip','src_port','dst_port','protocol','bytes','packets','src_mac','dst_mac','in_if','out_if','domain','service')))
+                    raw.append(flow_raw_values(row))
                     key=(bucket5(row['event_time']),row['client_ip'],row['direction'],row['service'],row['remote_ip'],row['domain'])
                     acc=agg5.setdefault(key,[0,0,0]); acc[0]+=row['bytes']; acc[1]+=row['packets']; acc[2]+=1
                     key=(row['event_time'].date(),row['client_ip'],row['direction'])
@@ -302,7 +326,7 @@ def flow_writer():
                     acc=service_daily.setdefault(key,[0,0,0]); acc[0]+=row['bytes']; acc[1]+=row['packets']; acc[2]+=1
                 with db_connect() as conn:
                     with conn.cursor() as cur:
-                        cur.executemany('INSERT INTO flows_raw(event_time,flow_start,flow_end,sampler_address,client_ip,remote_ip,direction,src_ip,dst_ip,src_port,dst_port,protocol,bytes,packets,src_mac,dst_mac,in_if,out_if,domain,service) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',raw)
+                        cur.executemany('INSERT INTO flows_raw(event_time,flow_start,flow_end,sampler_address,client_ip,remote_ip,direction,src_ip,dst_ip,src_port,dst_port,protocol,bytes,packets,src_mac,dst_mac,in_if,out_if,domain,category,service,confidence,classifier_evidence,classifier_version) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',raw)
                         cur.executemany('INSERT INTO flow_5m(bucket,client_ip,direction,service,remote_ip,domain,bytes,packets,flows) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(bucket,client_ip,direction,service,remote_ip,domain) DO UPDATE SET bytes=flow_5m.bytes+EXCLUDED.bytes,packets=flow_5m.packets+EXCLUDED.packets,flows=flow_5m.flows+EXCLUDED.flows',[(*k,*v) for k,v in agg5.items()])
                         cur.executemany('INSERT INTO device_daily(day,client_ip,direction,bytes,packets,flows) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(day,client_ip,direction) DO UPDATE SET bytes=device_daily.bytes+EXCLUDED.bytes,packets=device_daily.packets+EXCLUDED.packets,flows=device_daily.flows+EXCLUDED.flows',[(*k,*v) for k,v in device_daily.items()])
                         cur.executemany('INSERT INTO service_daily(day,client_ip,service,bytes,packets,flows) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(day,client_ip,service) DO UPDATE SET bytes=service_daily.bytes+EXCLUDED.bytes,packets=service_daily.packets+EXCLUDED.packets,flows=service_daily.flows+EXCLUDED.flows',[(*k,*v) for k,v in service_daily.items()])

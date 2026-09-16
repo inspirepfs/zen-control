@@ -37,6 +37,11 @@ CLASSIFICATION_PRECEDENCE = (
     "fallback",
 )
 
+# This identifies the stable classifier result contract persisted with each
+# traffic sample.  It changes only when that contract or its resolution logic
+# changes incompatibly, rather than when catalogue contents are refreshed.
+CLASSIFIER_VERSION = "zen_service_classifier_v1"
+
 _BUILTIN_METADATA = {
     "youtube": {"category": "video", "address_lists": ("Detected_YouTube", "Detected_GoogleVideo")},
     "netflix": {"category": "video", "address_lists": ("Detected_Netflix",)},

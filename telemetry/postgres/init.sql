@@ -8,8 +8,18 @@ CREATE TABLE IF NOT EXISTS flows_raw (
  bytes bigint NOT NULL DEFAULT 0, packets bigint NOT NULL DEFAULT 0,
  src_mac text NOT NULL DEFAULT '', dst_mac text NOT NULL DEFAULT '',
  in_if integer NOT NULL DEFAULT 0, out_if integer NOT NULL DEFAULT 0,
- domain text NOT NULL DEFAULT '', service text NOT NULL DEFAULT ''
+ domain text NOT NULL DEFAULT '',
+ category text NOT NULL DEFAULT 'unknown', service text NOT NULL DEFAULT 'Unknown',
+ confidence text NOT NULL DEFAULT 'none',
+ classifier_evidence jsonb NOT NULL DEFAULT '{"source":"fallback","matched_value":null,"precedence":"fallback"}'::jsonb,
+ classifier_version text NOT NULL DEFAULT 'unknown'
 );
+-- Existing installations retain historical rows; their absent classification
+-- metadata is represented by the same explicit unknown values as above.
+ALTER TABLE flows_raw ADD COLUMN IF NOT EXISTS category text NOT NULL DEFAULT 'unknown';
+ALTER TABLE flows_raw ADD COLUMN IF NOT EXISTS confidence text NOT NULL DEFAULT 'none';
+ALTER TABLE flows_raw ADD COLUMN IF NOT EXISTS classifier_evidence jsonb NOT NULL DEFAULT '{"source":"fallback","matched_value":null,"precedence":"fallback"}'::jsonb;
+ALTER TABLE flows_raw ADD COLUMN IF NOT EXISTS classifier_version text NOT NULL DEFAULT 'unknown';
 CREATE INDEX IF NOT EXISTS flows_raw_event_brin ON flows_raw USING brin(event_time);
 CREATE INDEX IF NOT EXISTS flows_raw_client_time ON flows_raw(client_ip,event_time DESC);
 
