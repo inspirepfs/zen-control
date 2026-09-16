@@ -58,6 +58,8 @@ The v0.59.0.4 → v0.59.0.5 incident is the reason this is explicit: health endp
 
 GitHub Quality now enforces this automatically with `scripts/runtime_acceptance.py` in the `runtime-container-smoke` job. The CI smoke uses synthetic credentials and an unreachable loopback RouterOS endpoint, proves `/health/live`, `/health/runtime`, `/login` and an authenticated dashboard render, and intentionally does not treat RouterOS readiness as part of this HTML/runtime compatibility gate.
 
+Fresh-install/bootstrap changes are also covered by the independent `fresh-install-commissioning` job. That job owns a throw-away Compose project, removes its volumes, boots ZEN twice from empty state and requires the fresh database/default-state plus commissioning fail-closed contracts to repeat. `scripts/fresh_install_acceptance.py` is intentionally destructive; run it only on an isolated CI runner or disposable development host and provide an exact `--confirm-destroy-project` value matching the throw-away project name.
+
 ## Documentation expectations
 
 A user-visible or operator-visible change should update the relevant public document in the same change. Prefer stable operational language over development-slice shorthand. New environment variables must be reflected in `.env.example` and the environment contract; RouterOS assumptions belong in `routeros/`; release/process changes belong in `docs/PUBLIC_RELEASE.md`.

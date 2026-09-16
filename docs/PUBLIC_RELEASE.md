@@ -68,6 +68,14 @@ After a release rebuilds `mikrotik-control`, source/unit tests are not enough. V
 
 This gate exists because v0.59.0.4 passed source tests and health routes while Starlette 1.6.0 had removed the legacy `TemplateResponse(name, context)` signature used by ZEN. v0.59.0.5 fixed the rendered-HTML compatibility boundary. Future framework/dependency changes must prove both API health **and actual HTML rendering**.
 
+## Fresh-install / first-run acceptance
+
+GitHub Quality includes an independent `fresh-install-commissioning` job in addition to the ordinary rebuilt-runtime smoke. It must prove that the current release can boot from truly empty throw-away Docker volumes, initialize the current SQLite schema/default catalogue, authenticate and render through the real built container, expose commissioning/support contracts, destroy the data volumes and repeat the same bootstrap a second time.
+
+This gate is **destructive by design**. `scripts/fresh_install_acceptance.py` refuses known production/default project names and requires exact project-name confirmation before `docker compose down -v`. It belongs only on an isolated CI runner or disposable development host. It must never be repurposed as a live-install repair command.
+
+The CI RouterOS target remains unreachable loopback. Fresh commissioning is expected to fail closed: local database/runtime evidence must PASS while RouterOS connectivity and security/authority remain BLOCKED or UNAVAILABLE. A fresh-install test must never manufacture RouterOS readiness or gain mutation authority.
+
 ## RouterOS final check
 
 Before relying on a release as an enforcement system:
@@ -100,7 +108,8 @@ The device-local diagnostics distinguish server/browser prerequisites from the b
 5. Verify the rebuilt runtime, including rendered HTML when the app container changed.
 6. Review public-source audit warnings explicitly.
 7. Publish a new immutable maintenance tag/release; do not move a previously public tag.
-8. For a release that changes public behaviour or setup, perform a fresh-clone/read-the-docs smoke from the public repository.
+8. Require the automated fresh-install/first-run acceptance to pass on its isolated throw-away Compose project.
+9. For a release that changes public behaviour or setup, perform a fresh-clone/read-the-docs smoke from the public repository.
 
 ## Release evidence to retain
 

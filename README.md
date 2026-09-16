@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current maintenance release: **v0.59.0.10**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.10 adds commissioning diagnostics and a defence-in-depth sanitized support bundle; v0.59.0.9 closed targeted schedule-planner CRUD with in-place editing.
+> Current maintenance release: **v0.59.0.11**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.11 adds destructive fresh-install/first-run commissioning acceptance on isolated CI runners; v0.59.0.10 added commissioning diagnostics and a defence-in-depth sanitized support bundle.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -280,6 +280,23 @@ docker compose exec -T mikrotik-control python -m app.support_cli --output /data
 ```
 
 The CLI authenticates only to `127.0.0.1` using the container's existing `ADMIN_*` environment.
+
+### Fresh-install acceptance
+
+GitHub Quality also runs an independent **fresh-install commissioning** job. It creates a throw-away Compose project from empty volumes, boots PostgreSQL and a rebuilt ZEN container, performs the authenticated runtime/support acceptance, verifies the brand-new SQLite bootstrap/default-state contract, destroys the volumes and repeats the process. RouterOS points only to unreachable loopback, so the expected first-run commissioning result is safely **BLOCKED** until real RouterOS authority is prepared.
+
+The harness is deliberately destructive and must never be aimed at a production project. On an isolated CI runner or disposable development host it can be run with an explicitly confirmed throw-away project name:
+
+```bash
+python3 scripts/fresh_install_acceptance.py \
+  --project-name zen-fresh-install-test \
+  --confirm-destroy-project zen-fresh-install-test \
+  --expect-version 0.59.0 \
+  --admin-user "$ADMIN_USER" \
+  --admin-password-env ZEN_RUNTIME_SMOKE_PASSWORD
+```
+
+The command uses `docker compose down -v` for the confirmed throw-away project and therefore is **not** a production-host commissioning command.
 
 ## Development and testing
 

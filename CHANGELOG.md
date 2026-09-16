@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.59.0.11 — Fresh-Install & First-Run Commissioning Acceptance
+
+- Adds `scripts/fresh_install_acceptance.py`, a destructive synthetic acceptance harness that proves ZEN can bootstrap from empty Docker volumes rather than relying on residue from an existing installation.
+- Runs two independent fresh-install cycles: each starts from an empty Compose project, brings up a fresh telemetry database and rebuilt ZEN container, performs the full authenticated runtime/support acceptance, validates the fresh SQLite schema/default-state contract, then proves the previous data-volume marker was removed before the next cycle.
+- Requires exact destructive project-name confirmation and rejects production-like/default project names; the harness is intended only for isolated CI runners or disposable development hosts.
+- Verifies fresh operator-owned policy tables are empty while built-in services, aggregate groups, bandwidth presets and default application settings are seeded correctly.
+- Proves first-run commissioning fails closed while synthetic RouterOS authority is deliberately unavailable: policy database/runtime workers must PASS while RouterOS connectivity/security authority remain BLOCKED or UNAVAILABLE.
+- Extends GitHub Quality with an independent `fresh-install-commissioning` job using loopback-only synthetic RouterOS credentials, bounded logs and guaranteed volume teardown.
+- Application/PWA runtime remains `0.59.0`; database schema, RouterOS authority primitives and policy semantics are unchanged.
+
 ## v0.59.0.10 — Sanitized Support Bundle & Commissioning Diagnostics
 
 - Adds a commissioning evaluator with explicit PASS, WARN, BLOCKED, UNAVAILABLE and optional NOT CONFIGURED states; missing evidence is never promoted to healthy.

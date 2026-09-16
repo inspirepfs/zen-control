@@ -218,7 +218,7 @@ class SupportBundleIntegrationContractTests(unittest.TestCase):
         self.assertIn("Support bundle", self.index)
         self.assertIn("python -m app.support_cli", self.readme)
         self.assertIn("127.0.0.1", self.cli)
-        self.assertIn("Current maintenance release: **v0.59.0.10**", self.readme)
+        self.assertRegex(self.readme, r"Current maintenance release: \*\*v0\.59\.0\.\d+\*\*")
         self.assertIn("## v0.59.0.10 — Sanitized Support Bundle & Commissioning Diagnostics", self.changelog)
         self.assertIn("PASS / WARN / BLOCKED / UNAVAILABLE", self.help)
 

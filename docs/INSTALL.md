@@ -1,6 +1,6 @@
 # Installation and Commissioning
 
-This document describes the supported Docker Compose deployment from an empty host through first operational acceptance. ZEN is not a one-click appliance; RouterOS authority must be understood and prepared deliberately. The application currently reports version `0.59.0`; maintenance tags such as `v0.59.0.6` identify qualified fixes/documentation on that runtime line.
+This document describes the supported Docker Compose deployment from an empty host through first operational acceptance. ZEN is not a one-click appliance; RouterOS authority must be understood and prepared deliberately. The application currently reports version `0.59.0`; maintenance tags such as `v0.59.0.11` identify qualified fixes/acceptance work on that runtime line.
 
 ## 1. Host prerequisites
 
@@ -223,6 +223,14 @@ Before relying on automatic enforcement:
 8. Render both `/login` and an authenticated dashboard page after any framework/dependency change; health APIs alone do not prove the Jinja/UI path is compatible.
 
 ### First-run acceptance checklist
+
+### Automated fresh-install proof
+
+Every qualified release now runs an isolated destructive fresh-install acceptance in GitHub Actions. The harness starts from a Compose project with no retained containers, networks or volumes, creates the policy database from scratch, proves built-in/default state is seeded while operator-owned policy state is empty, authenticates through the real container, exercises commissioning/support export and repeats the entire cycle after deleting the first data volumes.
+
+This is a release-validation tool, not a production repair command. `scripts/fresh_install_acceptance.py` invokes `docker compose down -v` for the explicitly confirmed throw-away project. Run it only on an **isolated CI runner or disposable development host**, never against the live ZEN project or on a host where the fixed Compose container names would conflict with production.
+
+The synthetic acceptance intentionally has no RouterOS authority. A correct first-run result therefore keeps RouterOS connectivity/security authority `BLOCKED`/`UNAVAILABLE` while proving the local policy database and runtime workers are healthy. Real commissioning continues with the RouterOS checks below.
 
 A new installation is not commissioned merely because containers are running. Before relying on it, confirm:
 
