@@ -10,7 +10,7 @@ RouterOS-api==0.21.0
 psycopg[binary]>=3.2,<4
 
 # R4 schedule timezone support
-tzdata>=2025.2
+tzdata>=2026.4
 
 # R14 parent authentication / encrypted TOTP enrollment
 cryptography>=50.0.1,<51
