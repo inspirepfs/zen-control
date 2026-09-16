@@ -7,7 +7,7 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 itsdangerous==2.2.0
 RouterOS-api==0.21.0
-psycopg[binary]>=3.2,<4
+psycopg[binary]>=3.3.5,<4
 
 # R4 schedule timezone support
 tzdata>=2025.2
