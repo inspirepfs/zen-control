@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -28,6 +29,7 @@ IDEAS = RALPH / "ideas.md"
 JOURNAL = RALPH / "journal.md"
 POLICY = RALPH / "policy.md"
 LIVE = RALPH / "live.log"
+CONTEXT = RALPH / "context.json"
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
@@ -79,8 +81,18 @@ RESULT_SCHEMA = {
         "ideas": {"type": "array", "items": {"type": "string"}},
         "blockers": {"type": "array", "items": {"type": "string"}},
         "needs_human": {"type": "boolean"},
+        "context": {
+            "type": "object",
+            "properties": {
+                "relevant_files": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+                "accepted_findings": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+                "files_inspected": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
+            },
+            "required": ["relevant_files", "accepted_findings", "files_inspected"],
+            "additionalProperties": False,
+        },
     },
-    "required": ["summary", "ideas", "blockers", "needs_human"],
+    "required": ["summary", "ideas", "blockers", "needs_human", "context"],
     "additionalProperties": False,
 }
 
@@ -158,6 +170,134 @@ def save_state(state: dict) -> None:
     os.replace(tmp, STATE)
 
 
+def default_context() -> dict:
+    return {
+        "schema": "zen_ralph_lite_context_v1",
+        "plan_hash": None,
+        "last_step": None,
+        "last_result": None,
+        "summary": "",
+        "changed_files": [],
+        "relevant_files": [],
+        "accepted_findings": [],
+        "updated_at": utc_now(),
+    }
+
+
+def load_context() -> dict:
+    if not CONTEXT.exists():
+        return default_context()
+    try:
+        data = json.loads(CONTEXT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_context()
+    return data if isinstance(data, dict) and data.get("schema") == "zen_ralph_lite_context_v1" else default_context()
+
+
+def save_context(context: dict) -> None:
+    context = dict(context)
+    context["schema"] = "zen_ralph_lite_context_v1"
+    context["updated_at"] = utc_now()
+    CONTEXT.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONTEXT.with_suffix(".tmp")
+    tmp.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, CONTEXT)
+
+
+def _context_path(value: str) -> str | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        candidate = Path(value)
+        if candidate.is_absolute():
+            candidate = candidate.relative_to(ROOT)
+    except ValueError:
+        return None
+    rel = candidate.as_posix().lstrip("./")
+    if not rel or rel == ".ralph" or rel.startswith(".ralph/") or is_protected_path(rel):
+        return None
+    return rel
+
+
+def context_handoff(state: dict) -> dict:
+    context = load_context()
+    if context.get("plan_hash") not in {None, state.get("plan_hash")}:
+        return default_context()
+    return {
+        "last_step": context.get("last_step"),
+        "last_result": context.get("last_result"),
+        "summary": str(context.get("summary") or "")[:1200],
+        "changed_files": list(context.get("changed_files") or [])[:12],
+        "relevant_files": list(context.get("relevant_files") or [])[:8],
+        "accepted_findings": list(context.get("accepted_findings") or [])[:8],
+    }
+
+
+def update_context_after_pass(state: dict, step: dict, result: dict, changed: Iterable[str]) -> None:
+    supplied = result.get("context") if isinstance(result.get("context"), dict) else {}
+    prior = context_handoff(state)
+    changed_files = [path for raw in changed if (path := _context_path(raw))]
+    relevant: list[str] = []
+    for raw in [*changed_files, *(supplied.get("relevant_files") or []), *(prior.get("relevant_files") or [])]:
+        path = _context_path(raw)
+        if path and path not in relevant:
+            relevant.append(path)
+        if len(relevant) >= 8:
+            break
+    findings: list[str] = []
+    for raw in [*(supplied.get("accepted_findings") or []), *(prior.get("accepted_findings") or [])]:
+        text = " ".join(str(raw).split())[:500]
+        if text and text not in findings:
+            findings.append(text)
+        if len(findings) >= 8:
+            break
+    save_context({
+        "plan_hash": state.get("plan_hash"),
+        "last_step": step.get("id"),
+        "last_result": "PASS",
+        "summary": " ".join(str(result.get("summary") or "").split())[:1200],
+        "changed_files": changed_files[:12],
+        "relevant_files": relevant,
+        "accepted_findings": findings,
+    })
+
+
+def bootstrap_context_from_journal(state: dict) -> bool:
+    """Seed compact handoff state from the latest successful pre-v0.1.4 loop."""
+    if int(state.get("current_step") or 1) <= 1 or not JOURNAL.exists():
+        return False
+    current = load_context()
+    if current.get("last_step") is not None:
+        return False
+    text = JOURNAL.read_text(encoding="utf-8")
+    blocks = re.findall(r"(?ms)^## Loop .*?(?=^## |\Z)", text)
+    for block_text in reversed(blocks):
+        if "- Result: PASS" not in block_text:
+            continue
+        def field(name: str) -> str:
+            match = re.search(rf"(?m)^- {re.escape(name)}: (.*)$", block_text)
+            return match.group(1).strip() if match else ""
+        try:
+            step_no = int(field("Plan step"))
+        except ValueError:
+            continue
+        raw_files = field("Files changed")
+        changed_files = [] if raw_files in {"", "-"} else [p.strip() for p in raw_files.split(",") if _context_path(p.strip())]
+        summary = field("Summary")
+        save_context({
+            "plan_hash": state.get("plan_hash"),
+            "last_step": step_no,
+            "last_result": "PASS",
+            "summary": summary[:1200],
+            "changed_files": changed_files[:12],
+            "relevant_files": changed_files[:8],
+            "accepted_findings": [summary[:500]] if summary and summary != "-" else [],
+        })
+        return True
+    return False
+
+
 def init_files() -> None:
     RALPH.mkdir(parents=True, exist_ok=True)
     if not STATE.exists():
@@ -170,18 +310,39 @@ def init_files() -> None:
         JOURNAL.write_text("# RALPH-Lite Loop Journal\n\n", encoding="utf-8")
     if not LIVE.exists():
         LIVE.write_text("# RALPH-Lite Live Trace\n", encoding="utf-8")
+    if not CONTEXT.exists():
+        save_context(default_context())
     if not POLICY.exists():
         raise RuntimeError("missing tracked authority file .ralph/policy.md")
+    bootstrap_context_from_journal(load_state())
 
 
-def append_journal(loop_no: int, step_no: int, phase: str, result: str, *, summary: str = "", files: Iterable[str] = (), gates: Iterable[str] = (), fingerprint: str | None = None, repair: int = 0, ideas: Iterable[str] = (), next_action: str = "", change_class: str = "control-event") -> None:
+def append_journal(loop_no: int, step_no: int, phase: str, result: str, *, summary: str = "", files: Iterable[str] = (), gates: Iterable[str] = (), fingerprint: str | None = None, repair: int = 0, ideas: Iterable[str] = (), next_action: str = "", change_class: str = "control-event", stats: dict | None = None) -> None:
+    ideas = list(ideas)
+    stats = dict(stats or {})
+    gate_times = stats.get("gate_durations") or {}
+    input_tokens = int(stats.get("input_tokens") or 0)
+    cached_tokens = int(stats.get("cached_input_tokens") or 0)
+    noncached = max(0, input_tokens - cached_tokens)
+    cache_ratio = (cached_tokens / input_tokens * 100.0) if input_tokens else 0.0
     lines = [
         f"## Loop {loop_no:04d} — {utc_now()}", "",
         f"- Plan step: {step_no}", f"- Phase: {phase}", f"- Result: {result}", f"- Change class: {change_class}", f"- Repair attempt: {repair}",
         f"- Failure fingerprint: `{fingerprint or '-'}`", f"- Files changed: {', '.join(files) if files else '-'}",
         f"- Gates: {'; '.join(gates) if gates else '-'}", f"- Summary: {summary or '-'}",
-        f"- Ideas captured: {len(list(ideas))}", f"- Next action: {next_action or '-'}", "",
+        f"- Ideas captured: {len(ideas)}", f"- Next action: {next_action or '-'}",
     ]
+    if stats:
+        lines += [
+            f"- Duration: {float(stats.get('duration_seconds') or 0):.1f}s",
+            f"- Codex duration: {float(stats.get('codex_seconds') or 0):.1f}s",
+            f"- Commands executed: {int(stats.get('commands_executed') or 0)}",
+            f"- Files inspected (reported): {int(stats.get('files_inspected') or 0)}",
+            f"- Tokens: input={input_tokens} cached={cached_tokens} non-cached={noncached} output={int(stats.get('output_tokens') or 0)} reasoning={int(stats.get('reasoning_output_tokens') or 0)} cache={cache_ratio:.1f}%",
+            f"- Gate durations: {'; '.join(f'{name}={seconds:.1f}s' for name, seconds in gate_times.items()) if gate_times else '-'}",
+            f"- First pass: {'yes' if result == 'PASS' and repair == 0 else 'no'}",
+        ]
+    lines.append("")
     with JOURNAL.open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
 
@@ -291,7 +452,7 @@ def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
 
 def authority_snapshot() -> dict[Path, bytes | None]:
     paths = (
-        STATE, PLAN, IDEAS, JOURNAL, POLICY,
+        STATE, PLAN, IDEAS, JOURNAL, POLICY, CONTEXT,
         ROOT / ".gitignore", ROOT / "scripts" / "ralph.py",
         ROOT / "tests" / "test_ralph_lite.py", ROOT / "docs" / "RALPH-LITE.md",
     )
@@ -398,12 +559,34 @@ def run_process(args: list[str], *, cwd: Path = ROOT, input_text: str | None = N
     return subprocess.run(args, cwd=cwd, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
 
-def stream_codex_process(args: list[str]) -> tuple[int, str]:
+def empty_codex_metrics() -> dict:
+    return {
+        "commands_executed": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+
+
+def update_codex_metrics(metrics: dict, event: dict) -> None:
+    event_type = str(event.get("type") or "")
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    if event_type == "item.completed" and str(item.get("type") or "") == "command_execution":
+        metrics["commands_executed"] = int(metrics.get("commands_executed") or 0) + 1
+    if event_type == "turn.completed":
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"):
+            metrics[key] = int(usage.get(key) or 0)
+
+
+def stream_codex_process(args: list[str]) -> tuple[int, str, dict]:
     """Run Codex while rendering its JSONL event stream for the operator."""
     proc = subprocess.Popen(
         args, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
     )
     captured: list[str] = []
+    metrics = empty_codex_metrics()
     assert proc.stdout is not None
     for raw in proc.stdout:
         captured.append(raw)
@@ -416,10 +599,11 @@ def stream_codex_process(args: list[str]) -> tuple[int, str]:
             live_write(_clip(stripped, 800), "CODEX")
             continue
         if isinstance(event, dict):
+            update_codex_metrics(metrics, event)
             for category, message in codex_event_messages(event):
                 if message:
                     live_write(message, category)
-    return proc.wait(), "".join(captured)
+    return proc.wait(), "".join(captured), metrics
 
 
 def is_bwrap_bootstrap_failure(output: str) -> bool:
@@ -435,62 +619,40 @@ def is_bwrap_bootstrap_failure(output: str) -> bool:
     )
 
 
-def sandbox_prefix_from_preflights(
-    default_returncode: int,
-    default_output: str,
-    legacy_returncode: int | None = None,
-    legacy_output: str = "",
-) -> list[str]:
-    """Choose Codex's sandbox backend without spending a model turn."""
-    default_bwrap = is_bwrap_bootstrap_failure(default_output)
-    if default_returncode == 0 and not default_bwrap:
+class EnvironmentBlocked(RuntimeError):
+    """Environment prerequisite failed; metrics are retained if a turn had already started."""
+
+    def __init__(self, message: str, metrics: dict | None = None):
+        super().__init__(message)
+        self.metrics = dict(metrics or {})
+
+
+def sandbox_prefix_from_preflights(default_returncode: int, default_output: str) -> list[str]:
+    """Accept only the supported default sandbox backend for workspace-write."""
+    if default_returncode == 0 and not is_bwrap_bootstrap_failure(default_output):
         return ["codex"]
-    if not default_bwrap:
-        raise RuntimeError(
-            f"Codex sandbox preflight failed ({default_returncode}) without a recognised "
-            f"bubblewrap bootstrap error: {default_output[-1200:]}"
-        )
-    if legacy_returncode == 0 and not is_bwrap_bootstrap_failure(legacy_output):
-        return ["codex", "--enable", "use_legacy_landlock"]
-    raise RuntimeError(
-        "Codex bubblewrap sandbox is unavailable and the legacy Landlock preflight also failed: "
-        + legacy_output[-1200:]
+    detail = default_output[-1200:] or f"exit={default_returncode}"
+    raise EnvironmentBlocked(
+        "Codex default Linux sandbox preflight failed; fix the host sandbox prerequisites before running RALPH: "
+        + detail
     )
 
 
 def codex_command_prefix() -> list[str]:
-    """Return a process-local Codex prefix after a zero-model sandbox preflight."""
+    """Return the process-local Codex prefix after a zero-model sandbox preflight."""
     global _CODEX_PREFIX
     if _CODEX_PREFIX is not None:
         return list(_CODEX_PREFIX)
     if shutil.which("codex") is None:
-        raise RuntimeError("codex CLI is not installed or not on PATH")
+        raise EnvironmentBlocked("codex CLI is not installed or not on PATH")
 
     default = run_process(["codex", "sandbox", "--", "/bin/true"])
-    if default.returncode == 0 and not is_bwrap_bootstrap_failure(default.stdout):
-        _CODEX_PREFIX = ["codex"]
-        live_write("sandbox preflight=PASS backend=default", "SANDBOX")
-        return list(_CODEX_PREFIX)
-
-    if not is_bwrap_bootstrap_failure(default.stdout):
-        raise RuntimeError(
-            f"Codex sandbox preflight failed ({default.returncode}) without a recognised "
-            f"bubblewrap bootstrap error: {default.stdout[-1200:]}"
-        )
-
-    live_write("default bubblewrap preflight blocked; testing legacy Landlock", "SANDBOX")
-    legacy = run_process([
-        "codex", "--enable", "use_legacy_landlock", "sandbox", "--", "/bin/true",
-    ])
-    _CODEX_PREFIX = sandbox_prefix_from_preflights(
-        default.returncode, default.stdout, legacy.returncode, legacy.stdout,
-    )
-    live_write("sandbox preflight=PASS backend=legacy-landlock", "SANDBOX")
+    _CODEX_PREFIX = sandbox_prefix_from_preflights(default.returncode, default.stdout)
+    live_write("sandbox preflight=PASS backend=default", "SANDBOX")
     return list(_CODEX_PREFIX)
 
 
 def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex") -> dict:
-    global _CODEX_PREFIX
     prefix = codex_command_prefix()
     with tempfile.TemporaryDirectory(prefix="ralph-lite-") as temp_dir:
         schema_path = Path(temp_dir) / "schema.json"
@@ -500,27 +662,17 @@ def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex"
             *prefix, "exec", "--ephemeral", "--json", "--sandbox", sandbox,
             "--output-schema", str(schema_path), "-o", str(output_path), prompt,
         ]
-        backend = "legacy-landlock" if "use_legacy_landlock" in prefix else "default"
-        live_write(f"{context} · sandbox={sandbox} backend={backend}", "CODEX")
-        returncode, output = stream_codex_process(command)
+        live_write(f"{context} · sandbox={sandbox} backend=default", "CODEX")
+        started = time.monotonic()
+        returncode, output, metrics = stream_codex_process(command)
+        metrics["codex_seconds"] = time.monotonic() - started
 
-        # Some Codex versions can finish the outer exec successfully even when
-        # every inner command was rejected by bubblewrap. Detect the sandbox
-        # signature in the JSONL stream regardless of the outer return code.
         if is_bwrap_bootstrap_failure(output):
-            if "use_legacy_landlock" in prefix:
-                raise RuntimeError("legacy Landlock Codex invocation still reported a bubblewrap bootstrap failure")
-            live_write("bubblewrap failed inside Codex turn; retrying same invocation with legacy Landlock", "SANDBOX")
-            _CODEX_PREFIX = ["codex", "--enable", "use_legacy_landlock"]
-            output_path.unlink(missing_ok=True)
-            fallback = [
-                *_CODEX_PREFIX, "exec", "--ephemeral", "--json", "--sandbox", sandbox,
-                "--output-schema", str(schema_path), "-o", str(output_path), prompt,
-            ]
-            returncode, output = stream_codex_process(fallback)
-            if is_bwrap_bootstrap_failure(output):
-                raise RuntimeError("legacy Landlock fallback also reported a bubblewrap bootstrap failure")
-
+            raise EnvironmentBlocked(
+                "Codex default sandbox failed inside the model turn; automatic legacy fallback is disabled: "
+                + normalize_failure(output)[-1200:],
+                metrics=metrics,
+            )
         if returncode != 0:
             raise RuntimeError(f"codex exec failed ({returncode}):\n{output[-6000:]}")
         try:
@@ -529,6 +681,8 @@ def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex"
             raise RuntimeError(f"codex returned invalid structured output: {exc}") from exc
         if isinstance(result, dict) and result.get("summary"):
             live_write(_clip(result["summary"], 800), "SUMMARY")
+        if isinstance(result, dict):
+            result["_ralph_metrics"] = metrics
         return result
 
 
@@ -541,19 +695,35 @@ def qualification_gates() -> list[tuple[str, list[str]]]:
     ]
 
 
-def run_gates() -> tuple[bool, list[str], str | None, str]:
+def run_gates() -> tuple[bool, list[str], str | None, str, dict[str, float]]:
     gate_log: list[str] = []
+    durations: dict[str, float] = {}
     for name, command in qualification_gates():
         live_write(f"running {name}", "GATE")
+        started = time.monotonic()
         proc = run_process(command)
+        durations[name] = time.monotonic() - started
         outcome = "PASS" if proc.returncode == 0 else "FAIL"
         gate_log.append(f"{name}={outcome}")
-        live_write(f"{name}={outcome}", "GATE")
+        live_write(f"{name}={outcome} duration={durations[name]:.1f}s", "GATE")
         if proc.returncode != 0:
             fp = failure_fingerprint(name, proc.stdout, proc.returncode)
             live_write(f"{name} failure fingerprint={fp}", "FAIL")
-            return False, gate_log, fp, proc.stdout[-12000:]
-    return True, gate_log, None, ""
+            return False, gate_log, fp, proc.stdout[-12000:], durations
+    return True, gate_log, None, "", durations
+
+
+def loop_stats(loop_started: float, result: dict | None = None, *, gate_durations: dict[str, float] | None = None, repair: int = 0) -> dict:
+    result = result if isinstance(result, dict) else {}
+    metrics = dict(result.get("_ralph_metrics") or {})
+    reported = result.get("context") if isinstance(result.get("context"), dict) else {}
+    metrics.update({
+        "duration_seconds": time.monotonic() - loop_started,
+        "gate_durations": dict(gate_durations or {}),
+        "files_inspected": len(list(reported.get("files_inspected") or [])),
+        "repair": repair,
+    })
+    return metrics
 
 
 def plan_prompt(goal: str) -> str:
@@ -561,6 +731,7 @@ def plan_prompt(goal: str) -> str:
 Goal: {goal}
 Return exactly 5-10 ordered, concrete implementation steps. Keep steps small enough to implement and qualify independently.
 For each step choose test_change_policy: none, add-only, or modify. Prefer add-only; use modify only when modifying existing tests is genuinely required.
+Use targeted symbol/range reads instead of broad repository ingestion. Avoid reading docs, README, CHANGELOG, or Git history unless directly needed for the goal.
 Do not execute or edit anything. Respect .ralph/policy.md. Put discovered nice-to-have work into later plan steps only if it directly serves the goal; otherwise it belongs in the ideas bucket during execution.
 """
 
@@ -569,6 +740,7 @@ def step_prompt(state: dict, step: dict, repair_fp: str | None, repair_no: int) 
     repair_text = ""
     if repair_fp:
         repair_text = f"\nThis is repair attempt {repair_no} for failure fingerprint {repair_fp}. Fix the failure without weakening qualification."
+    prior = context_handoff(state)
     return f"""Execute exactly ONE approved RALPH-Lite plan step in ZEN Control.
 Approved plan hash: {state['plan_hash']}
 Step {step['id']}: {step['title']}
@@ -576,6 +748,18 @@ Objective: {step['objective']}
 Acceptance: {json.dumps(step['acceptance'])}
 Test-change policy: {step['test_change_policy']}
 {repair_text}
+
+Compact handoff from the previous successful loop:
+{json.dumps(prior, separators=(',', ':'))}
+
+CONTEXT-EFFICIENCY RULES:
+- Start from the handoff's relevant_files and accepted_findings; do not rediscover accepted facts unless this step directly invalidates them.
+- Prefer rg -n plus narrow sed/range reads or targeted symbols. Do not repeatedly read whole large files.
+- Normally inspect no more than 6-8 relevant files before implementation. If more are genuinely required, explain why in the final summary.
+- Do not broadly scan docs/, README.md, CHANGELOG.md, or Git history unless directly necessary for this step.
+- Stop discovery once there is enough evidence to implement safely.
+- Return context.relevant_files (max 8), context.accepted_findings (max 8), and context.files_inspected (max 16) for the next loop.
+
 Read .ralph/policy.md and obey it. Do not edit any file under .ralph. Do not interact with live RouterOS, secrets, credentials, or external production systems. Stay inside the repository. Do not disable, skip, delete, or weaken qualification to obtain a pass. Make only changes necessary for this step. You may run focused local tests while working, but the external controller will run authoritative gates afterwards.
 If you discover useful out-of-scope work, return it in ideas and continue the approved step rather than implementing it.
 If safe completion requires breaking policy or human judgement, make no speculative workaround: return needs_human=true with blockers.
@@ -584,6 +768,12 @@ If safe completion requires breaking policy or human judgement, make no speculat
 
 def block(state: dict, reason: str) -> None:
     state["status"] = "BLOCKED_HUMAN"
+    state["block_reason"] = reason
+    save_state(state)
+
+
+def block_environment(state: dict, reason: str) -> None:
+    state["status"] = "BLOCKED_ENVIRONMENT"
     state["block_reason"] = reason
     save_state(state)
 
@@ -630,8 +820,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
 def cmd_resume(args: argparse.Namespace) -> int:
     init_files()
     state = load_state()
-    if state.get("status") != "BLOCKED_HUMAN":
-        raise RuntimeError("resume is only valid from BLOCKED_HUMAN")
+    if state.get("status") not in {"BLOCKED_HUMAN", "BLOCKED_ENVIRONMENT"}:
+        raise RuntimeError("resume is only valid from BLOCKED_HUMAN/BLOCKED_ENVIRONMENT")
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("resume hash does not match the approved plan")
     state["status"] = "APPROVED"
@@ -668,6 +858,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"PAUSED plan={state['plan_hash']} step={state['current_step']} loops={state['loop_count']}")
             return 0
         loops_this_run += 1
+        loop_started = time.monotonic()
         state["status"] = "RUNNING"
         state["loop_count"] += 1
         loop_no = state["loop_count"]
@@ -689,8 +880,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         protected_before = protected_snapshot()
         try:
             result = run_codex(step_prompt(state, step, active_fp, repair_no), RESULT_SCHEMA, "workspace-write", context=f"LOOP {loop_no:04d} STEP {step['id']} {'REPAIR' if active_fp else 'IMPLEMENT'}")
+        except EnvironmentBlocked as exc:
+            reason = str(exc)
+            live_write(reason, "ENV")
+            env_result = {"_ralph_metrics": exc.metrics, "context": {}}
+            append_journal(loop_no, step["id"], phase, "BLOCKED_ENVIRONMENT", summary=reason, repair=repair_no, next_action="fix environment then resume approved plan", stats=loop_stats(loop_started, env_result, repair=repair_no))
+            block_environment(state, reason)
+            return 2
         except Exception as exc:
-            append_journal(loop_no, step["id"], "repair" if active_fp else "implement", "BLOCKED", summary=str(exc), repair=repair_no, next_action="human review")
+            append_journal(loop_no, step["id"], phase, "BLOCKED", summary=str(exc), repair=repair_no, next_action="human review", stats=loop_stats(loop_started, repair=repair_no))
             block(state, str(exc))
             return 2
 
@@ -705,7 +903,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             detail = f"tooling paths {tooling_changed}" if tooling_changed else "RALPH runtime authority"
             reason = f"Codex changed {detail}; original contents restored"
             live_write(reason, "POLICY")
-            append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, next_action="human review", change_class=change_class)
+            append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
             block(state, "Codex attempted to change RALPH controller/tooling authority")
             return 2
 
@@ -715,7 +913,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if protected:
                 restore_protected(protected_before, protected)
             reason = "policy violation: " + "; ".join(filter(None, [f"protected paths {protected}" if protected else "", f"test paths {test_violations}" if test_violations else ""]))
-            append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class)
+            append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
             append_ideas(loop_no, result.get("ideas", []))
             block(state, reason)
             return 2
@@ -723,17 +921,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         append_ideas(loop_no, result.get("ideas", []))
         if result.get("needs_human") or result.get("blockers"):
             reason = "; ".join(result.get("blockers") or ["Codex requested human review"])
-            append_journal(loop_no, step["id"], "repair" if active_fp else "implement", "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class)
+            append_journal(loop_no, step["id"], phase, "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
             block(state, reason)
             return 2
 
-        passed, gates, fp, gate_output = run_gates()
+        passed, gates, fp, gate_output, gate_durations = run_gates()
+        stats = loop_stats(loop_started, result, gate_durations=gate_durations, repair=repair_no)
         if passed:
             live_write(f"loop={loop_no:04d} step={step['id']} PASS · class={change_class}", "PASS")
-            append_journal(loop_no, step["id"], "repair" if active_fp else "implement", "PASS", summary=result.get("summary", ""), files=files, gates=gates, repair=repair_no, ideas=result.get("ideas", []), next_action="next approved step", change_class=change_class)
+            append_journal(loop_no, step["id"], phase, "PASS", summary=result.get("summary", ""), files=files, gates=gates, repair=repair_no, ideas=result.get("ideas", []), next_action="next approved step", change_class=change_class, stats=stats)
             state["last_result"] = "PASS"
             state["last_failure"] = None
             state["active_failure"] = None
+            update_context_after_pass(state, step, result, files)
             state["current_step"] += 1
             save_state(state)
             continue
@@ -745,7 +945,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         state["last_result"] = "FAIL"
         state["last_failure"] = {"fingerprint": fp, "output": gate_output[-6000:], "gates": gates}
         state["active_failure"] = fp
-        append_journal(loop_no, step["id"], "repair" if active_fp else "implement", "FAIL", summary=result.get("summary", ""), files=files, gates=gates, fingerprint=fp, repair=repair_no, ideas=result.get("ideas", []), next_action="repair same approved step", change_class=change_class)
+        append_journal(loop_no, step["id"], phase, "FAIL", summary=result.get("summary", ""), files=files, gates=gates, fingerprint=fp, repair=repair_no, ideas=result.get("ideas", []), next_action="repair same approved step", change_class=change_class, stats=stats)
         save_state(state)
 
         same_attempts = int(state.get("failure_attempts", {}).get(fp, 0))

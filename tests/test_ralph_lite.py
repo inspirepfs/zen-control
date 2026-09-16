@@ -123,12 +123,10 @@ class CodexSandboxTests(unittest.TestCase):
     def test_preflight_keeps_default_backend_when_healthy(self):
         self.assertEqual(ralph.sandbox_prefix_from_preflights(0, ""), ["codex"])
 
-    def test_preflight_selects_landlock_for_bwrap_bootstrap_failure(self):
+    def test_preflight_blocks_instead_of_using_legacy_landlock(self):
         bwrap = "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
-        self.assertEqual(
-            ralph.sandbox_prefix_from_preflights(1, bwrap, 0, ""),
-            ["codex", "--enable", "use_legacy_landlock"],
-        )
+        with self.assertRaises(ralph.EnvironmentBlocked):
+            ralph.sandbox_prefix_from_preflights(1, bwrap)
 
     def test_outer_success_with_bwrap_text_is_still_detected(self):
         output = '{"type":"item.completed","item":{"aggregated_output":"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"}}'
@@ -176,6 +174,101 @@ class CodexObservabilityTests(unittest.TestCase):
             },
         })
         self.assertEqual(messages, [("USAGE", "input=100 cached=80 output=20 reasoning=7")])
+
+    def test_metrics_capture_commands_and_token_usage(self):
+        metrics = ralph.empty_codex_metrics()
+        ralph.update_codex_metrics(metrics, {
+            "type": "item.completed",
+            "item": {"type": "command_execution", "status": "completed"},
+        })
+        ralph.update_codex_metrics(metrics, {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 120,
+                "cached_input_tokens": 90,
+                "output_tokens": 21,
+                "reasoning_output_tokens": 8,
+            },
+        })
+        self.assertEqual(metrics["commands_executed"], 1)
+        self.assertEqual(metrics["input_tokens"], 120)
+        self.assertEqual(metrics["cached_input_tokens"], 90)
+        self.assertEqual(metrics["reasoning_output_tokens"], 8)
+
+
+class ContextTests(unittest.TestCase):
+    def test_step_prompt_injects_compact_context_and_efficiency_rules(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_context = ralph.CONTEXT
+            try:
+                ralph.CONTEXT = Path(td) / "context.json"
+                ralph.save_context({
+                    "plan_hash": "abc",
+                    "last_step": 1,
+                    "last_result": "PASS",
+                    "summary": "fixture corpus added",
+                    "changed_files": ["tests/fixtures/service_classification.json"],
+                    "relevant_files": ["app/classification_intelligence.py"],
+                    "accepted_findings": ["address-list takes precedence over DNS"],
+                })
+                state = {"plan_hash": "abc"}
+                step = {
+                    "id": 2, "title": "Precedence", "objective": "Make precedence explicit",
+                    "acceptance": ["deterministic"], "test_change_policy": "add-only",
+                }
+                prompt = ralph.step_prompt(state, step, None, 0)
+                self.assertIn("address-list takes precedence over DNS", prompt)
+                self.assertIn("Normally inspect no more than 6-8 relevant files", prompt)
+                self.assertIn("Do not broadly scan docs/", prompt)
+            finally:
+                ralph.CONTEXT = old_context
+
+    def test_context_update_merges_prior_findings_and_changed_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_root, old_context = ralph.ROOT, ralph.CONTEXT
+            try:
+                ralph.ROOT = Path(td)
+                ralph.CONTEXT = Path(td) / ".ralph" / "context.json"
+                ralph.save_context({
+                    "plan_hash": "abc", "last_step": 1, "last_result": "PASS",
+                    "summary": "first", "changed_files": ["a.py"],
+                    "relevant_files": ["a.py"], "accepted_findings": ["finding one"],
+                })
+                result = {
+                    "summary": "second",
+                    "context": {
+                        "relevant_files": ["b.py"],
+                        "accepted_findings": ["finding two"],
+                        "files_inspected": ["a.py", "b.py"],
+                    },
+                }
+                ralph.update_context_after_pass({"plan_hash": "abc"}, {"id": 2}, result, ["c.py"])
+                saved = ralph.load_context()
+                self.assertEqual(saved["relevant_files"][:3], ["c.py", "b.py", "a.py"])
+                self.assertEqual(saved["accepted_findings"][:2], ["finding two", "finding one"])
+            finally:
+                ralph.ROOT, ralph.CONTEXT = old_root, old_context
+
+    def test_bootstrap_context_from_existing_pass_journal(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_context, old_journal = ralph.CONTEXT, ralph.JOURNAL
+            try:
+                ralph.CONTEXT = Path(td) / "context.json"
+                ralph.JOURNAL = Path(td) / "journal.md"
+                ralph.JOURNAL.write_text(
+                    "# Journal\n\n## Loop 0003 — now\n\n"
+                    "- Plan step: 1\n- Result: PASS\n"
+                    "- Files changed: tests/fixtures/service_classification.json\n"
+                    "- Summary: Added classifier fixtures.\n\n",
+                    encoding="utf-8",
+                )
+                self.assertTrue(ralph.bootstrap_context_from_journal({"current_step": 2, "plan_hash": "abc"}))
+                saved = ralph.load_context()
+                self.assertEqual(saved["last_step"], 1)
+                self.assertEqual(saved["relevant_files"], ["tests/fixtures/service_classification.json"])
+                self.assertIn("Added classifier fixtures", saved["accepted_findings"][0])
+            finally:
+                ralph.CONTEXT, ralph.JOURNAL = old_context, old_journal
 
 
 class SnapshotTests(unittest.TestCase):
