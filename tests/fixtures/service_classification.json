@@ -1,0 +1,175 @@
+{
+  "schema": "zen_service_classification_fixture_v1",
+  "description": "Synthetic, offline examples for deterministic service-classification implementations. All IP addresses and domains are documentation-only values.",
+  "resolution": {
+    "signal_precedence": [
+      "address_list",
+      "dns",
+      "flow",
+      "port"
+    ],
+    "conflict_rule": "When more than one signal maps to a service, select the first matching signal in signal_precedence.",
+    "fallback": {
+      "category": "unknown",
+      "service": "Unknown",
+      "confidence": "none",
+      "evidence": {
+        "source": "fallback",
+        "matched_value": null,
+        "precedence": "fallback"
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "address_list_overrides_dns_flow_and_port",
+      "purpose": "An explicit RouterOS detector address-list remains authoritative when every lower-precedence signal conflicts.",
+      "signals": {
+        "address_list": ["Detected_ChatGPT"],
+        "dns": {"domain": "api.netflix.com"},
+        "flow": {
+          "destination_ip": "198.51.100.10",
+          "protocol": "TCP",
+          "destination_port": 443,
+          "domain": "www.youtube.com"
+        },
+        "port": {"protocol": "TCP", "number": 443}
+      },
+      "expected": {
+        "category": "ai",
+        "service": "ChatGPT",
+        "confidence": "high",
+        "evidence": {
+          "source": "address_list",
+          "matched_value": "Detected_ChatGPT",
+          "precedence": 1
+        }
+      }
+    },
+    {
+      "id": "dns_overrides_conflicting_flow_and_port",
+      "purpose": "A catalogue DNS suffix is selected ahead of a conflicting flow-domain label and generic port classification.",
+      "signals": {
+        "address_list": [],
+        "dns": {"domain": "api.netflix.com"},
+        "flow": {
+          "destination_ip": "198.51.100.20",
+          "protocol": "TCP",
+          "destination_port": 443,
+          "domain": "i.ytimg.com"
+        },
+        "port": {"protocol": "TCP", "number": 443}
+      },
+      "expected": {
+        "category": "video",
+        "service": "Netflix",
+        "confidence": "high",
+        "evidence": {
+          "source": "dns",
+          "matched_value": "netflix.com",
+          "precedence": 2
+        }
+      }
+    },
+    {
+      "id": "flow_domain_overrides_port",
+      "purpose": "A service-specific flow-domain label is selected before a generic destination-port fallback.",
+      "signals": {
+        "address_list": [],
+        "dns": null,
+        "flow": {
+          "destination_ip": "198.51.100.30",
+          "protocol": "TCP",
+          "destination_port": 443,
+          "domain": "gateway.discord.gg"
+        },
+        "port": {"protocol": "TCP", "number": 443}
+      },
+      "expected": {
+        "category": "social",
+        "service": "Discord",
+        "confidence": "medium",
+        "evidence": {
+          "source": "flow",
+          "matched_value": "discord.gg",
+          "precedence": 3
+        }
+      }
+    },
+    {
+      "id": "port_only_service_fallback",
+      "purpose": "A recognised service port classifies traffic only when no address-list, DNS, or flow-domain evidence is available.",
+      "signals": {
+        "address_list": [],
+        "dns": null,
+        "flow": {
+          "destination_ip": "198.51.100.40",
+          "protocol": "UDP",
+          "destination_port": 3074,
+          "domain": null
+        },
+        "port": {"protocol": "UDP", "number": 3074}
+      },
+      "expected": {
+        "category": "gaming",
+        "service": "Xbox",
+        "confidence": "low",
+        "evidence": {
+          "source": "port",
+          "matched_value": "UDP/3074",
+          "precedence": 4
+        }
+      }
+    },
+    {
+      "id": "address_list_without_other_evidence",
+      "purpose": "Address-list membership remains sufficient service evidence when DNS and flow-domain enrichment are absent.",
+      "signals": {
+        "address_list": ["Detected_Steam"],
+        "dns": null,
+        "flow": {
+          "destination_ip": "198.51.100.50",
+          "protocol": "UDP",
+          "destination_port": 27015,
+          "domain": null
+        },
+        "port": null
+      },
+      "expected": {
+        "category": "gaming",
+        "service": "Steam",
+        "confidence": "high",
+        "evidence": {
+          "source": "address_list",
+          "matched_value": "Detected_Steam",
+          "precedence": 1
+        }
+      }
+    },
+    {
+      "id": "unclassified_unknown_service",
+      "purpose": "Unknown traffic must use the stable fallback rather than inventing a service from an unrecognised domain or port.",
+      "signals": {
+        "address_list": [],
+        "dns": {"domain": "telemetry.unknown-service.example"},
+        "flow": {
+          "destination_ip": "203.0.113.60",
+          "protocol": "TCP",
+          "destination_port": 9443,
+          "domain": "telemetry.unknown-service.example"
+        },
+        "port": {"protocol": "TCP", "number": 9443}
+      },
+      "expected": {
+        "category": "unknown",
+        "service": "Unknown",
+        "confidence": "none",
+        "evidence": {
+          "source": "fallback",
+          "matched_value": null,
+          "precedence": "fallback"
+        }
+      }
+    }
+  ]
+}
