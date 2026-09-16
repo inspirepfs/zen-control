@@ -23,16 +23,20 @@
 <main class="analytics-main">
 {% set page_help = zen_help('activity_history') %}
 {% include "_context_help.jinja" %}
+{% set filter_suffix %}{% if selected_ip %}&amp;client_ip={{selected_ip}}{% endif %}{% if selected_category %}&amp;category={{selected_category|urlencode}}{% endif %}{% if selected_service %}&amp;service={{selected_service|urlencode}}{% endif %}{% endset %}
+{% set drill_filter_suffix %}{% if selected_category %}&amp;category={{selected_category|urlencode}}{% endif %}{% if selected_service %}&amp;service={{selected_service|urlencode}}{% endif %}{% endset %}
   {% if prepared_view %}<div class="local-only-note">Prepared 7-day read model · {{prepared_view.age_seconds|round(1)}}s old · config revision {{prepared_view.source_revision}} · generation {{prepared_view.generation}}</div>{% endif %}
   <section class="card analytics-filter-card">
     <div class="analytics-filter-row">
       <nav class="analytics-periods" aria-label="Activity period">
         {% for key,label in [('today','Today'),('yesterday','Yesterday'),('7d','7 days'),('30d','30 days')] %}
-          <a class="analytics-period {% if period == key %}active{% endif %}" href="/activity/analytics?period={{key}}{% if selected_ip %}&client_ip={{selected_ip}}{% endif %}">{{label}}</a>
+          <a class="analytics-period {% if period == key %}active{% endif %}" href="/activity/analytics?period={{key}}{{filter_suffix}}">{{label}}</a>
         {% endfor %}
       </nav>
       <form method="get" action="/activity/analytics" class="analytics-device-filter">
         <input type="hidden" name="period" value="{{period}}">
+        {% if selected_category %}<input type="hidden" name="category" value="{{selected_category}}">{% endif %}
+        {% if selected_service %}<input type="hidden" name="service" value="{{selected_service}}">{% endif %}
         {% if period == 'custom' %}<input type="hidden" name="start" value="{{custom_start}}"><input type="hidden" name="end" value="{{custom_end}}">{% endif %}
         <label>Device
           <select name="client_ip" onchange="this.form.submit()">
@@ -47,6 +51,8 @@
     <form method="get" action="/activity/analytics" class="analytics-custom-range">
       <input type="hidden" name="period" value="custom">
       {% if selected_ip %}<input type="hidden" name="client_ip" value="{{selected_ip}}">{% endif %}
+      {% if selected_category %}<input type="hidden" name="category" value="{{selected_category}}">{% endif %}
+      {% if selected_service %}<input type="hidden" name="service" value="{{selected_service}}">{% endif %}
       <label>Custom start <input type="date" name="start" value="{{custom_start or window.start_date if window else ''}}" required></label>
       <label>Custom end <input type="date" name="end" value="{{custom_end or window.end_date if window else ''}}" required></label>
       <button>Apply custom range</button>
@@ -107,7 +113,7 @@
       <div class="card-heading"><div><h2>Top devices</h2><p class="muted">Household traffic ranked for this period.</p></div></div>
       <div class="analytics-ranked-list">
         {% for item in top_devices %}
-        <a class="analytics-ranked-row" href="/activity/analytics?period={{period}}&client_ip={{item.client_ip}}{% if period == 'custom' %}&start={{custom_start}}&end={{custom_end}}{% endif %}">
+        <a class="analytics-ranked-row" href="/activity/analytics?period={{period}}&amp;client_ip={{item.client_ip}}{{drill_filter_suffix}}{% if period == 'custom' %}&amp;start={{custom_start}}&amp;end={{custom_end}}{% endif %}">
           <span><strong>{% if item.managed %}{{item.display_name}} <span class="muted">({{item.client_ip}})</span>{% else %}{{item.client_ip}}{% endif %}</strong><small>{{item.flows}} flows</small></span>
           <span>{{item.total_bytes_human}}</span>
         </a>
@@ -136,6 +142,23 @@
       </div>
     </section>
   </div>
+
+  <section id="analytics-drilldown" class="card analytics-drilldown-card"
+           data-start="{{window.start or ''}}"
+           data-end="{{window.end or ''}}"
+           data-category="{{selected_category}}" data-service="{{selected_service}}"
+           data-client-ip="{{selected_ip}}" aria-live="polite">
+    <div class="card-heading"><div><h2>Traffic category drill-down</h2><p class="muted">Select a category to rank its services, contributors and traffic over time. Filter selections stay in this analytics URL.</p></div></div>
+    <p class="analytics-drill-status" data-drill-status>Loading analytics drill-down…</p>
+    <div class="analytics-classification-grid" data-classification></div>
+    <div class="analytics-category-list" data-categories></div>
+    <div class="analytics-filter-summary" data-filter-summary></div>
+    <div class="analytics-drill-layout" hidden>
+      <section><h3>Service ranking</h3><div class="analytics-drill-list" data-services></div></section>
+      <section><h3>Client contributors</h3><div class="analytics-drill-list" data-clients></div></section>
+      <section><h3>Traffic over time</h3><div class="analytics-drill-list" data-buckets></div></section>
+    </div>
+  </section>
 
   <div class="analytics-two-column">
     <section class="card">
@@ -177,5 +200,81 @@
   </section>
   {% endif %}
 </main>
+<script>
+(() => {
+  const root = document.getElementById('analytics-drilldown');
+  if (!root || !root.dataset.start || !root.dataset.end) return;
+  const status = root.querySelector('[data-drill-status]');
+  const categoryList = root.querySelector('[data-categories]');
+  const classification = root.querySelector('[data-classification]');
+  const filterSummary = root.querySelector('[data-filter-summary]');
+  const layout = root.querySelector('.analytics-drill-layout');
+  const initial = root.dataset;
+  const state = {category: initial.category || '', service: initial.service || '', client_ip: initial.clientIp || ''};
+  const bytes = value => {
+    let n = Number(value) || 0, unit = 0, units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    while (n >= 1024 && unit < units.length - 1) { n /= 1024; unit += 1; }
+    return `${n >= 10 || unit === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[unit]}`;
+  };
+  const setState = (next, resetService = false) => {
+    Object.assign(state, next);
+    if (resetService) state.service = '';
+    const url = new URL(window.location.href);
+    for (const key of ['category', 'service', 'client_ip']) {
+      if (state[key]) url.searchParams.set(key, state[key]); else url.searchParams.delete(key);
+    }
+    window.history.replaceState({}, '', url);
+    loadDetail();
+  };
+  const error = message => {
+    status.textContent = `Could not load analytics drill-down: ${message}`;
+    status.className = 'analytics-drill-status error';
+    layout.hidden = true;
+  };
+  const button = (label, detail, selected, action) => {
+    const row = document.createElement('button'); row.type = 'button'; row.className = `analytics-drill-row${selected ? ' active' : ''}`;
+    row.append(Object.assign(document.createElement('strong'), {textContent: label}), Object.assign(document.createElement('small'), {textContent: detail}));
+    row.addEventListener('click', action); return row;
+  };
+  const renderList = (target, rows, label, onSelect) => {
+    target.replaceChildren();
+    if (!rows.length) { target.textContent = `No ${label} traffic matches these filters.`; target.classList.add('empty'); return; }
+    target.classList.remove('empty');
+    rows.forEach(row => target.append(button(row[label === 'service' ? 'service' : 'client_ip'] || 'Unknown', `${bytes(row.total_bytes)} · ${row.flows} flows`, false, () => onSelect(row))));
+  };
+  const renderBuckets = rows => {
+    const target = root.querySelector('[data-buckets]'); target.replaceChildren();
+    if (!rows.length) { target.textContent = 'No traffic-over-time data matches these filters.'; target.classList.add('empty'); return; }
+    target.classList.remove('empty'); const maximum = Math.max(...rows.map(row => Number(row.total_bytes) || 0), 1);
+    rows.forEach(row => { const item = document.createElement('div'); item.className = 'analytics-bucket-row'; const stamp = new Date(row.bucket).toLocaleString();
+      item.innerHTML = `<span>${stamp}</span><i style="width:${Math.max(2, Number(row.total_bytes) * 100 / maximum)}%"></i><strong>${bytes(row.total_bytes)}</strong>`; target.append(item); });
+  };
+  const renderDetail = payload => {
+    const filters = payload.filters || {}; state.category = filters.category || ''; state.service = filters.service || ''; state.client_ip = filters.client_ip || '';
+    const chips = [['Category', state.category || 'All categories'], ['Service', state.service || 'All services'], ['Client', state.client_ip || 'All devices']];
+    filterSummary.replaceChildren(...chips.map(([name, value]) => Object.assign(document.createElement('span'), {textContent: `${name}: ${value}`})));
+    status.textContent = `${bytes(payload.totals && payload.totals.total_bytes)} matching traffic`;
+    status.className = 'analytics-drill-status'; layout.hidden = false;
+    renderList(root.querySelector('[data-services]'), payload.services || [], 'service', row => setState({service: row.service}));
+    renderList(root.querySelector('[data-clients]'), payload.clients || [], 'client', row => setState({client_ip: row.client_ip}));
+    renderBuckets(payload.buckets || []);
+  };
+  const loadDetail = async () => {
+    status.textContent = 'Loading analytics drill-down…'; status.className = 'analytics-drill-status';
+    const query = new URLSearchParams({start: initial.start, end: initial.end, bucket_minutes: '30'});
+    Object.entries(state).forEach(([key, value]) => { if (value) query.set(key, value); });
+    try { const response = await fetch(`/api/activity/analytics-drilldown?${query}`); if (!response.ok) throw new Error(await response.text() || response.status); renderDetail(await response.json()); }
+    catch (exc) { error(exc.message || 'request failed'); }
+  };
+  const loadSummary = async () => {
+    try { const query = new URLSearchParams({start: initial.start, end: initial.end, category_limit: '20'}); const response = await fetch(`/api/activity/analytics-summary?${query}`); if (!response.ok) throw new Error(await response.text() || response.status); const payload = await response.json();
+      const quality = payload.classification || {}; classification.replaceChildren(...[['Classified', quality.classified_bytes], ['Low confidence', quality.low_confidence_bytes], ['Unknown', quality.unknown_bytes]].map(([label, value]) => { const chip = document.createElement('div'); chip.className = `analytics-classification ${label.toLowerCase().replace(' ', '-')}`; chip.textContent = `${label}: ${bytes(value)}`; return chip; }));
+      categoryList.replaceChildren(); (payload.top_categories || []).forEach(row => { const unknown = row.category === 'unknown'; const low = !unknown && Number(row.low_confidence_bytes) > 0; const stateLabel = unknown ? 'Unknown' : low ? 'Low confidence' : 'Classified'; categoryList.append(button(row.category, `${bytes(row.total_bytes)} · ${row.percent}% · ${stateLabel}`, state.category === row.category, () => setState({category: row.category}, true))); });
+      if (!categoryList.childElementCount) categoryList.textContent = 'No retained categories in this period.';
+    } catch (exc) { classification.textContent = 'Classification state unavailable.'; error(exc.message || 'request failed'); }
+  };
+  loadSummary(); loadDetail();
+})();
+</script>
 </body>
 </html>

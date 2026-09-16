@@ -1714,6 +1714,270 @@ class ActivityStore:
             row["height"] = max(3, round((row["download_bytes"] + row["upload_bytes"]) * 100 / max_value))
         return rows
 
+    def service_statistics(self, start, end, bucket_minutes=5):
+        """Aggregate retained raw traffic samples by bucket and classification.
+
+        ``flows_raw`` is deliberately the source of truth here: it retains the
+        classifier category alongside the individual sample, so the returned
+        byte and flow totals reconcile exactly with retained IPFIX evidence.
+        """
+        start, end = self._validate_range(start, end)
+        try:
+            bucket_minutes = int(bucket_minutes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Statistics bucket size must be an integer number of minutes") from exc
+        if not 1 <= bucket_minutes <= 24 * 60:
+            raise ValueError("Statistics bucket size must be between 1 and 1440 minutes")
+
+        rows = self._query(f"""
+            SELECT date_bin(interval '{bucket_minutes} minutes', event_time,
+                            timestamptz '2001-01-01') AS bucket,
+                   COALESCE(NULLIF(category,''), 'unknown') AS category,
+                   COALESCE(NULLIF(service,''), 'Unknown') AS service,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='download'),0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'),0) AS upload_bytes,
+                   count(*) AS flows,
+                   count(DISTINCT NULLIF(client_ip,'')) AS active_clients
+            FROM flows_raw
+            WHERE event_time >= %s AND event_time < %s
+            GROUP BY 1, 2, 3
+            ORDER BY 1, 2, 3
+        """, (start, end))
+        total = self._query("""
+            SELECT COALESCE(sum(bytes) FILTER (WHERE direction='download'),0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'),0) AS upload_bytes,
+                   count(*) AS flows,
+                   count(DISTINCT NULLIF(client_ip,'')) AS active_clients
+            FROM flows_raw
+            WHERE event_time >= %s AND event_time < %s
+        """, (start, end))[0]
+
+        buckets = []
+        for row in rows:
+            buckets.append({
+                "bucket": row["bucket"].isoformat(),
+                "category": str(row.get("category") or "unknown"),
+                "service": str(row.get("service") or "Unknown"),
+                "download_bytes": int(row.get("download_bytes") or 0),
+                "upload_bytes": int(row.get("upload_bytes") or 0),
+                "flows": int(row.get("flows") or 0),
+                "active_clients": int(row.get("active_clients") or 0),
+            })
+        return {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "bucket_minutes": bucket_minutes,
+            "buckets": buckets,
+            "totals": {
+                "download_bytes": int(total.get("download_bytes") or 0),
+                "upload_bytes": int(total.get("upload_bytes") or 0),
+                "flows": int(total.get("flows") or 0),
+                "active_clients": int(total.get("active_clients") or 0),
+            },
+        }
+
+    def analytics_summary(self, start, end, category_limit=10):
+        """Return stable overview KPIs and ranked traffic categories for a range.
+
+        Raw samples retain the classification in effect when the traffic was
+        observed.  Keeping this query on ``flows_raw`` therefore avoids applying
+        today's catalogue to historical traffic.
+        """
+        start, end = self._validate_range(start, end)
+        try:
+            category_limit = int(category_limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Category limit must be an integer") from exc
+        if not 1 <= category_limit <= 100:
+            raise ValueError("Category limit must be between 1 and 100")
+
+        categories = self._query("""
+            SELECT CASE
+                       WHEN lower(trim(COALESCE(category, ''))) IN ('', 'unknown', 'unclassified')
+                           THEN 'unknown'
+                       ELSE lower(trim(category))
+                   END AS category,
+                   COALESCE(sum(bytes),0) AS total_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='download'),0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'),0) AS upload_bytes,
+                   count(*) AS flows,
+                   count(DISTINCT NULLIF(client_ip,'')) AS active_clients,
+                   COALESCE(sum(bytes) FILTER (WHERE lower(trim(COALESCE(confidence, ''))) = 'low'),0) AS low_confidence_bytes
+            FROM flows_raw
+            WHERE event_time >= %s AND event_time < %s
+            GROUP BY 1
+        """, (start, end))
+        totals_row = self._query("""
+            SELECT COALESCE(sum(bytes),0) AS total_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='download'),0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'),0) AS upload_bytes,
+                   count(*) AS flows,
+                   count(DISTINCT NULLIF(client_ip,'')) AS active_clients
+            FROM flows_raw
+            WHERE event_time >= %s AND event_time < %s
+        """, (start, end))[0]
+        totals = {
+            "total_bytes": int(totals_row.get("total_bytes") or 0),
+            "download_bytes": int(totals_row.get("download_bytes") or 0),
+            "upload_bytes": int(totals_row.get("upload_bytes") or 0),
+            "flows": int(totals_row.get("flows") or 0),
+            "active_clients": int(totals_row.get("active_clients") or 0),
+        }
+        denominator = totals["total_bytes"]
+        rows = []
+        for row in categories:
+            total_bytes = int(row.get("total_bytes") or 0)
+            rows.append({
+                "category": str(row.get("category") or "unknown"),
+                "total_bytes": total_bytes,
+                "download_bytes": int(row.get("download_bytes") or 0),
+                "upload_bytes": int(row.get("upload_bytes") or 0),
+                "flows": int(row.get("flows") or 0),
+                "active_clients": int(row.get("active_clients") or 0),
+                "low_confidence_bytes": int(row.get("low_confidence_bytes") or 0),
+                "percent": round(total_bytes * 100 / denominator, 1) if denominator else 0.0,
+            })
+        rows.sort(key=lambda item: (-item["total_bytes"], item["category"].casefold(), item["category"]))
+        for rank, row in enumerate(rows, start=1):
+            row["rank"] = rank
+        unknown = next((row for row in rows if row["category"] == "unknown"), None)
+        unclassified = {
+            "total_bytes": 0,
+            "download_bytes": 0,
+            "upload_bytes": 0,
+            "flows": 0,
+            "percent": 0.0,
+        }
+        if unknown:
+            unclassified.update({key: unknown[key] for key in unclassified})
+        unknown_bytes = sum(row["total_bytes"] for row in rows if row["category"] == "unknown")
+        low_confidence_bytes = sum(
+            row["low_confidence_bytes"] for row in rows if row["category"] != "unknown"
+        )
+        return {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "totals": totals,
+            "top_categories": rows[:category_limit],
+            "unclassified": unclassified,
+            "classification": {
+                "classified_bytes": max(0, totals["total_bytes"] - unknown_bytes - low_confidence_bytes),
+                "low_confidence_bytes": low_confidence_bytes,
+                "unknown_bytes": unknown_bytes,
+            },
+        }
+
+    def analytics_drilldown(self, start, end, category=None, service=None, client_ip=None, bucket_minutes=5):
+        """Return service, client, and time views for one retained-traffic slice."""
+        start, end = self._validate_range(start, end)
+        try:
+            bucket_minutes = int(bucket_minutes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Drill-down bucket size must be an integer number of minutes") from exc
+        if not 1 <= bucket_minutes <= 24 * 60:
+            raise ValueError("Drill-down bucket size must be between 1 and 1440 minutes")
+
+        category_key = str(category or "").strip().lower() or None
+        if category_key in {"unclassified", "unknown"}:
+            category_key = "unknown"
+        service_key = str(service or "").strip().lower() or None
+        requested_client = str(client_ip or "").strip() or None
+        if requested_client:
+            try:
+                requested_client = str(ipaddress.ip_address(requested_client))
+            except ValueError:
+                return self._empty_analytics_drilldown(start, end, category_key, service_key, requested_client, bucket_minutes)
+
+        category_sql = """CASE
+            WHEN lower(trim(COALESCE(category, ''))) IN ('', 'unknown', 'unclassified') THEN 'unknown'
+            ELSE lower(trim(category))
+        END"""
+        filters = ["event_time >= %s", "event_time < %s"]
+        params = [start, end]
+        if category_key:
+            filters.append(f"{category_sql} = %s")
+            params.append(category_key)
+        if service_key:
+            filters.append("COALESCE(NULLIF(lower(trim(service)), ''), 'unknown') = %s")
+            params.append(service_key)
+        if requested_client:
+            filters.append("client_ip = %s")
+            params.append(requested_client)
+        where = " AND ".join(filters)
+        query_params = tuple(params)
+
+        services = self._query(f"""
+            SELECT COALESCE(NULLIF(trim(service), ''), 'Unknown') AS service,
+                   COALESCE(sum(bytes), 0) AS total_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='download'), 0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'), 0) AS upload_bytes,
+                   count(*) AS flows,
+                   count(DISTINCT NULLIF(client_ip, '')) AS active_clients
+            FROM flows_raw WHERE {where}
+            GROUP BY 1 ORDER BY total_bytes DESC, service ASC
+        """, query_params)
+        clients = self._query(f"""
+            SELECT COALESCE(NULLIF(client_ip, ''), 'unknown') AS client_ip,
+                   COALESCE(sum(bytes), 0) AS total_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='download'), 0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'), 0) AS upload_bytes,
+                   count(*) AS flows
+            FROM flows_raw WHERE {where}
+            GROUP BY 1 ORDER BY total_bytes DESC, client_ip ASC
+        """, query_params)
+        buckets = self._query(f"""
+            SELECT date_bin(interval '{bucket_minutes} minutes', event_time,
+                            timestamptz '2001-01-01') AS bucket,
+                   COALESCE(sum(bytes), 0) AS total_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='download'), 0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'), 0) AS upload_bytes,
+                   count(*) AS flows,
+                   count(DISTINCT NULLIF(client_ip, '')) AS active_clients
+            FROM flows_raw WHERE {where}
+            GROUP BY 1 ORDER BY 1
+        """, query_params)
+        total = self._query(f"""
+            SELECT COALESCE(sum(bytes), 0) AS total_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='download'), 0) AS download_bytes,
+                   COALESCE(sum(bytes) FILTER (WHERE direction='upload'), 0) AS upload_bytes,
+                   count(*) AS flows,
+                   count(DISTINCT NULLIF(client_ip, '')) AS active_clients
+            FROM flows_raw WHERE {where}
+        """, query_params)[0]
+
+        def metric_row(row, key=None):
+            result = {
+                "total_bytes": int(row.get("total_bytes") or 0),
+                "download_bytes": int(row.get("download_bytes") or 0),
+                "upload_bytes": int(row.get("upload_bytes") or 0),
+                "flows": int(row.get("flows") or 0),
+            }
+            if "active_clients" in row:
+                result["active_clients"] = int(row.get("active_clients") or 0)
+            if key:
+                result[key] = str(row.get(key) or "unknown")
+            return result
+
+        return {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "bucket_minutes": bucket_minutes,
+            "filters": {"category": category_key, "service": service_key, "client_ip": requested_client},
+            "services": [metric_row(row, "service") for row in services],
+            "clients": [metric_row(row, "client_ip") for row in clients],
+            "buckets": [{"bucket": row["bucket"].isoformat(), **metric_row(row)} for row in buckets],
+            "totals": metric_row(total),
+        }
+
+    @staticmethod
+    def _empty_analytics_drilldown(start, end, category, service, client_ip, bucket_minutes):
+        return {
+            "start": start.isoformat(), "end": end.isoformat(), "bucket_minutes": bucket_minutes,
+            "filters": {"category": category, "service": service, "client_ip": client_ip},
+            "services": [], "clients": [], "buckets": [],
+            "totals": {"total_bytes": 0, "download_bytes": 0, "upload_bytes": 0, "flows": 0, "active_clients": 0},
+        }
+
 
 def build_service_intelligence(
     service_defs,

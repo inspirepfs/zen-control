@@ -3259,6 +3259,62 @@ def api_activity_overview(
         raise HTTPException(status_code=503, detail=str(exc))
 
 
+@app.get("/api/activity/service-statistics")
+def api_activity_service_statistics(
+    start: str,
+    end: str,
+    bucket_minutes: int = 5,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    try:
+        start_at = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        end_at = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        return activity_store.service_statistics(start_at, end_at, bucket_minutes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ActivityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/api/activity/analytics-summary")
+def api_activity_analytics_summary(
+    start: str,
+    end: str,
+    category_limit: int = 10,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    try:
+        start_at = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        end_at = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        return activity_store.analytics_summary(start_at, end_at, category_limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ActivityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/api/activity/analytics-drilldown")
+def api_activity_analytics_drilldown(
+    start: str,
+    end: str,
+    category: str = "",
+    service: str = "",
+    client_ip: str = "",
+    bucket_minutes: int = 5,
+    user=Depends(require_role("admin", "operator", "viewer")),
+):
+    try:
+        start_at = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        end_at = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        return activity_store.analytics_drilldown(
+            start_at, end_at, category, service, client_ip, bucket_minutes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ActivityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
 @app.get("/api/activity/device/{client_ip}")
 def api_activity_device(
     client_ip: str,
@@ -3732,6 +3788,8 @@ def activity_analytics_page(
     request: Request,
     period: str = "7d",
     client_ip: str = "",
+    category: str = "",
+    service: str = "",
     start: str = "",
     end: str = "",
     user=Depends(require_role("admin", "operator", "viewer")),
@@ -3741,6 +3799,8 @@ def activity_analytics_page(
     names = _activity_managed_names()
     error = None
     selected = str(client_ip or "").strip()
+    selected_category = str(category or "").strip().lower()
+    selected_service = str(service or "").strip().lower()
     prepared_meta = None
     try:
         prepared = None
@@ -3812,6 +3872,8 @@ def activity_analytics_page(
             "custom_start": start,
             "custom_end": end,
             "selected_ip": selected,
+            "selected_category": selected_category,
+            "selected_service": selected_service,
             "selected_name": selected_name,
             "managed_names": names,
             "window": window,
