@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a reproducible ZEN Control defect without sensitive data.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, household data, RouterOS exports, support bundles, or private endpoints. Report security vulnerabilities privately via SECURITY.md.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and impact
+      description: State the affected user/operational outcome and whether RouterOS authority, security, evidence, migration, PWA/browser, diagnostics, incidents, performance, or release readiness is involved.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction and observed result
+      description: Provide minimal safe steps, expected result, actual result, and sanitized version/environment details.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Safe evidence
+      description: Include only sanitized logs, screenshots, or diagnostic summaries. State whether live RouterOS was involved.
+    validations:
+      required: true

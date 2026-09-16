@@ -8,6 +8,7 @@ budgets, loop journaling, and the ideas bucket.
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import hashlib
 import json
@@ -23,6 +24,11 @@ import tomllib
 from pathlib import Path
 from typing import Iterable
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+import ralph_tui as tui
+
 ROOT = Path(__file__).resolve().parents[1]
 RALPH = ROOT / ".ralph"
 STATE = RALPH / "state.json"
@@ -32,6 +38,9 @@ JOURNAL = RALPH / "journal.md"
 POLICY = RALPH / "policy.md"
 LIVE = RALPH / "live.log"
 CONTEXT = RALPH / "context.json"
+EVENTS = RALPH / "events.jsonl"
+RECOVERY = RALPH / "recovery"
+REPORTS = RALPH / "reports"
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
@@ -59,7 +68,11 @@ TOOLING_PATHS = {
     ".gitignore",
     ".ralph/policy.md",
     "scripts/ralph.py",
+    "scripts/ralph_gate.py",
+    "scripts/ralph_tui.py",
     "tests/test_ralph_lite.py",
+    "tests/test_ralph_gate.py",
+    "tests/test_ralph_lifecycle.py",
     "docs/RALPH-LITE.md",
 }
 
@@ -167,6 +180,16 @@ def default_state() -> dict:
         "last_failure": None,
         "last_result": None,
         "block_reason": None,
+        "recovery_checkpoint": None,
+        "plan_changed_files": [],
+        "plan_owned_files": [],
+        "human_steering": [],
+        "steering_allowed_new_tests": [],
+        "step_results": [],
+        "final_qualification": None,
+        "commit_sha": None,
+        "push_upstream": None,
+        "completion_changes": None,
         "updated_at": utc_now(),
     }
 
@@ -249,6 +272,29 @@ def context_handoff(state: dict) -> dict:
     }
 
 
+def update_context_after_human_confirmation(state: dict, step: dict, gate_id: str, reason: str) -> None:
+    """Record a human-owned accepted finding without pretending Codex proved it."""
+    prior = context_handoff(state)
+    summary = " ".join(str(reason or "").split())[:1200]
+    finding = f"Human gate {gate_id} satisfied by operator: {summary}"[:500]
+    findings: list[str] = []
+    for raw in [finding, *(prior.get("accepted_findings") or [])]:
+        text = " ".join(str(raw).split())[:500]
+        if text and text not in findings:
+            findings.append(text)
+        if len(findings) >= 8:
+            break
+    save_context({
+        "plan_hash": state.get("plan_hash"),
+        "last_step": step.get("id"),
+        "last_result": "HUMAN_CONFIRMED",
+        "summary": summary,
+        "changed_files": [],
+        "relevant_files": list(prior.get("relevant_files") or [])[:8],
+        "accepted_findings": findings,
+    })
+
+
 def update_context_after_pass(state: dict, step: dict, result: dict, changed: Iterable[str]) -> None:
     supplied = result.get("context") if isinstance(result.get("context"), dict) else {}
     prior = context_handoff(state)
@@ -313,8 +359,615 @@ def bootstrap_context_from_journal(state: dict) -> bool:
     return False
 
 
+
+def _git(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(["git", *args], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed ({proc.returncode}): {proc.stdout[-3000:]}")
+    return proc
+
+
+def git_head() -> str:
+    return _git(["rev-parse", "HEAD"]).stdout.strip()
+
+
+def git_branch() -> str:
+    return _git(["branch", "--show-current"]).stdout.strip()
+
+
+def git_upstream() -> str | None:
+    proc = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], check=False)
+    value = proc.stdout.strip()
+    return value if proc.returncode == 0 and value else None
+
+
+def _status_sets() -> tuple[list[str], list[str]]:
+    proc = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    dirty: list[str] = []
+    untracked: list[str] = []
+    for entry in proc.stdout.split("\0"):
+        if not entry:
+            continue
+        code = entry[:2]
+        payload = entry[3:] if len(entry) >= 4 else ""
+        if " -> " in payload:
+            payload = payload.split(" -> ", 1)[1]
+        payload = payload.strip()
+        if not payload:
+            continue
+        if payload not in dirty:
+            dirty.append(payload)
+        if code == "??" and payload not in untracked:
+            untracked.append(payload)
+    return sorted(dirty), sorted(untracked)
+
+
+def create_recovery_checkpoint(state: dict) -> dict:
+    """Create a local Git-backed recovery point before an approved plan can run."""
+    plan_digest = str(state.get("plan_hash") or "")
+    if not plan_digest:
+        raise RuntimeError("cannot checkpoint a plan without a plan hash")
+    stamp = dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    checkpoint_id = f"RP-{stamp}-{plan_digest[:8]}"
+    directory = RECOVERY / checkpoint_id
+    directory.mkdir(parents=True, exist_ok=False)
+    head = git_head()
+    branch = git_branch()
+    upstream = git_upstream()
+    dirty, untracked = _status_sets()
+    staged = [line.strip() for line in _git(["diff", "--cached", "--name-only"]).stdout.splitlines() if line.strip()]
+
+    # `git stash create` records tracked staged/unstaged work without changing the
+    # worktree.  Keep the object reachable through a private local ref.  Untracked
+    # paths are listed separately; protected/private files are never copied.
+    stash = _git(["stash", "create", f"RALPH recovery {checkpoint_id}"], check=False).stdout.strip()
+    recovery_oid = stash or head
+    ref = f"refs/ralph/recovery/{checkpoint_id}"
+    _git(["update-ref", ref, recovery_oid])
+
+    (directory / "status.txt").write_text(_git(["status", "--short"]).stdout, encoding="utf-8")
+    (directory / "working.patch").write_text(_git(["diff", "--binary", "HEAD"]).stdout, encoding="utf-8")
+    (directory / "staged.patch").write_text(_git(["diff", "--cached", "--binary"]).stdout, encoding="utf-8")
+    manifest = {
+        "schema": "zen_ralph_recovery_v1",
+        "id": checkpoint_id,
+        "created_at": utc_now(),
+        "plan_hash": plan_digest,
+        "head": head,
+        "branch": branch,
+        "upstream": upstream,
+        "ref": ref,
+        "recovery_oid": recovery_oid,
+        "baseline_dirty_paths": dirty,
+        "baseline_untracked_paths": untracked,
+        "baseline_staged_paths": staged,
+        "protected_untracked_not_copied": [path for path in untracked if is_protected_path(path)],
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tui.write_event(EVENTS, "CHECKPOINT", f"created {checkpoint_id}", checkpoint=manifest)
+    live_write(f"{checkpoint_id} · HEAD {head[:12]} · dirty={len(dirty)} · ref={ref}", "CHECKPOINT")
+    return manifest
+
+
+def load_recovery_checkpoint(checkpoint_id: str | None) -> dict:
+    if not checkpoint_id:
+        return {}
+    path = RECOVERY / checkpoint_id / "manifest.json"
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def plan_baseline_path_kind(state: dict, path: str) -> str:
+    """Classify a path against the approval-time recovery checkpoint."""
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint:
+        return "unknown"
+    path = str(path or "").strip().replace("\\", "/")
+    if path in set(checkpoint.get("baseline_untracked_paths") or []):
+        return "preexisting-untracked"
+    head = str(checkpoint.get("head") or "").strip()
+    if head:
+        proc = _git(["cat-file", "-e", f"{head}:{path}"], check=False)
+        if proc.returncode == 0:
+            return "tracked"
+    if path in set(checkpoint.get("baseline_dirty_paths") or []):
+        return "preexisting-dirty"
+    return "absent"
+
+
+def plan_owned_path(state: dict, path: str) -> bool:
+    return str(path) in set(state.get("plan_owned_files") or [])
+
+
+def remember_plan_files(state: dict, paths: Iterable[str]) -> None:
+    current = list(state.get("plan_changed_files") or [])
+    owned = list(state.get("plan_owned_files") or [])
+    for path in paths:
+        if not path:
+            continue
+        if path not in current:
+            current.append(path)
+        if plan_baseline_path_kind(state, path) == "absent" and path not in owned:
+            owned.append(path)
+    state["plan_changed_files"] = sorted(current)
+    state["plan_owned_files"] = sorted(owned)
+
+
+def steering_for_step(state: dict, step_no: int) -> list[dict]:
+    values = state.get("human_steering") if isinstance(state.get("human_steering"), list) else []
+    return [dict(item) for item in values if isinstance(item, dict) and int(item.get("step") or 0) == int(step_no)]
+
+
+def steering_allowed_new_tests(state: dict, step_no: int) -> set[str]:
+    allowed: set[str] = set()
+    for item in state.get("steering_allowed_new_tests") or []:
+        if not isinstance(item, dict) or int(item.get("step") or 0) != int(step_no):
+            continue
+        path = str(item.get("path") or "").strip()
+        if path:
+            allowed.add(path)
+    return allowed
+
+
+def _numstat(paths: Iterable[str], *, base_ref: str = "HEAD") -> dict[str, tuple[int, int]]:
+    selected = [str(path) for path in paths if path]
+    if not selected:
+        return {}
+    proc = _git(["diff", "--numstat", base_ref, "--", *selected], check=False)
+    result: dict[str, tuple[int, int]] = {}
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                added = int(parts[0]) if parts[0].isdigit() else 0
+                removed = int(parts[1]) if parts[1].isdigit() else 0
+            except ValueError:
+                continue
+            result[parts[2]] = (added, removed)
+    for path in selected:
+        full = ROOT / path
+        if path not in result and full.exists() and full.is_file():
+            status = _git(["status", "--porcelain=v1", "--", path], check=False).stdout
+            if status.startswith("??"):
+                try:
+                    result[path] = (len(full.read_text(encoding="utf-8", errors="ignore").splitlines()), 0)
+                except OSError:
+                    result[path] = (0, 0)
+    return result
+
+
+def _changed_new_lines(path: str, *, base_ref: str = "HEAD") -> set[int]:
+    proc = _git(["diff", "--unified=0", base_ref, "--", path], check=False)
+    lines: set[int] = set()
+    for raw in proc.stdout.splitlines():
+        match = re.match(r"@@ -(?:\d+)(?:,\d+)? \+(\d+)(?:,(\d+))? @@", raw)
+        if not match:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2) or 1)
+        lines.update(range(start, start + max(0, count)))
+    full = ROOT / path
+    if not lines and full.exists() and _git(["status", "--porcelain=v1", "--", path], check=False).stdout.startswith("??"):
+        try:
+            lines.update(range(1, len(full.read_text(encoding="utf-8", errors="ignore").splitlines()) + 1))
+        except OSError:
+            pass
+    return lines
+
+
+def _python_changed_symbols(path: str, *, base_ref: str = "HEAD") -> list[str]:
+    if not path.endswith(".py"):
+        return []
+    full = ROOT / path
+    if not full.exists():
+        return []
+    changed = _changed_new_lines(path, base_ref=base_ref)
+    if not changed:
+        return []
+    try:
+        tree = ast.parse(full.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, SyntaxError):
+        return []
+    symbols: list[tuple[int, str]] = []
+    class_stack: list[str] = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_ClassDef(self, node):
+            end = int(getattr(node, "end_lineno", node.lineno))
+            if any(int(node.lineno) <= line <= end for line in changed):
+                symbols.append((int(node.lineno), f"class {'.'.join([*class_stack, node.name])}"))
+            class_stack.append(node.name)
+            self.generic_visit(node)
+            class_stack.pop()
+
+        def _function(self, node):
+            end = int(getattr(node, "end_lineno", node.lineno))
+            if any(int(node.lineno) <= line <= end for line in changed):
+                name = ".".join([*class_stack, node.name])
+                symbols.append((int(node.lineno), f"{name}()"))
+            self.generic_visit(node)
+
+        visit_FunctionDef = _function
+        visit_AsyncFunctionDef = _function
+
+    Visitor().visit(tree)
+    result: list[str] = []
+    for _, name in sorted(symbols):
+        if name not in result:
+            result.append(name)
+        if len(result) >= 5:
+            break
+    return result
+
+
+def _diff_symbols(path: str, *, base_ref: str = "HEAD") -> list[str]:
+    symbols = _python_changed_symbols(path, base_ref=base_ref)
+    if symbols:
+        return symbols
+    proc = _git(["diff", "--function-context", "--unified=0", base_ref, "--", path], check=False)
+    fallback: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line.startswith("@@"):
+            continue
+        tail = line.split("@@", 2)[-1].strip()
+        tail = re.sub(r"\s+", " ", tail)[:100]
+        if tail and tail not in fallback:
+            fallback.append(tail)
+        if len(fallback) >= 3:
+            break
+    return fallback
+
+
+def change_entries(paths: Iterable[str], *, base_ref: str = "HEAD") -> list[dict]:
+    paths = sorted(set(str(path) for path in paths if path))
+    stats = _numstat(paths, base_ref=base_ref)
+    entries: list[dict] = []
+    for path in paths:
+        full = ROOT / path
+        status = _git(["status", "--porcelain=v1", "--", path], check=False).stdout[:2]
+        if status == "??":
+            action = "CREATE"
+        elif "D" in status or not full.exists():
+            action = "DELETE"
+        elif "R" in status:
+            action = "MOVE"
+        else:
+            action = "EDIT"
+        added, removed = stats.get(path, (0, 0))
+        entries.append({
+            "action": action,
+            "path": path,
+            "added": added,
+            "removed": removed,
+            "symbols": _diff_symbols(path, base_ref=base_ref),
+        })
+    return entries
+
+
+
+def bounded_diff(paths: Iterable[str], *, base_ref: str = "HEAD", max_chars: int = 12000) -> str:
+    selected = [str(path) for path in paths if path]
+    if not selected:
+        return ""
+    proc = _git(["diff", "--unified=1", base_ref, "--", *selected], check=False)
+    text = proc.stdout
+    for path in selected:
+        full = ROOT / path
+        if full.exists() and _git(["status", "--porcelain=v1", "--", path], check=False).stdout.startswith("??"):
+            try:
+                content = full.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            text += f"\ndiff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ new file @@\n"
+            text += "\n".join("+" + line for line in content.splitlines()[:80]) + "\n"
+    return text[:max_chars]
+
+def final_qualification_gates() -> list[tuple[str, list[str]]]:
+    gates = list(qualification_gates())
+    optional = [
+        ("environment", ROOT / "scripts" / "env_validate.py"),
+        ("supply-chain", ROOT / "scripts" / "supply_chain_validate.py"),
+        ("public-audit", ROOT / "scripts" / "public_release_audit.py"),
+    ]
+    for name, path in optional:
+        if path.exists():
+            gates.append((name, [sys.executable, str(path.relative_to(ROOT))]))
+    gates.append(("diff-check", ["git", "diff", "--check"]))
+    return gates
+
+
+def run_final_qualification() -> tuple[bool, list[str], dict[str, float], str]:
+    results: list[str] = []
+    durations: dict[str, float] = {}
+    output = ""
+    print(tui.box("FINAL QUALIFICATION", ["Re-running authoritative gates before commit readiness"], tone="cyan"))
+    for name, command in final_qualification_gates():
+        live_write(f"running {name}", "GATE")
+        started = time.monotonic()
+        proc = run_process(command)
+        durations[name] = time.monotonic() - started
+        outcome = "PASS" if proc.returncode == 0 else "FAIL"
+        results.append(f"{name}={outcome}")
+        live_write(f"{name}={outcome} duration={durations[name]:.1f}s", "PASS" if proc.returncode == 0 else "FAIL")
+        if proc.returncode != 0:
+            output = proc.stdout[-12000:]
+            return False, results, durations, output
+    return True, results, durations, output
+
+
+def _step_results_from_state(state: dict) -> list[dict]:
+    values = state.get("step_results") if isinstance(state.get("step_results"), list) else []
+    return [dict(value) for value in values if isinstance(value, dict)]
+
+
+def record_step_result(state: dict, step: dict, result: str, *, summary: str = "", files: Iterable[str] = (), gates: Iterable[str] = (), stats: dict | None = None) -> None:
+    values = _step_results_from_state(state)
+    values.append({
+        "step": int(step.get("id") or 0),
+        "title": str(step.get("title") or ""),
+        "result": result,
+        "summary": " ".join(str(summary or "").split())[:1000],
+        "files": list(files),
+        "gates": list(gates),
+        "stats": dict(stats or {}),
+        "recorded_at": utc_now(),
+    })
+    state["step_results"] = values[-100:]
+
+
+def build_completion_report(state: dict, final_gates: list[str]) -> dict:
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    steps = list(plan.get("steps") or [])
+    files = list(state.get("plan_changed_files") or [])
+    saved_changes = state.get("completion_changes") if isinstance(state.get("completion_changes"), dict) else {}
+    entries = list(saved_changes.get("entries") or []) if saved_changes else change_entries(files)
+    added = int(saved_changes.get("added") or 0) if saved_changes else sum(int(item.get("added") or 0) for item in entries)
+    removed = int(saved_changes.get("removed") or 0) if saved_changes else sum(int(item.get("removed") or 0) for item in entries)
+    step_results = _step_results_from_state(state)
+    passed_steps = len({int(item.get("step") or 0) for item in step_results if item.get("result") in {"PASS", "HUMAN_CONFIRMED"}})
+    token_totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0, "commands_executed": 0}
+    for item in step_results:
+        stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+        for key in token_totals:
+            token_totals[key] += int(stats.get(key) or 0)
+
+    report = {
+        "schema": "zen_ralph_completion_v1",
+        "generated_at": utc_now(),
+        "plan_hash": state.get("plan_hash"),
+        "goal": plan.get("goal"),
+        "status": state.get("status"),
+        "counts": {
+            "steps_total": len(steps),
+            "steps_passed": passed_steps,
+            "loops": int(state.get("loop_count") or 0),
+            "human_gates": len(state.get("human_gate_resolutions") or []),
+            "human_steers": len(state.get("human_steering") or []),
+        },
+        "qualification": {"state": str((state.get("final_qualification") or {}).get("state") or "UNKNOWN"), "gates": final_gates},
+        "changes": {"files": len(entries), "added": added, "removed": removed, "entries": entries},
+        "step_results": step_results,
+        "recovery_checkpoint": state.get("recovery_checkpoint"),
+        "recovery_ref": (load_recovery_checkpoint(state.get("recovery_checkpoint")) or {}).get("ref"),
+        "authority": {
+            "ralph_tooling_changed": any(is_tooling_path(path) for path in files),
+            "protected_paths_changed": any(is_protected_path(path) for path in files),
+            "plan_owned_files": sorted(state.get("plan_owned_files") or []),
+            "human_steering": list(state.get("human_steering") or []),
+        },
+        "usage": token_totals,
+        "suggested_commit": state.get("commit_message") or _default_commit_message(state),
+        "commit": state.get("commit_sha"),
+        "push": state.get("push_upstream"),
+    }
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    stem = str(state.get("plan_hash") or "unknown")[:16]
+    json_path = REPORTS / f"{stem}-summary.json"
+    md_path = REPORTS / f"{stem}-summary.md"
+    report["json_path"] = str(json_path.relative_to(ROOT))
+    report["markdown_path"] = str(md_path.relative_to(ROOT))
+    json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    lines = [
+        "# RALPH-Lite Completion Report", "",
+        f"**Plan:** `{state.get('plan_hash')}`", f"**Goal:** {plan.get('goal') or '-'}", f"**Status:** {state.get('status')}", "",
+        "## Execution", "",
+        f"- Steps: {passed_steps}/{len(steps)} PASS/HUMAN_CONFIRMED",
+        f"- Implementation loops: {int(state.get('loop_count') or 0)}",
+        f"- Human gates resolved: {len(state.get('human_gate_resolutions') or [])}",
+        f"- Human steering decisions: {len(state.get('human_steering') or [])}",
+        f"- Recovery checkpoint: `{state.get('recovery_checkpoint') or '-'}`", "",
+        "## Final qualification", "",
+        *[f"- {gate}" for gate in final_gates], "",
+        "## Changes", "",
+        f"- Files: {len(entries)}", f"- Lines: +{added}/-{removed}",
+    ]
+    for item in entries:
+        symbols = ", ".join(item.get("symbols") or [])
+        detail = f" ({symbols})" if symbols else ""
+        lines.append(f"- {item['action']} `{item['path']}` +{item['added']}/-{item['removed']}{detail}")
+    lines += ["", "## Step results", ""]
+    for item in step_results:
+        lines.append(f"- Step {item.get('step')}: **{item.get('result')}** — {item.get('title')} — {item.get('summary') or '-'}")
+    lines += [
+        "", "## Authority", "",
+        f"- RALPH tooling changed by plan: {'YES' if report['authority']['ralph_tooling_changed'] else 'NO'}",
+        f"- Protected paths changed by plan: {'YES' if report['authority']['protected_paths_changed'] else 'NO'}",
+        f"- Plan-owned files: {', '.join(report['authority']['plan_owned_files']) if report['authority']['plan_owned_files'] else '-'}",
+        f"- Human steering decisions: {len(report['authority']['human_steering'])}",
+        "", "## Usage / efficiency", "",
+        f"- Input tokens: {token_totals['input_tokens']}",
+        f"- Cached input tokens: {token_totals['cached_input_tokens']}",
+        f"- Output tokens: {token_totals['output_tokens']}",
+        f"- Reasoning tokens: {token_totals['reasoning_output_tokens']}",
+        f"- Commands executed: {token_totals['commands_executed']}",
+        "", "## Finalization", "",
+        f"- Suggested commit: `{report['suggested_commit']}`",
+        f"- Commit: `{state.get('commit_sha') or '-'}`",
+        f"- Push upstream: `{state.get('push_upstream') or '-'}`",
+        f"- Review: `python3 scripts/ralph.py finalize {state.get('plan_hash')}`",
+        f"- Commit: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --commit`",
+        f"- Push: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --push`",
+        "",
+    ]
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return report
+
+
+def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint:
+        raise RuntimeError("recovery checkpoint is missing; finalization refused")
+    baseline = set(checkpoint.get("baseline_dirty_paths") or [])
+    baseline_staged = sorted(checkpoint.get("baseline_staged_paths") or [])
+    if baseline_staged:
+        raise RuntimeError(f"pre-existing staged changes were present at approval; automated commit refused: {baseline_staged}")
+    planned = set(state.get("plan_changed_files") or [])
+    if not planned:
+        raise RuntimeError("no RALPH plan changes are recorded; commit refused")
+    overlap = sorted(baseline & planned)
+    if overlap:
+        raise RuntimeError(f"plan changed files that were already dirty at approval; safe automated commit refused: {overlap}")
+    current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
+    baseline = {path for path in baseline if not path.startswith(".ralph/")}
+    unexpected = sorted(current - baseline - planned)
+    if unexpected:
+        raise RuntimeError(f"unexpected working-tree delta outside baseline/plan; automated commit refused: {unexpected}")
+    protected = sorted(path for path in planned if is_protected_path(path) or is_tooling_path(path))
+    if protected:
+        raise RuntimeError(f"automated commit refuses protected/RALPH tooling paths: {protected}")
+    missing = sorted(path for path in planned if path not in current)
+    if missing:
+        raise RuntimeError(f"recorded plan paths are no longer present in the working-tree delta: {missing}")
+    proc = _git(["diff", "--check", "--", *sorted(planned)], check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git diff --check failed: {proc.stdout[-3000:]}")
+    audit = ROOT / "scripts" / "public_release_audit.py"
+    if audit.exists():
+        proc = run_process([sys.executable, str(audit.relative_to(ROOT))])
+        if proc.returncode != 0:
+            raise RuntimeError(f"public release audit failed; commit refused: {proc.stdout[-4000:]}")
+    return sorted(planned), sorted(baseline)
+
+
+def _default_commit_message(state: dict) -> str:
+    goal = " ".join(str(((state.get("plan") or {}).get("goal") or "RALPH plan completion")).split())
+    goal = re.sub(r"[^A-Za-z0-9 ._/-]+", "", goal).strip()
+    if len(goal) > 64:
+        goal = goal[:61].rstrip() + "..."
+    return f"chore(zen): {goal[0].lower() + goal[1:] if goal else 'ralph plan completion'}"
+
+
+def cmd_checkpoints(_: argparse.Namespace) -> int:
+    init_files()
+    manifests = sorted(RECOVERY.glob("*/manifest.json"), reverse=True)
+    if not manifests:
+        print("No RALPH recovery checkpoints.")
+        return 0
+    for path in manifests[:30]:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        print(f"{data.get('id')} head={str(data.get('head') or '')[:12]} branch={data.get('branch') or '-'} dirty={len(data.get('baseline_dirty_paths') or [])} ref={data.get('ref')}")
+    return 0
+
+
+def cmd_checkpoint_info(args: argparse.Namespace) -> int:
+    init_files()
+    data = load_recovery_checkpoint(args.checkpoint_id)
+    if not data:
+        raise RuntimeError(f"unknown checkpoint {args.checkpoint_id}")
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    init_files()
+    state = load_state()
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("report hash does not match the current plan")
+    gates = list((state.get("final_qualification") or {}).get("gates") or [])
+    report = build_completion_report(state, gates)
+    print(report["markdown_path"])
+    return 0
+
+
+def cmd_finalize(args: argparse.Namespace) -> int:
+    init_files()
+    state = load_state()
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("finalize hash does not match the current plan")
+    action = "push" if args.push else "commit" if args.commit else "review"
+    if action == "review":
+        if state.get("status") not in {"READY_TO_COMMIT", "COMMITTED", "PUSHED"}:
+            raise RuntimeError(f"finalize review requires READY_TO_COMMIT/COMMITTED/PUSHED, found {state.get('status')}")
+        report = build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
+        print(tui.completion_card(report))
+        print(f"Report: {report['markdown_path']}")
+        return 0
+
+    if action == "commit":
+        if state.get("status") != "READY_TO_COMMIT":
+            raise RuntimeError(f"finalize --commit requires READY_TO_COMMIT, found {state.get('status')}")
+        planned, _baseline = _finalization_guard(state)
+        _git(["add", "--", *planned])
+        message = args.message or _default_commit_message(state)
+        proc = _git(["commit", "-m", message, "-m", f"RALPH-Plan: {state.get('plan_hash')}"] , check=False)
+        if proc.returncode != 0:
+            _git(["reset"], check=False)
+            raise RuntimeError(f"git commit failed ({proc.returncode}): {proc.stdout[-4000:]}")
+        sha = git_head()
+        state["status"] = "COMMITTED"
+        state["commit_sha"] = sha
+        state["commit_message"] = message
+        save_state(state)
+        build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
+        live_write(f"commit {sha[:12]} created · {message}", "COMPLETE")
+        print(f"COMMITTED plan={state['plan_hash']} sha={sha}")
+        return 0
+
+    if state.get("status") != "COMMITTED":
+        raise RuntimeError(f"finalize --push requires COMMITTED, found {state.get('status')}")
+    upstream = git_upstream()
+    if not upstream or "/" not in upstream:
+        raise RuntimeError("current branch has no configured upstream; push refused")
+    remote, remote_branch = upstream.split("/", 1)
+    current_branch = git_branch()
+    if not current_branch:
+        raise RuntimeError("detached HEAD; push refused")
+    fetch = _git(["fetch", "--quiet", "--prune", remote], check=False)
+    if fetch.returncode != 0:
+        raise RuntimeError(f"could not refresh configured upstream; push refused: {fetch.stdout[-3000:]}")
+    counts = _git(["rev-list", "--left-right", "--count", f"HEAD...{upstream}"]).stdout.strip().split()
+    if len(counts) != 2:
+        raise RuntimeError("could not determine upstream divergence")
+    ahead, behind = map(int, counts)
+    if behind:
+        raise RuntimeError(f"configured upstream is ahead by {behind}; push refused")
+    if ahead < 1:
+        raise RuntimeError("nothing to push to configured upstream")
+    proc = _git(["push"], check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git push failed ({proc.returncode}): {proc.stdout[-4000:]}")
+    state["status"] = "PUSHED"
+    state["push_upstream"] = upstream
+    state["pushed_at"] = utc_now()
+    save_state(state)
+    build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
+    live_write(f"pushed commit {str(state.get('commit_sha') or '')[:12]} to configured upstream {upstream}", "COMPLETE")
+    print(f"PUSHED plan={state['plan_hash']} upstream={upstream}")
+    return 0
+
 def init_files() -> None:
     RALPH.mkdir(parents=True, exist_ok=True)
+    RECOVERY.mkdir(parents=True, exist_ok=True)
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    EVENTS.touch(exist_ok=True)
     if not STATE.exists():
         save_state(default_state())
     if not PLAN.exists():
@@ -366,14 +1019,15 @@ def append_journal(loop_no: int, step_no: int, phase: str, result: str, *, summa
 
 
 def live_write(message: str, category: str = "RALPH") -> None:
-    """Write a concise operator-visible event to terminal and the local live trace."""
+    """Write a plain durable trace plus a colour-aware operator event."""
     RALPH.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().astimezone().strftime("%H:%M:%S")
     clean = " ".join(str(message).split())
-    line = f"[{stamp}] {category:<8} {clean}"
-    print(line, flush=True)
+    plain = f"[{stamp}] {category:<8} {clean}"
+    print(tui.event_line(category, clean, stamp=stamp), flush=True)
     with LIVE.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+        handle.write(plain + "\n")
+    tui.write_event(EVENTS, category, clean)
 
 
 def _clip(text: str, limit: int = 500) -> str:
@@ -393,24 +1047,36 @@ def codex_event_messages(event: dict) -> list[tuple[str, str]]:
     elif event_type == "turn.started":
         messages.append(("CODEX", "turn started"))
     elif event_type == "item.started" and item_type == "command_execution":
-        messages.append(("RUN", _clip(item.get("command", ""))))
+        command = str(item.get("command") or "")
+        first = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+        read_tools = {"cat", "sed", "grep", "rg", "head", "tail", "less", "find", "ls", "stat", "git"}
+        category = "READ" if first in read_tools and not any(token in command for token in (" >", ">>", " apply", " commit", " add ", " rm ", " mv ")) else "RUN"
+        messages.append((category, _clip(command)))
     elif event_type == "item.completed":
         if item_type == "reasoning":
             messages.append(("THINK", _clip(item.get("text", ""), 800)))
         elif item_type == "command_execution":
             status = str(item.get("status") or "completed").upper()
             code = item.get("exit_code")
-            suffix = f" exit={code}" if code is not None else ""
-            messages.append(("CMD", f"{status}{suffix} · {_clip(item.get('command', ''))}"))
-            if status == "FAILED" and item.get("aggregated_output"):
-                messages.append(("OUTPUT", _clip(str(item["aggregated_output"])[-1200:], 800)))
+            command = str(item.get("command") or "")
+            failed = status == "FAILED" or (code is not None and int(code) != 0)
+            validation = any(token in command for token in ("unittest", "pytest", "py_compile", "validate.py", "audit.py"))
+            if failed:
+                messages.append(("FAIL", f"exit={code} · {_clip(command)}"))
+                if item.get("aggregated_output"):
+                    messages.append(("OUTPUT", _clip(str(item["aggregated_output"])[-1200:], 800)))
+            elif validation:
+                messages.append(("PASS", f"exit={code if code is not None else 0} · {_clip(command)}"))
         elif item_type == "file_change":
             changes = item.get("changes") if isinstance(item.get("changes"), list) else []
-            rendered = []
+            if not changes:
+                messages.append(("EDIT", "file change completed"))
             for change in changes:
-                if isinstance(change, dict):
-                    rendered.append(f"{change.get('kind', 'update')}:{change.get('path', '?')}")
-            messages.append(("FILES", ", ".join(rendered) if rendered else "file change completed"))
+                if not isinstance(change, dict):
+                    continue
+                kind = str(change.get("kind") or "update").lower()
+                category = {"add": "CREATE", "create": "CREATE", "delete": "DELETE", "remove": "DELETE", "rename": "MOVE", "move": "MOVE"}.get(kind, "EDIT")
+                messages.append((category, str(change.get("path") or "?")))
         elif item_type == "error":
             messages.append(("WARN", _clip(item.get("message", "Codex item error"), 800)))
     elif event_type == "turn.completed":
@@ -472,8 +1138,9 @@ def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
 def authority_snapshot() -> dict[Path, bytes | None]:
     paths = (
         STATE, PLAN, IDEAS, JOURNAL, POLICY, CONTEXT,
-        ROOT / ".gitignore", ROOT / "scripts" / "ralph.py",
-        ROOT / "tests" / "test_ralph_lite.py", ROOT / "docs" / "RALPH-LITE.md",
+        ROOT / ".gitignore", ROOT / "scripts" / "ralph.py", ROOT / "scripts" / "ralph_gate.py", ROOT / "scripts" / "ralph_tui.py",
+        ROOT / "tests" / "test_ralph_lite.py", ROOT / "tests" / "test_ralph_gate.py", ROOT / "tests" / "test_ralph_lifecycle.py",
+        ROOT / "docs" / "RALPH-LITE.md",
     )
     return {path: path.read_bytes() if path.exists() else None for path in paths}
 
@@ -545,13 +1212,38 @@ def classify_changes(paths: Iterable[str]) -> str:
     return "product-development"
 
 
-def test_policy_violation(before: dict[str, str], after: dict[str, str], policy: str) -> list[str]:
+def test_policy_violation(
+    before: dict[str, str],
+    after: dict[str, str],
+    policy: str,
+    *,
+    state: dict | None = None,
+    step_no: int | None = None,
+) -> list[str]:
+    """Enforce test authority against the approval-time baseline, not retry-loop state.
+
+    A test created by the approved plan remains editable during later repair/retry
+    loops under add-only policy.  Tests that existed when the plan was approved
+    remain protected.  Explicit human steering may authorize one exact new test
+    path without granting authority over existing tests.
+    """
     changed = [p for p in changed_paths(before, after) if p == "tests" or p.startswith("tests/")]
     if policy == "modify":
         return []
+    allowed = steering_allowed_new_tests(state or {}, int(step_no or 0)) if state else set()
     if policy == "none":
-        return changed
-    return [p for p in changed if p in before]  # add-only: existing tests may not change or disappear
+        return [p for p in changed if p not in allowed]
+    violations: list[str] = []
+    for path in changed:
+        if path in allowed:
+            continue
+        if state is not None:
+            if plan_baseline_path_kind(state, path) == "absent":
+                continue
+            violations.append(path)
+        elif path in before:
+            violations.append(path)
+    return violations
 
 
 def normalize_failure(text: str) -> str:
@@ -769,18 +1461,54 @@ def efficiency_findings(stats: dict | None) -> list[str]:
     return findings
 
 
-def codex_requires_human_before_gates(result: dict) -> tuple[bool, str]:
-    """Only policy/human-decision blockers may pre-empt controller qualification.
+def _step_explicitly_delegates_human_gate(step: dict | None) -> bool:
+    """Return true only when the approved step explicitly delegates a human gate.
+
+    This is intentionally conservative.  A model-authored summary may never create
+    new human authority by itself; the approved plan must already say that missing
+    runtime/operator evidence stops at BLOCKED_HUMAN.
+    """
+    if not isinstance(step, dict):
+        return False
+    text = " ".join([
+        str(step.get("objective") or ""),
+        *(str(value) for value in (step.get("acceptance") or [])),
+    ]).lower()
+    return (
+        "blocked_human" in text
+        and any(marker in text for marker in ("operator", "runtime", "evidence", "human-owned", "human owned"))
+    )
+
+
+def _declared_human_block(result: dict) -> str:
+    summary = str(result.get("summary") or "").strip()
+    match = re.match(r"^BLOCKED_HUMAN\s*:\s*(.*)$", summary, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    detail = match.group(1).strip()
+    return detail or "Approved step requires human-owned evidence before it can advance"
+
+
+def codex_requires_human_before_gates(result: dict, step: dict | None = None) -> tuple[bool, str]:
+    """Only approved human/policy blockers may pre-empt controller qualification.
 
     Local/focused validation is advisory: the deterministic controller owns the
-    authoritative qualification gates and must be allowed to run them.
+    authoritative qualification gates and must be allowed to run them.  However,
+    if the approved step explicitly delegates missing operator/runtime evidence to
+    BLOCKED_HUMAN, a model result that explicitly declares BLOCKED_HUMAN must not
+    be laundered into PASS merely because generic compile/unit/UX gates succeed.
     """
     blocker_class = str(result.get("blocker_class") or "none")
     blockers = [str(item).strip() for item in (result.get("blockers") or []) if str(item).strip()]
+
+    declared = _declared_human_block(result)
+    if declared and _step_explicitly_delegates_human_gate(step):
+        return True, declared
+
     if blocker_class == "validation-only":
         return False, ""
     if blocker_class in {"human-decision", "policy"} or result.get("needs_human"):
-        return True, "; ".join(blockers or ["Codex requested human review"])
+        return True, "; ".join(blockers or [declared or "Codex requested human review"])
     if blockers:
         return True, "; ".join(blockers)
     return False, ""
@@ -797,7 +1525,7 @@ def is_recoverable_validation_block(reason: str) -> bool:
 
 def git_changed_paths() -> list[str]:
     """Return current tracked/untracked worktree paths without reading file contents."""
-    proc = run_process(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    proc = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"git status failed ({proc.returncode}): {proc.stdout[-2000:]}")
     entries = proc.stdout.split("\0")
@@ -827,9 +1555,9 @@ def validate_recovery_paths(paths: Iterable[str], step: dict) -> None:
     if policy == "none" and test_paths:
         raise RuntimeError(f"blocked-change recovery violates test policy none: {test_paths}")
     if policy == "add-only":
+        state = load_state()
         for path in test_paths:
-            proc = run_process(["git", "cat-file", "-e", f"HEAD:{path}"])
-            if proc.returncode == 0:
+            if plan_baseline_path_kind(state, path) != "absent":
                 raise RuntimeError(f"blocked-change recovery modifies existing test under add-only policy: {path}")
 
 
@@ -856,6 +1584,9 @@ Acceptance: {json.dumps(step['acceptance'])}
 Test-change policy: {step['test_change_policy']}
 {repair_text}
 
+Human steering for this approved step (bounded, auditable; does not waive protected-path/security rules):
+{json.dumps(steering_for_step(state, int(step['id'])), separators=(',', ':'))}
+
 Compact handoff from the previous successful loop:
 {json.dumps(prior, separators=(',', ':'))}
 
@@ -873,7 +1604,7 @@ CONTEXT-EFFICIENCY RULES:
 
 Read .ralph/policy.md and obey it. Do not edit any file under .ralph. Do not interact with live RouterOS, secrets, credentials, or external production systems. Stay inside the repository. Do not disable, skip, delete, or weaken qualification to obtain a pass. Make only changes necessary for this step. You may run focused local tests while working, but the external controller will run authoritative gates afterwards.
 If you discover useful out-of-scope work, return it in ideas and continue the approved step rather than implementing it.
-Use blocker_class="human-decision" only when genuine human judgement is required and blocker_class="policy" only when safe completion would break policy. In those cases return needs_human=true with blockers. Otherwise use blocker_class="none" (or "validation-only" as described above).
+Use blocker_class="human-decision" only when genuine human judgement is required and blocker_class="policy" only when safe completion would break policy. In those cases return needs_human=true with blockers. If the APPROVED acceptance explicitly says missing operator/runtime evidence must stop at BLOCKED_HUMAN, treat absent required evidence as blocker_class="human-decision", needs_human=true, and put the exact evidence/action in blockers; never classify that condition as validation-only. Otherwise use blocker_class="none" (or "validation-only" as described above).
 If safe completion requires breaking policy or human judgement, make no speculative workaround: return needs_human=true with blockers.
 """
 
@@ -1302,6 +2033,63 @@ def cmd_usage(args: argparse.Namespace) -> int:
             print(f"  proposal {index:04d}: input={item['input']:,} non-cached={item['noncached']:,} output={item['output']:,} reasoning={item['reasoning']:,} cache={ratio:.1f}%")
     return 0 if snapshot else 2
 
+def gate_id_for_state(state: dict) -> str:
+    """Return the stable operator-facing ID for the currently latched human gate."""
+    return f"HG-{int(state.get('loop_count') or 0):04d}-{int(state.get('current_step') or 0):02d}"
+
+
+def human_gate_resolution_allowed(state: dict) -> tuple[bool, str]:
+    """Conservatively decide whether a human-owned gate may advance without Codex retry.
+
+    This is intentionally narrower than BLOCKED_HUMAN itself. Policy/authority failures,
+    repair exhaustion, and ordinary agent decisions must be retried or otherwise handled;
+    only an approved step that explicitly delegates a runtime/operator evidence condition
+    to BLOCKED_HUMAN can be human-confirmed.
+    """
+    if state.get("status") != "BLOCKED_HUMAN":
+        return False, "controller is not BLOCKED_HUMAN"
+    if state.get("active_failure"):
+        return False, "active implementation failure cannot be human-confirmed"
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    current = int(state.get("current_step") or 0)
+    if not (1 <= current <= len(steps)) or not isinstance(steps[current - 1], dict):
+        return False, "current approved step is unavailable"
+    step = steps[current - 1]
+    approval_text = " ".join([
+        str(step.get("objective") or ""),
+        *(str(item) for item in (step.get("acceptance") or [])),
+    ]).lower()
+    if "blocked_human" not in approval_text:
+        return False, "approved step does not explicitly delegate a BLOCKED_HUMAN condition"
+    if not any(marker in approval_text for marker in ("runtime", "operator", "human-owned", "human owned")):
+        return False, "approved step does not delegate runtime/operator-owned acceptance"
+
+    block_text = " ".join(str(state.get("block_reason") or "").split()).lower()
+    forbidden = (
+        "policy violation", "protected path", "controller/tooling authority",
+        "approved plan file changed", "repair attempts", "secret", "credential",
+    )
+    if any(marker in block_text for marker in forbidden):
+        return False, "current blocker is policy/authority owned and cannot be human-confirmed"
+    return True, "approved runtime/operator gate may be human-confirmed"
+
+
+def append_human_gate_resolution(state: dict, step: dict, gate_id: str, reason: str, original_block: str) -> None:
+    """Append an explicit non-Codex audit record for a resolved human gate."""
+    with JOURNAL.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"## Human gate {gate_id} resolved — {utc_now()}\n\n"
+            f"- Plan: `{state.get('plan_hash')}`\n"
+            f"- Plan step: {step.get('id')}\n"
+            f"- Result: HUMAN_CONFIRMED\n"
+            f"- Original blocker: {original_block or '-'}\n"
+            f"- Human evidence/reason: {reason}\n"
+            f"- Codex loop incremented: no\n"
+            f"- Next action: step {int(step.get('id') or 0) + 1} of approved plan\n\n"
+        )
+
+
 def block(state: dict, reason: str) -> None:
     state["status"] = "BLOCKED_HUMAN"
     state["block_reason"] = reason
@@ -1324,14 +2112,14 @@ def cmd_init(_: argparse.Namespace) -> int:
 def cmd_propose(args: argparse.Namespace) -> int:
     init_files()
     state = load_state()
-    if state.get("status") not in {"IDLE", "PLAN_COMPLETE"}:
+    if state.get("status") not in {"IDLE", "PLAN_COMPLETE", "PUSHED"}:
         raise RuntimeError(f"cannot propose while status={state.get('status')}; finish or resolve the current plan first")
     plan = run_codex(plan_prompt(args.goal), PLAN_SCHEMA, "read-only", context="PLAN PROPOSAL")
     validate_plan(plan)
     digest = plan_hash(plan)
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state})
+    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "step_results": [], "final_qualification": None, "commit_sha": None, "push_upstream": None, "completion_changes": None})
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
@@ -1349,10 +2137,27 @@ def cmd_approve(args: argparse.Namespace) -> int:
         raise RuntimeError("approval hash does not match the proposed plan")
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
         raise RuntimeError("plan.md changed after proposal; proposal must be regenerated before approval")
+    checkpoint = create_recovery_checkpoint(state)
     state["status"] = "APPROVED"
+    state["recovery_checkpoint"] = checkpoint["id"]
+    state["plan_changed_files"] = []
+    state["plan_owned_files"] = []
+    state["human_steering"] = []
+    state["steering_allowed_new_tests"] = []
+    state["step_results"] = []
     state.pop("proposal_previous_state", None)
     save_state(state)
-    print(f"Approved plan {expected}; {len(state['plan']['steps'])} steps ready.")
+    print(tui.box(
+        "PLAN APPROVED · RECOVERY CHECKPOINT CREATED",
+        [
+            f"Plan {expected}",
+            f"Steps {len(state['plan']['steps'])}",
+            f"Recovery {checkpoint['id']}",
+            f"Git ref {checkpoint['ref']}",
+            "Execution may now start safely.",
+        ],
+        tone="green",
+    ))
     return 0
 
 
@@ -1368,7 +2173,7 @@ def cmd_reject(args: argparse.Namespace) -> int:
 
     current_usage = state.get("codex_usage")
     previous = state.get("proposal_previous_state")
-    if isinstance(previous, dict) and previous.get("status") in {"IDLE", "PLAN_COMPLETE"}:
+    if isinstance(previous, dict) and previous.get("status") in {"IDLE", "PLAN_COMPLETE", "PUSHED"}:
         restored = dict(previous)
         if isinstance(current_usage, dict):
             restored["codex_usage"] = current_usage
@@ -1407,7 +2212,198 @@ def cmd_reject(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_retire_plan(args: argparse.Namespace) -> int:
+    """Human-only retirement of an obsolete approved plan."""
+    init_files()
+    state = load_state()
+
+    allowed = {
+        "APPROVED",
+        "BLOCKED_HUMAN",
+        "BLOCKED_ENVIRONMENT",
+        "PAUSED_USAGE",
+        "PAUSED_USAGE_LIMIT",
+        "READY_TO_COMMIT",
+        "COMMITTED",
+    }
+    status = str(state.get("status") or "")
+    if status not in allowed:
+        raise RuntimeError(
+            f"retire-plan requires an active approved/blocked plan, found {status}"
+        )
+
+    expected = state.get("plan_hash")
+    if not expected or args.plan_hash != expected:
+        raise RuntimeError("retire-plan hash does not match the active plan")
+
+    reason = " ".join(str(args.reason or "").split())
+    if not reason:
+        raise RuntimeError("retire-plan requires a non-empty reason")
+
+    old_step = int(state.get("current_step") or 1)
+    old_loops = int(state.get("loop_count") or 0)
+    steps = list(((state.get("plan") or {}).get("steps") or []))
+
+    retirement = {
+        "plan_hash": expected,
+        "status_before": status,
+        "step": old_step,
+        "step_count": len(steps),
+        "loop_count": old_loops,
+        "reason": reason[:1200],
+        "retired_at": utc_now(),
+    }
+
+    history = (
+        state.get("retired_plans")
+        if isinstance(state.get("retired_plans"), list)
+        else []
+    )
+    state["retired_plans"] = [*history[-19:], retirement]
+
+    append_journal(
+        old_loops,
+        old_step,
+        "human-retire",
+        "RETIRED",
+        summary=reason,
+        next_action="propose a new plan",
+    )
+
+    live_write(
+        f"plan={expected} retired at step={old_step}/{len(steps)} "
+        f"without Codex execution; returning controller to IDLE",
+        "RETIRED",
+    )
+
+    state.update({
+        "status": "IDLE",
+        "plan_hash": None,
+        "plan": None,
+        "current_step": 1,
+        "failure_attempts": {},
+        "active_failure": None,
+        "last_failure": None,
+        "last_result": "RETIRED",
+        "block_reason": None,
+    })
+    state.pop("proposal_previous_state", None)
+
+    PLAN.unlink(missing_ok=True)
+    save_state(state)
+
+    print(
+        f"RETIRED plan={expected} "
+        f"step={old_step}/{len(steps)} loops={old_loops}; state=IDLE"
+    )
+    return 0
+
+def cmd_steer(args: argparse.Namespace) -> int:
+    """Record bounded human direction for the current blocked step and retry it."""
+    init_files()
+    state = load_state()
+    if state.get("status") != "BLOCKED_HUMAN":
+        raise RuntimeError("steer is only valid from BLOCKED_HUMAN")
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("steer hash does not match the approved plan")
+    expected_gate = gate_id_for_state(state)
+    if args.gate != expected_gate:
+        raise RuntimeError(f"steer gate does not match current gate {expected_gate}")
+    direction = " ".join(str(args.direction or "").split())
+    if not direction:
+        raise RuntimeError("steer requires non-empty human direction")
+
+    step_no = int(state.get("current_step") or 0)
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    if not (1 <= step_no <= len(steps)):
+        raise RuntimeError("steer cannot resolve current approved step")
+    step = steps[step_no - 1]
+
+    original_block = " ".join(str(state.get("block_reason") or "").split())
+    blocked_test_paths = set(re.findall(r"['\"](tests/[^'\"]+)['\"]", original_block))
+    if args.allow_new_test and "policy violation" not in original_block.lower():
+        raise RuntimeError("--allow-new-test is valid only for the current policy-review gate")
+
+    allowed_new_tests: list[str] = []
+    for raw in list(args.allow_new_test or []):
+        path = str(raw or "").strip().replace("\\", "/").lstrip("./")
+        if not path.startswith("tests/") or path == "tests/":
+            raise RuntimeError(f"--allow-new-test requires a concrete tests/ path: {path or raw}")
+        if path not in blocked_test_paths:
+            raise RuntimeError(f"--allow-new-test path is not part of the current policy gate: {path}")
+        if is_protected_path(path) or is_tooling_path(path):
+            raise RuntimeError(f"steer cannot grant authority over protected/RALPH tooling path: {path}")
+        origin = plan_baseline_path_kind(state, path)
+        if origin != "absent":
+            raise RuntimeError(f"steer cannot grant new-test authority to a pre-existing path ({origin}): {path}")
+        if path not in allowed_new_tests:
+            allowed_new_tests.append(path)
+
+    record = {
+        "gate_id": expected_gate,
+        "plan_hash": state.get("plan_hash"),
+        "step": step_no,
+        "step_title": str(step.get("title") or ""),
+        "direction": direction[:1200],
+        "allowed_new_tests": allowed_new_tests,
+        "original_block": original_block[:1200],
+        "recorded_at": utc_now(),
+    }
+    history = state.get("human_steering") if isinstance(state.get("human_steering"), list) else []
+    state["human_steering"] = [*history[-49:], record]
+    grants = state.get("steering_allowed_new_tests") if isinstance(state.get("steering_allowed_new_tests"), list) else []
+    for path in allowed_new_tests:
+        grant = {"step": step_no, "path": path, "gate_id": expected_gate, "recorded_at": record["recorded_at"]}
+        if not any(isinstance(item, dict) and int(item.get("step") or 0) == step_no and item.get("path") == path for item in grants):
+            grants.append(grant)
+    state["steering_allowed_new_tests"] = grants[-100:]
+    state["status"] = "APPROVED"
+    state["block_reason"] = None
+    save_state(state)
+
+    prior = context_handoff(state)
+    findings = list(prior.get("accepted_findings") or [])
+    finding = f"Human steer {expected_gate}: {direction}"[:500]
+    if finding not in findings:
+        findings.insert(0, finding)
+    save_context({
+        "plan_hash": state.get("plan_hash"),
+        "last_step": step_no,
+        "last_result": "HUMAN_STEERED",
+        "summary": direction[:1200],
+        "changed_files": list(prior.get("changed_files") or [])[:12],
+        "relevant_files": list(prior.get("relevant_files") or [])[:8],
+        "accepted_findings": findings[:8],
+    })
+    append_journal(
+        int(state.get("loop_count") or 0),
+        step_no,
+        "human-steer",
+        "STEERED",
+        summary=direction,
+        files=allowed_new_tests,
+        next_action="retry same approved step with bounded human direction",
+    )
+    live_write(
+        f"gate={expected_gate} step={step_no} human direction recorded"
+        + (f" · new-test authority={','.join(allowed_new_tests)}" if allowed_new_tests else ""),
+        "GATE-HUMAN",
+    )
+    print(tui.steer_card(
+        gate_id=expected_gate,
+        step_no=step_no,
+        step_count=len(steps),
+        title=str(step.get("title") or f"Step {step_no}"),
+        direction=direction,
+        allowed_new_tests=allowed_new_tests,
+    ))
+    return 0
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
+    """Retry the same blocked step after human input; this does not accept the step."""
     init_files()
     state = load_state()
     if state.get("status") not in {"BLOCKED_HUMAN", "BLOCKED_ENVIRONMENT"}:
@@ -1417,8 +2413,63 @@ def cmd_resume(args: argparse.Namespace) -> int:
     state["status"] = "APPROVED"
     state["block_reason"] = None
     save_state(state)
-    append_journal(state["loop_count"], state["current_step"], "human-resume", "RESUMED", summary=args.reason, next_action="continue approved plan")
-    print("Human resume accepted; approved plan may continue.")
+    append_journal(state["loop_count"], state["current_step"], "human-resume", "RESUMED", summary=args.reason, next_action="retry same approved step")
+    print("Human resume accepted; the blocked approved step will be retried.")
+    return 0
+
+
+def cmd_resolve_gate(args: argparse.Namespace) -> int:
+    """Accept a human-owned gate and advance without fabricating an autonomous PASS."""
+    init_files()
+    state = load_state()
+    if state.get("status") != "BLOCKED_HUMAN":
+        raise RuntimeError("resolve-gate is only valid from BLOCKED_HUMAN")
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("resolve-gate hash does not match the approved plan")
+    expected_gate = gate_id_for_state(state)
+    if args.gate != expected_gate:
+        raise RuntimeError(f"resolve-gate ID does not match current gate {expected_gate}")
+    reason = " ".join(str(args.reason or "").split())
+    if not reason:
+        raise RuntimeError("resolve-gate requires non-empty human evidence/reason")
+    allowed, why = human_gate_resolution_allowed(state)
+    if not allowed:
+        raise RuntimeError(f"current human gate cannot be resolved by operator confirmation: {why}")
+
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    step = steps[int(state["current_step"]) - 1]
+    original_block = " ".join(str(state.get("block_reason") or "").split())
+    resolution = {
+        "gate_id": expected_gate,
+        "plan_hash": state.get("plan_hash"),
+        "loop": int(state.get("loop_count") or 0),
+        "step": int(state.get("current_step") or 0),
+        "step_title": str(step.get("title") or ""),
+        "result": "HUMAN_CONFIRMED",
+        "reason": reason[:1200],
+        "original_block": original_block[:1200],
+        "resolved_at": utc_now(),
+    }
+    history = state.get("human_gate_resolutions") if isinstance(state.get("human_gate_resolutions"), list) else []
+    state["human_gate_resolutions"] = [*history[-49:], resolution]
+    update_context_after_human_confirmation(state, step, expected_gate, reason)
+    append_human_gate_resolution(state, step, expected_gate, reason, original_block)
+    record_step_result(state, step, "HUMAN_CONFIRMED", summary=reason)
+
+    state["last_result"] = "HUMAN_CONFIRMED"
+    state["block_reason"] = None
+    state["current_step"] = int(state["current_step"]) + 1
+    state["status"] = "APPROVED"
+    save_state(state)
+    live_write(
+        f"gate={expected_gate} resolved HUMAN_CONFIRMED; advanced to step={state['current_step']} without Codex retry",
+        "GATE",
+    )
+    print(
+        f"Human gate {expected_gate} resolved; step {step.get('id')}=HUMAN_CONFIRMED; "
+        f"next step={state['current_step']}/{len(steps)}; status=APPROVED."
+    )
     return 0
 
 
@@ -1432,11 +2483,13 @@ def cmd_status(_: argparse.Namespace) -> int:
     windows = usage.get("windows") if isinstance(usage.get("windows"), list) else []
     remaining = min((float(w.get("remaining_percent", 100.0)) for w in windows), default=None)
     quota = f"{guard}:{remaining:.1f}%min" if remaining is not None else guard
-    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} block={state.get('block_reason') or '-'} efficiency={efficiency.get('status') or '-'} quota={quota}")
+    gate = gate_id_for_state(state) if state.get("status") == "BLOCKED_HUMAN" else "-"
+    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} gate={gate} block={state.get('block_reason') or '-'} efficiency={efficiency.get('status') or '-'} quota={quota}")
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    tui.configure(getattr(args, "color", "auto"))
     init_files()
     state = load_state()
     if state.get("status") not in {"APPROVED", "RUNNING", "PAUSED_USAGE_LIMIT"}:
@@ -1444,6 +2497,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
         block(state, "approved plan file changed")
         raise RuntimeError("approved plan file changed; blocked for human review")
+    if not state.get("recovery_checkpoint"):
+        checkpoint = create_recovery_checkpoint(state)
+        state["recovery_checkpoint"] = checkpoint["id"]
+        save_state(state)
 
     loops_this_run = 0
     while state["current_step"] <= len(state["plan"]["steps"]):
@@ -1469,11 +2526,25 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
         save_state(state)
         phase = "repair" if active_fp else "implement"
+        usage = state.get("codex_usage") if isinstance(state.get("codex_usage"), dict) else {}
+        windows = usage.get("windows") if isinstance(usage.get("windows"), list) else []
+        remaining = min((float(w.get("remaining_percent", 100.0)) for w in windows), default=None)
+        quota = f"{remaining:.1f}% remaining" if remaining is not None else ""
+        efficiency_state = state.get("last_efficiency") if isinstance(state.get("last_efficiency"), dict) else {}
+        print(tui.step_banner(
+            loop_no=loop_no, step_no=int(step["id"]), step_count=len(state["plan"]["steps"]),
+            title=str(step["title"]), phase=phase, plan_hash=str(state["plan_hash"]),
+            repair=repair_no, quota=quota, status=str(state.get("status") or "RUNNING"),
+            efficiency=str(efficiency_state.get("status") or "PASS"),
+            recovery=str(state.get("recovery_checkpoint") or "-"),
+            changed_files=len(state.get("plan_changed_files") or []),
+        ))
         live_write(
             f"loop={loop_no:04d} step={step['id']}/{len(state['plan']['steps'])} phase={phase} repair={repair_no} title={step['title']}",
             "RALPH",
         )
 
+        loop_git_base = _git(["stash", "create", f"RALPH loop {loop_no:04d} pre-turn"], check=False).stdout.strip() or git_head()
         before_repo = repo_snapshot()
         authority = authority_snapshot()
         protected_before = protected_snapshot()
@@ -1507,18 +2578,50 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
 
         protected = [p for p in files if is_protected_path(p)]
-        test_violations = test_policy_violation(before_repo, after_repo, step["test_change_policy"])
+        test_violations = test_policy_violation(
+            before_repo, after_repo, step["test_change_policy"], state=state, step_no=int(step["id"])
+        )
         if protected or test_violations:
             if protected:
                 restore_protected(protected_before, protected)
             reason = "policy violation: " + "; ".join(filter(None, [f"protected paths {protected}" if protected else "", f"test paths {test_violations}" if test_violations else ""]))
-            append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
+            origins = {path: plan_baseline_path_kind(state, path) for path in test_violations}
+            print(tui.policy_gate_card(
+                gate_id=gate_id_for_state(state),
+                step_no=int(step["id"]),
+                step_count=len(state["plan"]["steps"]),
+                title=str(step.get("title") or ""),
+                test_policy=str(step.get("test_change_policy") or ""),
+                paths=test_violations,
+                origins=origins,
+                acceptance=list(step.get("acceptance") or []),
+                protected=protected,
+            ))
+            append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="review gate; steer/resume/replan as appropriate", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
             append_ideas(loop_no, result.get("ideas", []))
             block(state, reason)
             return 2
 
+        remember_plan_files(state, files)
+        save_state(state)
+        entries = change_entries(files, base_ref=loop_git_base)
+        if entries:
+            print(tui.change_card(entries))
+            preview = tui.diff_preview(bounded_diff(files, base_ref=loop_git_base))
+            if preview:
+                print(preview)
+            summary_card = tui.behavior_summary(str(result.get("summary") or ""))
+            if summary_card:
+                print(summary_card)
+            for item in entries:
+                live_write(
+                    f"{item['path']} +{item['added']}/-{item['removed']}"
+                    + (f" · {', '.join(item['symbols'])}" if item.get("symbols") else ""),
+                    item["action"],
+                )
+
         append_ideas(loop_no, result.get("ideas", []))
-        requires_human, reason = codex_requires_human_before_gates(result)
+        requires_human, reason = codex_requires_human_before_gates(result, step)
         if requires_human:
             append_journal(loop_no, step["id"], phase, "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
             block(state, reason)
@@ -1539,6 +2642,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             state["active_failure"] = None
             state["last_efficiency"] = {"status": "WARN" if efficiency else "PASS", "findings": efficiency}
             update_context_after_pass(state, step, result, files)
+            record_step_result(state, step, "PASS", summary=result.get("summary", ""), files=files, gates=gates, stats=stats)
+            entry_stats = change_entries(files, base_ref=loop_git_base)
+            print(tui.result_card(
+                result="PASS",
+                step_no=int(step["id"]),
+                step_count=len(state["plan"]["steps"]),
+                files=len(entry_stats),
+                added=sum(int(item.get("added") or 0) for item in entry_stats),
+                removed=sum(int(item.get("removed") or 0) for item in entry_stats),
+                tests=gates,
+                tokens=stats,
+            ))
             state["current_step"] += 1
             state["status"] = "APPROVED"
             save_state(state)
@@ -1564,17 +2679,60 @@ def cmd_run(args: argparse.Namespace) -> int:
             block(state, f"failure {fp} persisted through {MAX_REPAIRS_PER_FAILURE} repair attempts")
             return 2
 
-    state["status"] = "PLAN_COMPLETE"
+    passed, final_gates, final_durations, final_output = run_final_qualification()
+    state["final_qualification"] = {
+        "state": "PASS" if passed else "FAIL",
+        "gates": final_gates,
+        "durations": final_durations,
+        "output": final_output[-6000:],
+        "completed_at": utc_now(),
+    }
     state["block_reason"] = None
     try:
         state["codex_usage"] = query_codex_rate_limits()
     except Exception:
         pass
+
+    if not passed:
+        state["status"] = "BLOCKED_HUMAN"
+        state["block_reason"] = "final qualification failed after all approved steps completed"
+        save_state(state)
+        append_journal(
+            state["loop_count"], len(state["plan"]["steps"]), "final-qualification", "FAIL",
+            summary=state["block_reason"], gates=final_gates, next_action="human review final qualification output",
+        )
+        live_write(state["block_reason"], "FAIL")
+        print(final_output[-6000:])
+        return 2
+
+    final_entries = change_entries(state.get("plan_changed_files") or [])
+    state["completion_changes"] = {
+        "entries": final_entries,
+        "files": len(final_entries),
+        "added": sum(int(item.get("added") or 0) for item in final_entries),
+        "removed": sum(int(item.get("removed") or 0) for item in final_entries),
+    }
+    state["status"] = "READY_TO_COMMIT"
     save_state(state)
+    report = build_completion_report(state, final_gates)
     with JOURNAL.open("a", encoding="utf-8") as handle:
-        handle.write(f"## Plan complete — {utc_now()}\n\n- Plan: `{state['plan_hash']}`\n- Loops: {state['loop_count']}\n- Steps: {len(state['plan']['steps'])}\n- Status: PLAN_COMPLETE\n- Next action: human review and approve a new 5-10 step plan\n\n")
-    live_write(f"plan complete · plan={state['plan_hash']} loops={state['loop_count']} steps={len(state['plan']['steps'])}", "COMPLETE")
-    print(f"PLAN_COMPLETE plan={state['plan_hash']} loops={state['loop_count']} steps={len(state['plan']['steps'])}")
+        handle.write(
+            f"## Plan complete — {utc_now()}\n\n"
+            f"- Plan: `{state['plan_hash']}`\n"
+            f"- Loops: {state['loop_count']}\n"
+            f"- Steps: {len(state['plan']['steps'])}\n"
+            "- Final qualification: PASS\n"
+            "- Status: READY_TO_COMMIT\n"
+            f"- Completion report: `{report['markdown_path']}`\n"
+            f"- Recovery checkpoint: `{state.get('recovery_checkpoint')}`\n"
+            f"- Next action: python3 scripts/ralph.py finalize {state['plan_hash']}\n\n"
+        )
+    live_write(
+        f"plan complete · final qualification PASS · report={report['markdown_path']} · READY_TO_COMMIT",
+        "READY",
+    )
+    print(tui.completion_card(report))
+    print(f"Next: python3 scripts/ralph.py finalize {state['plan_hash']}")
     return 0
 
 
@@ -1667,18 +2825,52 @@ def build_parser() -> argparse.ArgumentParser:
     reject.add_argument("plan_hash")
     reject.add_argument("--reason", required=True)
     reject.set_defaults(func=cmd_reject)
+
+    retire = sub.add_parser(
+        "retire-plan",
+        help="retire an obsolete active plan without granting execution authority",
+    )
+    retire.add_argument("plan_hash")
+    retire.add_argument("--reason", required=True)
+    retire.set_defaults(func=cmd_retire_plan)
     run = sub.add_parser("run")
     run.add_argument("--max-loops", type=int, default=DEFAULT_MAX_LOOPS)
     run.add_argument("--wait-for-limits", action=argparse.BooleanOptionalAction, default=True, help="wait and automatically resume after Codex usage limits recover")
     run.add_argument("--usage-poll-seconds", type=int, default=USAGE_POLL_SECONDS, help="maximum zero-model usage recheck interval while paused")
+    run.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="terminal colour mode")
     run.set_defaults(func=cmd_run)
-    resume = sub.add_parser("resume")
+    steer = sub.add_parser("steer", help="record bounded human direction for the current blocked step and retry it")
+    steer.add_argument("plan_hash")
+    steer.add_argument("--gate", required=True, help="exact current human-gate ID")
+    steer.add_argument("--direction", required=True, help="bounded human direction retained in the audit trail and next prompt")
+    steer.add_argument("--allow-new-test", action="append", default=[], metavar="PATH", help="explicitly authorise one exact new tests/ path; never permits editing pre-existing tests")
+    steer.set_defaults(func=cmd_steer)
+    resume = sub.add_parser("resume", help="retry the same blocked approved step after human input")
     resume.add_argument("plan_hash")
     resume.add_argument("--reason", required=True)
     resume.set_defaults(func=cmd_resume)
+    resolve_gate = sub.add_parser("resolve-gate", help="human-confirm an explicitly delegated runtime/operator gate and advance")
+    resolve_gate.add_argument("plan_hash")
+    resolve_gate.add_argument("--gate", required=True, help="exact current human-gate ID, for example HG-0015-04")
+    resolve_gate.add_argument("--reason", required=True, help="human evidence/action satisfying the approved gate")
+    resolve_gate.set_defaults(func=cmd_resolve_gate)
     recover = sub.add_parser("recover-validation-block")
     recover.add_argument("plan_hash")
     recover.set_defaults(func=cmd_recover_validation_block)
+    sub.add_parser("checkpoints", help="list local Git-backed recovery checkpoints").set_defaults(func=cmd_checkpoints)
+    checkpoint_info = sub.add_parser("checkpoint-info", help="show one recovery checkpoint manifest")
+    checkpoint_info.add_argument("checkpoint_id")
+    checkpoint_info.set_defaults(func=cmd_checkpoint_info)
+    report = sub.add_parser("report", help="regenerate the current plan completion report")
+    report.add_argument("plan_hash")
+    report.set_defaults(func=cmd_report)
+    finalize = sub.add_parser("finalize", help="review, commit, or push a fully qualified completed plan")
+    finalize.add_argument("plan_hash")
+    action = finalize.add_mutually_exclusive_group()
+    action.add_argument("--commit", action="store_true", help="commit only the recorded plan delta after final guards")
+    action.add_argument("--push", action="store_true", help="push the committed plan to the current configured upstream")
+    finalize.add_argument("--message", help="explicit commit subject; used only with --commit")
+    finalize.set_defaults(func=cmd_finalize)
     usage = sub.add_parser("usage", help="show RALPH context/token usage and live Codex remaining limits")
     usage.add_argument("--details", action="store_true", help="include per-loop token usage")
     usage.add_argument("--json", action="store_true", help="emit machine-readable report")

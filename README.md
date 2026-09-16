@@ -16,7 +16,7 @@ If you are new to ZEN, use the documentation in this order:
 2. **Prepare and install** with [docs/INSTALL.md](docs/INSTALL.md) and the reviewed [RouterOS setup bundle](routeros/setup/README.md).
 3. **Configure safely** with [.env.example](.env.example) and [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 4. **Operate and recover** with [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
-5. **Contribute or review security-sensitive changes** with [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md) and [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
+5. **Contribute or review security-sensitive changes** with [CONTRIBUTING.md](CONTRIBUTING.md), [docs/RALPH-LITE.md](docs/RALPH-LITE.md), [SECURITY.md](SECURITY.md), [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md) and [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
 
 ZEN is designed for technically confident operators. It intentionally exposes evidence and failure states instead of hiding them behind a one-click appliance model.
 
@@ -321,6 +321,17 @@ docker compose --env-file .env.example config >/dev/null
 The project also runs these source-level checks in GitHub Actions.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes that touch RouterOS authority, authentication, migration or evidence semantics.
+
+### Public contribution flow
+
+Public work follows **Issue → Triage → Ready → Claimed → short-lived implementation
+→ early Draft PR → CI/review → merge**. Declare one bounded scope and its
+non-goals before claiming work. Changes touching RouterOS authority/security,
+authentication, PWA/browser security, diagnostics/incidents/performance, release
+readiness, public audit, RALPH-Lite, or CI/workflows require early coordination
+with the relevant authority/security owner; do not use a PR to widen authority
+without that review. GitHub Projects, Discussions, and additional automation are
+post-release ideas only, not current workflow commitments.
 
 ## Repository layout
 

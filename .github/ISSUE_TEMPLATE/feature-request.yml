@@ -1,0 +1,31 @@
+name: Feature or documentation request
+description: Propose a bounded public contribution.
+title: "request: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and proposed scope
+      description: Describe the user/operational problem, intended outcome, non-goals, and affected surfaces.
+    validations:
+      required: true
+  - type: dropdown
+    id: critical_surface
+    attributes:
+      label: Authority or security coordination
+      options:
+        - No critical surface identified
+        - RouterOS authority/security
+        - Authentication, PWA, or browser security
+        - Diagnostics, incidents, performance, or release readiness
+        - Public audit, RALPH policy/controller, or CI/workflow
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance and safe evidence
+      description: State measurable acceptance criteria and what sanitized evidence can demonstrate them.
+    validations:
+      required: true

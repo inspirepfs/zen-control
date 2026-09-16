@@ -85,7 +85,9 @@ class PolicyTests(unittest.TestCase):
 
     def test_ralph_tooling_paths_are_classified_separately(self):
         self.assertTrue(ralph.is_tooling_path("scripts/ralph.py"))
+        self.assertTrue(ralph.is_tooling_path("scripts/ralph_gate.py"))
         self.assertTrue(ralph.is_tooling_path("tests/test_ralph_lite.py"))
+        self.assertTrue(ralph.is_tooling_path("tests/test_ralph_gate.py"))
         self.assertFalse(ralph.is_tooling_path("app/main.py"))
         self.assertEqual(ralph.classify_changes(["app/main.py"]), "product-development")
         self.assertEqual(ralph.classify_changes(["scripts/ralph.py"]), "ralph-tooling")
@@ -152,7 +154,7 @@ class CodexObservabilityTests(unittest.TestCase):
                 "aggregated_output": "ok",
             },
         })
-        self.assertIn("COMPLETED exit=0", command[0][1])
+        self.assertEqual(command, [("PASS", "exit=0 · python3 -m unittest tests.test_classifier -v")])
         files = ralph.codex_event_messages({
             "type": "item.completed",
             "item": {
@@ -161,7 +163,7 @@ class CodexObservabilityTests(unittest.TestCase):
                 "changes": [{"path": "app/classifier.py", "kind": "update"}],
             },
         })
-        self.assertEqual(files, [("FILES", "update:app/classifier.py")])
+        self.assertEqual(files, [("EDIT", "app/classifier.py")])
 
     def test_turn_usage_includes_reasoning_tokens(self):
         messages = ralph.codex_event_messages({
@@ -333,6 +335,35 @@ class ControllerQualificationAuthorityTests(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertIn("migration policy", reason)
 
+    def test_explicit_blocked_human_summary_cannot_be_laundered_into_pass(self):
+        step = {
+            "objective": "Validate operator-owned evidence.",
+            "acceptance": [
+                "If operator evidence is unavailable, stop at BLOCKED_HUMAN with exact instructions."
+            ],
+        }
+        result = {
+            "summary": "BLOCKED_HUMAN: ../zen-performance.json is absent.",
+            "needs_human": False,
+            "blocker_class": "validation-only",
+            "blockers": [],
+        }
+        blocked, reason = ralph.codex_requires_human_before_gates(result, step)
+        self.assertTrue(blocked)
+        self.assertIn("zen-performance.json", reason)
+
+    def test_blocked_human_text_without_approved_delegation_does_not_create_authority(self):
+        step = {"objective": "Run local checks.", "acceptance": ["Controller gates remain authoritative."]}
+        result = {
+            "summary": "BLOCKED_HUMAN: local focused test command missing.",
+            "needs_human": False,
+            "blocker_class": "validation-only",
+            "blockers": [],
+        }
+        blocked, reason = ralph.codex_requires_human_before_gates(result, step)
+        self.assertFalse(blocked)
+        self.assertEqual("", reason)
+
     def test_current_python_command_budget_block_is_recoverable(self):
         reason = "Focused tests were not run: `python` is unavailable and the six-command shell budget was exhausted before retrying with `python3`."
         self.assertTrue(ralph.is_recoverable_validation_block(reason))
@@ -467,6 +498,134 @@ class SnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class HumanGateResolutionTests(unittest.TestCase):
+    def _with_paths(self, td: str):
+        root = Path(td)
+        saved = {
+            "STATE": ralph.STATE,
+            "PLAN": ralph.PLAN,
+            "JOURNAL": ralph.JOURNAL,
+            "CONTEXT": ralph.CONTEXT,
+            "LIVE": ralph.LIVE,
+            "init_files": ralph.init_files,
+        }
+        ralph.STATE = root / "state.json"
+        ralph.PLAN = root / "plan.md"
+        ralph.JOURNAL = root / "journal.md"
+        ralph.CONTEXT = root / "context.json"
+        ralph.LIVE = root / "live.log"
+        ralph.JOURNAL.write_text("", encoding="utf-8")
+        ralph.LIVE.write_text("", encoding="utf-8")
+        ralph.init_files = lambda: None
+        return saved
+
+    def _restore_paths(self, saved):
+        for name, value in saved.items():
+            setattr(ralph, name, value)
+
+    def _blocked_state(self, *, reason="Incident Monitor warning is runtime-owned evidence."):
+        plan = valid_plan(9)
+        plan["steps"][3].update({
+            "title": "Classify Incident Monitor runtime evidence",
+            "objective": "Classify the runtime-owned Incident Monitor warning without manufacturing health.",
+            "acceptance": [
+                "If evidence is runtime-owned, stop with BLOCKED_HUMAN and state the exact safe operator action needed."
+            ],
+            "test_change_policy": "none",
+        })
+        digest = ralph.plan_hash(plan)
+        state = ralph.default_state()
+        state.update({
+            "status": "BLOCKED_HUMAN",
+            "plan_hash": digest,
+            "plan": plan,
+            "current_step": 4,
+            "loop_count": 15,
+            "block_reason": reason,
+            "last_result": None,
+        })
+        return state, digest
+
+    def test_resolve_gate_records_human_confirmed_and_advances_without_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._with_paths(td)
+            try:
+                state, digest = self._blocked_state()
+                ralph.save_state(state)
+                ralph.PLAN.write_text(ralph.render_plan(state["plan"]), encoding="utf-8")
+                args = type("Args", (), {
+                    "plan_hash": digest,
+                    "gate": "HG-0015-04",
+                    "reason": "Fresh scan completed; active durable incidents=0.",
+                })()
+                self.assertEqual(0, ralph.cmd_resolve_gate(args))
+                resolved = ralph.load_state()
+                self.assertEqual("APPROVED", resolved["status"])
+                self.assertEqual(5, resolved["current_step"])
+                self.assertEqual(15, resolved["loop_count"])
+                self.assertEqual("HUMAN_CONFIRMED", resolved["last_result"])
+                self.assertIsNone(resolved["block_reason"])
+                self.assertEqual("HG-0015-04", resolved["human_gate_resolutions"][-1]["gate_id"])
+                context = ralph.load_context()
+                self.assertEqual(4, context["last_step"])
+                self.assertEqual("HUMAN_CONFIRMED", context["last_result"])
+                self.assertIn("active durable incidents=0", context["summary"])
+                journal = ralph.JOURNAL.read_text(encoding="utf-8")
+                self.assertIn("Result: HUMAN_CONFIRMED", journal)
+                self.assertIn("Codex loop incremented: no", journal)
+                self.assertIn("gate=HG-0015-04 resolved HUMAN_CONFIRMED", ralph.LIVE.read_text(encoding="utf-8"))
+            finally:
+                self._restore_paths(saved)
+
+    def test_resolve_gate_rejects_stale_gate_id_without_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._with_paths(td)
+            try:
+                state, digest = self._blocked_state()
+                ralph.save_state(state)
+                before = ralph.STATE.read_bytes()
+                args = type("Args", (), {
+                    "plan_hash": digest,
+                    "gate": "HG-0014-04",
+                    "reason": "stale gate",
+                })()
+                with self.assertRaisesRegex(RuntimeError, "does not match current gate"):
+                    ralph.cmd_resolve_gate(args)
+                self.assertEqual(before, ralph.STATE.read_bytes())
+            finally:
+                self._restore_paths(saved)
+
+    def test_resolve_gate_rejects_policy_or_authority_block(self):
+        state, _ = self._blocked_state(reason="policy violation: protected paths ['.env']")
+        allowed, reason = ralph.human_gate_resolution_allowed(state)
+        self.assertFalse(allowed)
+        self.assertIn("policy/authority", reason)
+
+    def test_resolve_gate_requires_explicit_step_delegation(self):
+        state, _ = self._blocked_state()
+        state["plan"]["steps"][3]["acceptance"] = ["Operator review may be useful."]
+        allowed, reason = ralph.human_gate_resolution_allowed(state)
+        self.assertFalse(allowed)
+        self.assertIn("does not explicitly delegate", reason)
+
+    def test_resume_remains_retry_not_step_acceptance(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._with_paths(td)
+            try:
+                state, digest = self._blocked_state()
+                ralph.save_state(state)
+                args = type("Args", (), {"plan_hash": digest, "reason": "new runtime evidence supplied"})()
+                self.assertEqual(0, ralph.cmd_resume(args))
+                resumed = ralph.load_state()
+                self.assertEqual("APPROVED", resumed["status"])
+                self.assertEqual(4, resumed["current_step"])
+                self.assertEqual(15, resumed["loop_count"])
+                self.assertIsNone(resumed["block_reason"])
+                self.assertIn("retry same approved step", ralph.JOURNAL.read_text(encoding="utf-8"))
+            finally:
+                self._restore_paths(saved)
+
 
 class ProposalLifecycleTests(unittest.TestCase):
     def _with_paths(self, directory):

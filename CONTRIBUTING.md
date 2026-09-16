@@ -67,6 +67,27 @@ Dependency/build changes are additionally gated by the independent `supply-chain
 
 A user-visible or operator-visible change should update the relevant public document in the same change. Prefer stable operational language over development-slice shorthand. New environment variables must be reflected in `.env.example` and the environment contract; RouterOS assumptions belong in `routeros/`; release/process changes belong in `docs/PUBLIC_RELEASE.md`.
 
+## Public contribution workflow
+
+Use the public path: **Issue → Triage → Ready → Claimed → short-lived
+implementation → early Draft PR → CI/review → merge**. An issue is triaged before
+it is marked Ready; claim only Ready work and declare one bounded engineering
+objective, affected surfaces, and explicit non-goals. Keep implementation
+short-lived and open a Draft PR early so scope, safety evidence, and review needs
+are visible before the change grows.
+
+Coordinate before implementation when scope touches RouterOS authority/security,
+authentication, PWA/browser security, diagnostics/incidents/performance, release
+readiness, public audit, RALPH policy/controller, or CI/workflows. Those changes
+need the relevant authority/security review and must preserve the contracts above;
+a contributor cannot use an issue or PR to self-authorize a wider mutation
+surface. The Draft-PR template records this declaration, evidence, rollback, and
+review coordination.
+
+GitHub Projects, Discussions, and additional workflow automation are recorded as
+post-release ideas only. They are not a current contributor-tracking or approval
+system.
+
 ## Release patch workflow
 
 `scripts/release_patch.py` automates the qualified host release path and fail-closes on environment-contract drift before compilation. It performs exact `-p0` patch dry-run/application, validation, verified pre-rebuild SQLite backup plus offline restore/upgrade smoke when `mikrotik-control` is affected, affected-service Compose rebuild, app/runtime/topology health proof, Git stage/commit/push, GitHub Actions watch and optional annotated tag push.
@@ -101,6 +122,10 @@ Keep a pull request coherent around one engineering objective. Explain:
 - whether a RouterOS mutation surface is added or widened.
 
 Do not include household-specific data, secrets or copied runtime databases.
+
+Open a Draft PR early for implementation work. Move it to review only after the
+scope declaration is still accurate, the required authority/security coordination
+is recorded, relevant documentation is updated, and CI evidence is available.
 
 ## Public-release hygiene
 

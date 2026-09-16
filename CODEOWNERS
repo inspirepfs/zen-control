@@ -1,0 +1,47 @@
+# Critical ZEN Control surfaces require @inspirepfs review.
+
+# Release readiness and release process
+/app/release_readiness.py @inspirepfs
+/app/runtime_health.py @inspirepfs
+/scripts/release_acceptance.py @inspirepfs
+/scripts/release_patch.py @inspirepfs
+/docs/PUBLIC_RELEASE.md @inspirepfs
+
+# PWA and browser security
+/app/pwa.py @inspirepfs
+/app/push_delivery.py @inspirepfs
+/app/security.py @inspirepfs
+/app/static/pwa.js @inspirepfs
+/app/static/service-worker.js @inspirepfs
+/app/static/manifest.webmanifest @inspirepfs
+/app/templates/_pwa_head.jinja @inspirepfs
+
+# Diagnostics, incidents and performance
+/app/diagnostics.py @inspirepfs
+/app/incidents.py @inspirepfs
+/app/operations.py @inspirepfs
+/app/performance.py @inspirepfs
+/app/support_bundle.py @inspirepfs
+/scripts/perf_acceptance.py @inspirepfs
+
+# RouterOS authority and security
+/routeros/ @inspirepfs
+/app/routeros.py @inspirepfs
+/app/policy*.py @inspirepfs
+/app/kid_control*.py @inspirepfs
+
+# Public audit
+/scripts/public_release_audit.py @inspirepfs
+/docs/SUPPLY_CHAIN.md @inspirepfs
+/SECURITY.md @inspirepfs
+
+# RALPH policy/controller
+/.ralph/policy.md @inspirepfs
+/scripts/ralph.py @inspirepfs
+/scripts/ralph_gate.py @inspirepfs
+/docs/RALPH-LITE.md @inspirepfs
+
+# CI and workflow controls
+/.github/workflows/ @inspirepfs
+/.github/dependabot.yml @inspirepfs
+/Dockerfile @inspirepfs
