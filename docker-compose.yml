@@ -111,7 +111,7 @@ services:
   # managed route should target http://mikrotik-control:8080 and enable
   # Cloudflare Tunnel "Protect with Access" in the Cloudflare dashboard.
   cloudflared:
-    image: cloudflare/cloudflared:2026.9.0
+    image: cloudflare/cloudflared:2026.9.1
     container_name: zen-cloudflared
     profiles: ["remote-access"]
     restart: unless-stopped
