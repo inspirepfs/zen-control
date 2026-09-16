@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.59.0.12 — Supply-Chain Security & Dependency Automation
+
+- Adds an independent `supply-chain` GitHub Quality job that audits Python dependencies with `pip-audit`, builds the real application image, scans fixed HIGH/CRITICAL container vulnerabilities with Trivy and retains the resulting evidence.
+- Generates a CycloneDX SBOM for the candidate application image plus machine-readable pip-audit/Trivy reports, image identity and build-input hashes as a 30-day workflow artifact.
+- Pins every external GitHub Actions `uses:` reference in the Quality workflow to an immutable commit SHA and moves checkout/setup-python to Node 24-capable releases, removing the Node 20 deprecation warning.
+- Adds weekly Dependabot coverage for Python packages, GitHub Actions, Dockerfiles and Docker Compose images; automated update proposals remain subject to all existing quality/runtime/fresh-install gates.
+- Adds `scripts/supply_chain_validate.py` and regression contracts so future workflow changes fail if floating external Action refs or required supply-chain controls are removed.
+- Narrows the application and telemetry-ingest Python base image from the moving `python:3.12-slim` line to the patch-specific `python:3.12.14-slim` tag; later updates are proposed by Dependabot and rescanned.
+- Documents the remaining distinction between version-tag monitoring and immutable registry-digest pinning instead of presenting tag monitoring as equivalent provenance.
+- Application/PWA runtime remains `0.59.0`; database schema, RouterOS authority primitives and policy semantics are unchanged.
+
 ## v0.59.0.11 — Fresh-Install & First-Run Commissioning Acceptance
 
 - Adds `scripts/fresh_install_acceptance.py`, a destructive synthetic acceptance harness that proves ZEN can bootstrap from empty Docker volumes rather than relying on residue from an existing installation.

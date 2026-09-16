@@ -73,6 +73,12 @@ The built-in v0.59.0.10 support bundle is designed for public troubleshooting an
 
 If a credential has been exposed, rotate it even if the repository audit later becomes clean. Deleting a value from the current tree does not revoke it.
 
+## Dependency and build-chain controls
+
+The public repository runs a separate supply-chain Quality job for Python dependency auditing, real application-image vulnerability scanning and CycloneDX SBOM generation. External GitHub Actions are commit-SHA pinned and Dependabot monitors Python, Actions, Dockerfile and Compose dependency surfaces. See [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md) for the exact gate and its stated limits.
+
+A clean scanner result does not turn missing provenance into proof of safety. In particular, version-tag monitoring is not the same as registry-digest pinning, and unfixed vulnerabilities are not treated as harmless merely because the blocking release gate is limited to vulnerabilities with an available fix.
+
 ## Public-source secret and depersonalization audit
 
 Before a public release run:

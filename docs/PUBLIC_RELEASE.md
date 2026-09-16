@@ -48,12 +48,19 @@ The candidate should pass:
 python3 scripts/env_validate.py
 python3 -m py_compile app/*.py telemetry/ingest/*.py scripts/*.py
 python3 scripts/ux_validate.py
+python3 scripts/supply_chain_validate.py
 python3 scripts/public_release_audit.py --history --deployment-markers
 python3 -m unittest discover -s tests -t . -v
 docker compose config >/dev/null
 ```
 
 Use the normal release helper so backup/restore smoke, affected-service deployment, runtime/topology proof, exact Git commit and GitHub Quality evidence are preserved.
+
+## Supply-chain gate
+
+GitHub Quality must pass the independent `supply-chain` job. The candidate must retain a clean `pip-audit` result, a Trivy image report with no fixed HIGH/CRITICAL finding, and a generated CycloneDX image SBOM. Supply-chain workflow evidence is part of release evidence when dependency/build inputs change.
+
+All external GitHub Actions references are required to use immutable 40-character commit SHAs; `scripts/supply_chain_validate.py` enforces that repository contract without network access. Dependabot update proposals do not bypass review or any release gate. See `SUPPLY_CHAIN.md` for the complete contract and the explicit distinction between tag monitoring and registry-digest pinning.
 
 ## Mandatory rebuilt-runtime smoke
 
@@ -108,8 +115,9 @@ The device-local diagnostics distinguish server/browser prerequisites from the b
 5. Verify the rebuilt runtime, including rendered HTML when the app container changed.
 6. Review public-source audit warnings explicitly.
 7. Publish a new immutable maintenance tag/release; do not move a previously public tag.
-8. Require the automated fresh-install/first-run acceptance to pass on its isolated throw-away Compose project.
-9. For a release that changes public behaviour or setup, perform a fresh-clone/read-the-docs smoke from the public repository.
+8. Require the automated supply-chain audit/SBOM job to pass and retain its evidence when dependencies/build inputs changed.
+9. Require the automated fresh-install/first-run acceptance to pass on its isolated throw-away Compose project.
+10. For a release that changes public behaviour or setup, perform a fresh-clone/read-the-docs smoke from the public repository.
 
 ## Release evidence to retain
 

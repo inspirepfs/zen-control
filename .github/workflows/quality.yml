@@ -11,8 +11,8 @@ jobs:
   source-quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
           cache: pip
@@ -21,9 +21,11 @@ jobs:
       - name: Environment contract
         run: python3 scripts/env_validate.py --no-local
       - name: Compile Python
-        run: python3 -m py_compile app/*.py telemetry/ingest/*.py
+        run: python3 -m py_compile app/*.py telemetry/ingest/*.py scripts/*.py
       - name: UX validation
         run: python3 scripts/ux_validate.py
+      - name: Supply-chain contract
+        run: python3 scripts/supply_chain_validate.py
       - name: PWA JavaScript syntax
         run: node --check app/static/pwa.js
       - name: Public-source audit
@@ -32,6 +34,89 @@ jobs:
         run: python3 -m unittest discover -s tests -t . -v
       - name: Compose parse
         run: docker compose --env-file .env.example config >/dev/null
+  supply-chain:
+    runs-on: ubuntu-latest
+    needs: source-quality
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Python audit tooling
+        run: python3 -m pip install --disable-pip-version-check pip-audit==2.10.1
+      - name: Python dependency vulnerability report
+        shell: bash
+        run: |
+          mkdir -p supply-chain-artifacts
+          set +e
+          python3 -m pip_audit \
+            -r requirements.txt \
+            --progress-spinner off \
+            --format json \
+            --output supply-chain-artifacts/pip-audit.json
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > supply-chain-artifacts/pip-audit.exit
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::pip-audit reported vulnerable or unauditable Python dependencies"
+          fi
+      - name: Build supply-chain image
+        run: |
+          docker build --pull -t zen-control:supply-chain .
+          docker image inspect --format '{{.Id}}' zen-control:supply-chain > supply-chain-artifacts/image-id.txt
+          sha256sum requirements.txt Dockerfile > supply-chain-artifacts/build-inputs.sha256
+      - name: Container vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: zen-control:supply-chain
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'
+          format: json
+          output: supply-chain-artifacts/trivy-vulnerabilities.json
+      - name: Generate CycloneDX image SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: zen-control:supply-chain
+          scanners: vuln
+          list-all-pkgs: true
+          exit-code: '0'
+          format: cyclonedx
+          output: supply-chain-artifacts/zen-control-image.cdx.json
+      - name: Upload supply-chain evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supply-chain-${{ github.sha }}
+          path: supply-chain-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Enforce Python dependency audit
+        shell: bash
+        run: |
+          rc="$(cat supply-chain-artifacts/pip-audit.exit)"
+          if [ "$rc" -ne 0 ]; then
+            echo "Python dependency audit failed with status $rc" >&2
+            exit "$rc"
+          fi
+          echo "PYTHON DEPENDENCY AUDIT: PASS"
+      - name: Enforce fixed HIGH/CRITICAL container vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: zen-control:supply-chain
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
   runtime-container-smoke:
     runs-on: ubuntu-latest
     needs: source-quality
@@ -52,8 +137,8 @@ jobs:
       ZEN_LAN_CIDRS: 127.0.0.0/8
       CADDY_CF_API_TOKEN: test-secret-ci-unused-dns-token
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - name: Start telemetry database
@@ -117,8 +202,8 @@ jobs:
       ZEN_LAN_CIDRS: 127.0.0.0/8
       CADDY_CF_API_TOKEN: test-secret-ci-fresh-unused-dns-token
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - name: Fresh-install commissioning acceptance

@@ -14,13 +14,14 @@ ZEN Control is a self-hosted control plane for MikroTik RouterOS. The documentat
 
 ### Day-2 operation
 
-- [Operator guide](OPERATOR_GUIDE.md) — day-2 health interpretation, recovery, commissioning diagnostics and safe support-bundle collection. — routine health, degraded-state interpretation, logs, backup/recovery, upgrade/rollback and incident triage.
+- [Operator guide](OPERATOR_GUIDE.md) — routine health, degraded-state interpretation, commissioning diagnostics, safe support-bundle collection, backup/recovery, upgrade/rollback and incident triage.
 - [Release history](../CHANGELOG.md) — maintenance/hotfix history and contract changes.
 
 ### Contribution, security and release
 
 - [Contributing](../CONTRIBUTING.md) — development principles, quality gates and pull-request expectations.
 - [Security policy](../SECURITY.md) — threat model, deployment responsibilities and vulnerability reporting.
+- [Supply-chain security](SUPPLY_CHAIN.md) — immutable CI action pins, dependency automation, vulnerability scanning and SBOM evidence.
 - [Release and maintenance checklist](PUBLIC_RELEASE.md) — source audit, runtime smoke, qualification and publication gates.
 
 ## Version terminology

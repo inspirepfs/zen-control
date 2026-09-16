@@ -4,7 +4,7 @@ Self-hosted household network policy, parental controls and observability for Mi
 
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
-> Current maintenance release: **v0.59.0.11**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.11 adds destructive fresh-install/first-run commissioning acceptance on isolated CI runners; v0.59.0.10 added commissioning diagnostics and a defence-in-depth sanitized support bundle.
+> Current maintenance release: **v0.59.0.12**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.12 adds supply-chain scanning, SBOM evidence, immutable GitHub Action pins and Dependabot automation; v0.59.0.11 added destructive fresh-install/first-run commissioning acceptance on isolated CI runners.
 
 [![Quality](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml/badge.svg)](https://github.com/inspirepfs/zen-control/actions/workflows/quality.yml)
 
@@ -16,7 +16,7 @@ If you are new to ZEN, use the documentation in this order:
 2. **Prepare and install** with [docs/INSTALL.md](docs/INSTALL.md) and the reviewed [RouterOS setup bundle](routeros/setup/README.md).
 3. **Configure safely** with [.env.example](.env.example) and [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 4. **Operate and recover** with [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
-5. **Contribute or review security-sensitive changes** with [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
+5. **Contribute or review security-sensitive changes** with [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md) and [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
 
 ZEN is designed for technically confident operators. It intentionally exposes evidence and failure states instead of hiding them behind a one-click appliance model.
 

@@ -189,7 +189,7 @@ class FreshInstallReleaseContractTests(unittest.TestCase):
         self.assertIn("marker_present", self.script)
 
     def test_release_and_docs_describe_fresh_install_gate(self):
-        self.assertIn("Current maintenance release: **v0.59.0.11**", self.readme)
+        self.assertIn("Current maintenance release: **v0.59.0.", self.readme)
         self.assertIn("## v0.59.0.11 — Fresh-Install & First-Run Commissioning Acceptance", self.changelog)
         for text in (self.readme, self.install, self.public_release, self.contributing):
             self.assertIn("fresh-install", text.lower())

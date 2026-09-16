@@ -1,6 +1,6 @@
 # Installation and Commissioning
 
-This document describes the supported Docker Compose deployment from an empty host through first operational acceptance. ZEN is not a one-click appliance; RouterOS authority must be understood and prepared deliberately. The application currently reports version `0.59.0`; maintenance tags such as `v0.59.0.11` identify qualified fixes/acceptance work on that runtime line.
+This document describes the supported Docker Compose deployment from an empty host through first operational acceptance. ZEN is not a one-click appliance; RouterOS authority must be understood and prepared deliberately. The application currently reports version `0.59.0`; maintenance tags such as `v0.59.0.12` identify qualified fixes/acceptance work on that runtime line.
 
 ## 1. Host prerequisites
 

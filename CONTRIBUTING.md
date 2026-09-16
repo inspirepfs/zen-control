@@ -36,6 +36,7 @@ Run at least:
 python3 scripts/env_validate.py --no-local
 python3 -m py_compile app/*.py telemetry/ingest/*.py
 python3 scripts/ux_validate.py
+python3 scripts/supply_chain_validate.py
 python3 scripts/public_release_audit.py
 python3 -m unittest discover -s tests -t . -v
 docker compose --env-file .env.example config >/dev/null
@@ -59,6 +60,8 @@ The v0.59.0.4 → v0.59.0.5 incident is the reason this is explicit: health endp
 GitHub Quality now enforces this automatically with `scripts/runtime_acceptance.py` in the `runtime-container-smoke` job. The CI smoke uses synthetic credentials and an unreachable loopback RouterOS endpoint, proves `/health/live`, `/health/runtime`, `/login` and an authenticated dashboard render, and intentionally does not treat RouterOS readiness as part of this HTML/runtime compatibility gate.
 
 Fresh-install/bootstrap changes are also covered by the independent `fresh-install-commissioning` job. That job owns a throw-away Compose project, removes its volumes, boots ZEN twice from empty state and requires the fresh database/default-state plus commissioning fail-closed contracts to repeat. `scripts/fresh_install_acceptance.py` is intentionally destructive; run it only on an isolated CI runner or disposable development host and provide an exact `--confirm-destroy-project` value matching the throw-away project name.
+
+Dependency/build changes are additionally gated by the independent `supply-chain` job. External workflow actions must remain pinned to full commit SHAs; Python dependencies are audited with `pip-audit`; the built image is scanned by Trivy; and a CycloneDX image SBOM plus machine-readable reports are retained as workflow evidence. See `docs/SUPPLY_CHAIN.md`.
 
 ## Documentation expectations
 
