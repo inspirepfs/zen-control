@@ -120,6 +120,20 @@ class CodexSandboxTests(unittest.TestCase):
         output = "codex exec failed: invalid output schema"
         self.assertFalse(ralph.is_bwrap_bootstrap_failure(output))
 
+    def test_preflight_keeps_default_backend_when_healthy(self):
+        self.assertEqual(ralph.sandbox_prefix_from_preflights(0, ""), ["codex"])
+
+    def test_preflight_selects_landlock_for_bwrap_bootstrap_failure(self):
+        bwrap = "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+        self.assertEqual(
+            ralph.sandbox_prefix_from_preflights(1, bwrap, 0, ""),
+            ["codex", "--enable", "use_legacy_landlock"],
+        )
+
+    def test_outer_success_with_bwrap_text_is_still_detected(self):
+        output = '{"type":"item.completed","item":{"aggregated_output":"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"}}'
+        self.assertTrue(ralph.is_bwrap_bootstrap_failure(output))
+
 
 class CodexObservabilityTests(unittest.TestCase):
     def test_reasoning_summary_is_operator_visible(self):

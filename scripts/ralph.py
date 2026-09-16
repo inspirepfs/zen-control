@@ -31,6 +31,7 @@ LIVE = RALPH / "live.log"
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
+_CODEX_PREFIX: list[str] | None = None
 EXCLUDED_DIRS = {
     ".git", ".ralph", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".venv", "venv", "node_modules", "data", "logs", "diagnostics", "backup", "backups",
@@ -434,27 +435,92 @@ def is_bwrap_bootstrap_failure(output: str) -> bool:
     )
 
 
-def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex") -> dict:
+def sandbox_prefix_from_preflights(
+    default_returncode: int,
+    default_output: str,
+    legacy_returncode: int | None = None,
+    legacy_output: str = "",
+) -> list[str]:
+    """Choose Codex's sandbox backend without spending a model turn."""
+    default_bwrap = is_bwrap_bootstrap_failure(default_output)
+    if default_returncode == 0 and not default_bwrap:
+        return ["codex"]
+    if not default_bwrap:
+        raise RuntimeError(
+            f"Codex sandbox preflight failed ({default_returncode}) without a recognised "
+            f"bubblewrap bootstrap error: {default_output[-1200:]}"
+        )
+    if legacy_returncode == 0 and not is_bwrap_bootstrap_failure(legacy_output):
+        return ["codex", "--enable", "use_legacy_landlock"]
+    raise RuntimeError(
+        "Codex bubblewrap sandbox is unavailable and the legacy Landlock preflight also failed: "
+        + legacy_output[-1200:]
+    )
+
+
+def codex_command_prefix() -> list[str]:
+    """Return a process-local Codex prefix after a zero-model sandbox preflight."""
+    global _CODEX_PREFIX
+    if _CODEX_PREFIX is not None:
+        return list(_CODEX_PREFIX)
     if shutil.which("codex") is None:
         raise RuntimeError("codex CLI is not installed or not on PATH")
+
+    default = run_process(["codex", "sandbox", "--", "/bin/true"])
+    if default.returncode == 0 and not is_bwrap_bootstrap_failure(default.stdout):
+        _CODEX_PREFIX = ["codex"]
+        live_write("sandbox preflight=PASS backend=default", "SANDBOX")
+        return list(_CODEX_PREFIX)
+
+    if not is_bwrap_bootstrap_failure(default.stdout):
+        raise RuntimeError(
+            f"Codex sandbox preflight failed ({default.returncode}) without a recognised "
+            f"bubblewrap bootstrap error: {default.stdout[-1200:]}"
+        )
+
+    live_write("default bubblewrap preflight blocked; testing legacy Landlock", "SANDBOX")
+    legacy = run_process([
+        "codex", "--enable", "use_legacy_landlock", "sandbox", "--", "/bin/true",
+    ])
+    _CODEX_PREFIX = sandbox_prefix_from_preflights(
+        default.returncode, default.stdout, legacy.returncode, legacy.stdout,
+    )
+    live_write("sandbox preflight=PASS backend=legacy-landlock", "SANDBOX")
+    return list(_CODEX_PREFIX)
+
+
+def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex") -> dict:
+    global _CODEX_PREFIX
+    prefix = codex_command_prefix()
     with tempfile.TemporaryDirectory(prefix="ralph-lite-") as temp_dir:
         schema_path = Path(temp_dir) / "schema.json"
         output_path = Path(temp_dir) / "result.json"
         schema_path.write_text(json.dumps(schema), encoding="utf-8")
         command = [
-            "codex", "exec", "--ephemeral", "--json", "--sandbox", sandbox,
+            *prefix, "exec", "--ephemeral", "--json", "--sandbox", sandbox,
             "--output-schema", str(schema_path), "-o", str(output_path), prompt,
         ]
-        live_write(f"{context} · sandbox={sandbox}", "CODEX")
+        backend = "legacy-landlock" if "use_legacy_landlock" in prefix else "default"
+        live_write(f"{context} · sandbox={sandbox} backend={backend}", "CODEX")
         returncode, output = stream_codex_process(command)
-        if returncode != 0 and is_bwrap_bootstrap_failure(output):
-            live_write("bubblewrap bootstrap blocked; retrying this invocation with legacy Landlock", "SANDBOX")
+
+        # Some Codex versions can finish the outer exec successfully even when
+        # every inner command was rejected by bubblewrap. Detect the sandbox
+        # signature in the JSONL stream regardless of the outer return code.
+        if is_bwrap_bootstrap_failure(output):
+            if "use_legacy_landlock" in prefix:
+                raise RuntimeError("legacy Landlock Codex invocation still reported a bubblewrap bootstrap failure")
+            live_write("bubblewrap failed inside Codex turn; retrying same invocation with legacy Landlock", "SANDBOX")
+            _CODEX_PREFIX = ["codex", "--enable", "use_legacy_landlock"]
+            output_path.unlink(missing_ok=True)
             fallback = [
-                "codex", "--enable", "use_legacy_landlock", "exec",
-                "--ephemeral", "--json", "--sandbox", sandbox,
+                *_CODEX_PREFIX, "exec", "--ephemeral", "--json", "--sandbox", sandbox,
                 "--output-schema", str(schema_path), "-o", str(output_path), prompt,
             ]
             returncode, output = stream_codex_process(fallback)
+            if is_bwrap_bootstrap_failure(output):
+                raise RuntimeError("legacy Landlock fallback also reported a bubblewrap bootstrap failure")
+
         if returncode != 0:
             raise RuntimeError(f"codex exec failed ({returncode}):\n{output[-6000:]}")
         try:
