@@ -68,6 +68,19 @@ class SupplyChainReleaseTests(unittest.TestCase):
         self.assertNotIn("FROM python:3.12-slim", (ROOT / "Dockerfile").read_text())
         self.assertNotIn("FROM python:3.12-slim", (ROOT / "telemetry/ingest/Dockerfile").read_text())
 
+    def test_primary_python_images_refresh_fixed_os_packages(self):
+        for relpath in ("Dockerfile", "telemetry/ingest/Dockerfile"):
+            dockerfile = (ROOT / relpath).read_text()
+            self.assertIn("apt-get update", dockerfile, msg=relpath)
+            self.assertIn("apt-get upgrade -y", dockerfile, msg=relpath)
+            self.assertIn("apt-get clean", dockerfile, msg=relpath)
+            self.assertIn("rm -rf /var/lib/apt/lists/*", dockerfile, msg=relpath)
+            self.assertLess(
+                dockerfile.index("apt-get upgrade -y"),
+                dockerfile.index("pip install"),
+                msg=f"{relpath} must patch the OS layer before installing application dependencies",
+            )
+
     def test_repository_validator_is_part_of_source_quality(self):
         self.assertIn("python3 scripts/supply_chain_validate.py", self.workflow)
         self.assertIn("40-hex commit SHA", self.validator)
