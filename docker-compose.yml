@@ -335,7 +335,7 @@ services:
       - "127.0.0.1:1025:1025"
 
   webhook-sink:
-    image: python:3.12-alpine
+    image: python:3.14-alpine
     container_name: zen-webhook-sink
     profiles: ["test-tools"]
     restart: unless-stopped
