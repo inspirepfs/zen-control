@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "scripts" / "ralph_web.py"
+spec = importlib.util.spec_from_file_location("ralph_web_test_module", MODULE_PATH)
+web = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+import sys
+sys.modules[spec.name] = web
+spec.loader.exec_module(web)
+
+
+class WebHarness:
+    NAMES = ("ROOT", "RALPH", "STATE", "EVENTS", "LIVE", "REPORTS", "WEB_JOB", "WEB_LOG", "RALPH_CLI")
+
+    def __init__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.saved = {name: getattr(web, name) for name in self.NAMES}
+
+    def __enter__(self):
+        ralph = self.root / ".ralph"
+        ralph.mkdir()
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        (scripts / "ralph.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        web.ROOT = self.root
+        web.RALPH = ralph
+        web.STATE = ralph / "state.json"
+        web.EVENTS = ralph / "events.jsonl"
+        web.LIVE = ralph / "live.log"
+        web.REPORTS = ralph / "reports"
+        web.WEB_JOB = ralph / "web-job.json"
+        web.WEB_LOG = ralph / "web-run.log"
+        web.RALPH_CLI = scripts / "ralph.py"
+        return self
+
+    def state(self, **updates):
+        state = {
+            "status": "APPROVED",
+            "plan_hash": "a" * 64,
+            "current_step": 2,
+            "loop_count": 7,
+            "block_reason": None,
+            "recovery_checkpoint": "RP-TEST",
+            "plan_changed_files": ["app/a.py"],
+            "plan_owned_files": ["tests/test_new.py"],
+            "human_steering": [],
+            "plan": {
+                "goal": "Improve ZEN safely",
+                "steps": [
+                    {"id": i, "title": f"Step {i}", "objective": f"Objective {i}", "acceptance": [f"Acceptance {i}"], "test_change_policy": "add-only"}
+                    for i in range(1, 6)
+                ],
+            },
+            "step_results": [{"step": 1, "result": "PASS"}],
+            "last_efficiency": {"status": "PASS"},
+            "codex_usage": {"windows": [{"remaining_percent": 68.5}]},
+        }
+        state.update(updates)
+        web.STATE.write_text(json.dumps(state), encoding="utf-8")
+        return state
+
+    def __exit__(self, exc_type, exc, tb):
+        for name, value in self.saved.items():
+            setattr(web, name, value)
+        self.tmp.cleanup()
+
+
+class HostSafetyTests(unittest.TestCase):
+    def test_loopback_hosts_are_allowed(self):
+        self.assertEqual(web.validate_loopback("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(web.validate_loopback("localhost"), "127.0.0.1")
+        self.assertEqual(web.validate_loopback("::1"), "::1")
+
+    def test_non_loopback_bind_is_refused(self):
+        with self.assertRaisesRegex(web.WebConsoleError, "refuses non-loopback"):
+            web.validate_loopback("0.0.0.0")
+        with self.assertRaises(web.WebConsoleError):
+            web.validate_loopback("192.168.2.10")
+
+    def test_private_lan_bind_requires_explicit_opt_in(self):
+        with self.assertRaisesRegex(web.WebConsoleError, "--allow-lan"):
+            web.validate_bind("192.168.2.10")
+        self.assertEqual(web.validate_bind("192.168.2.10", allow_lan=True), "192.168.2.10")
+        with self.assertRaisesRegex(web.WebConsoleError, "wildcard"):
+            web.validate_bind("0.0.0.0", allow_lan=True)
+        with self.assertRaisesRegex(web.WebConsoleError, "private"):
+            web.validate_bind("8.8.8.8", allow_lan=True)
+
+    def test_lan_host_header_allows_only_exact_bind_ip(self):
+        allowed = {"192.168.2.10"}
+        self.assertTrue(web.host_header_allowed("192.168.2.10:8765", allowed))
+        self.assertFalse(web.host_header_allowed("192.168.2.11:8765", allowed))
+        self.assertFalse(web.host_header_allowed("evil.example:8765", allowed))
+
+    def test_host_header_rejects_dns_rebinding_names(self):
+        self.assertTrue(web.host_header_allowed("localhost:8765"))
+        self.assertTrue(web.host_header_allowed("127.0.0.1:8765"))
+        self.assertTrue(web.host_header_allowed("[::1]:8765"))
+        self.assertFalse(web.host_header_allowed("evil.example:8765"))
+        self.assertFalse(web.host_header_allowed("192.168.2.10:8765"))
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_snapshot_is_bounded_operator_view(self):
+        with WebHarness() as h:
+            h.state()
+            web.EVENTS.write_text(json.dumps({"category": "EDIT", "message": "app/a.py"}) + "\n", encoding="utf-8")
+            with mock.patch.object(web, "git_snapshot", return_value={"branch": "main", "upstream": "origin/main", "head": "abc", "dirty": False, "dirty_count": 0, "status": []}):
+                snap = web.snapshot()
+            self.assertEqual(snap["controller"]["status"], "APPROVED")
+            self.assertEqual(snap["plan"]["steps"][0]["state"], "PASS")
+            self.assertEqual(snap["plan"]["steps"][1]["state"], "CURRENT")
+            self.assertEqual(snap["controller"]["quota_remaining_percent"], 68.5)
+            self.assertEqual(snap["events"][0]["category"], "EDIT")
+            self.assertNotIn("proposal_previous_state", json.dumps(snap))
+
+    def test_human_gate_snapshot_is_actionable(self):
+        with WebHarness() as h:
+            h.state(status="BLOCKED_HUMAN", current_step=3, loop_count=21, block_reason="policy violation: test paths ['tests/test_new.py']")
+            gate = web.snapshot()["gate"]
+            self.assertEqual(gate["id"], "HG-0021-03")
+            self.assertTrue(gate["policy_review"])
+            self.assertEqual(gate["test_change_policy"], "add-only")
+
+    def test_event_tail_is_bounded(self):
+        with WebHarness() as h:
+            h.state()
+            web.EVENTS.write_text("\n".join(json.dumps({"category": "READ", "message": str(i)}) for i in range(300)) + "\n", encoding="utf-8")
+            rows = web.event_tail(25)
+            self.assertEqual(len(rows), 25)
+            self.assertEqual(rows[-1]["message"], "299")
+
+
+class ActionAuthorityTests(unittest.TestCase):
+    def base_state(self, status="APPROVED"):
+        return {"status": status, "plan_hash": "b" * 64}
+
+    def test_run_is_background_and_bounded(self):
+        request = web.command_for_action({"action": "run", "max_loops": 999}, self.base_state())
+        self.assertTrue(request.background)
+        self.assertEqual(request.argv[-1], "40")
+
+    def test_propose_requires_idle_like_state_and_goal(self):
+        req = web.command_for_action({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "IDLE"})
+        self.assertTrue(req.background)
+        with self.assertRaises(web.WebConsoleError):
+            web.command_for_action({"action": "propose", "goal": "short"}, {"status": "IDLE"})
+        with self.assertRaises(web.WebConsoleError):
+            web.command_for_action({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "RUNNING"})
+
+    def test_destructive_actions_require_explicit_confirmation(self):
+        state = self.base_state("READY_TO_COMMIT")
+        with self.assertRaisesRegex(web.WebConsoleError, "confirm=COMMIT"):
+            web.command_for_action({"action": "finalize_commit"}, state)
+        req = web.command_for_action({"action": "finalize_commit", "confirm": "COMMIT"}, state)
+        self.assertIn("--commit", req.argv)
+        with self.assertRaisesRegex(web.WebConsoleError, "confirm=PUSH"):
+            web.command_for_action({"action": "finalize_push"}, self.base_state("COMMITTED"))
+        with self.assertRaisesRegex(web.WebConsoleError, "confirm=RETIRE"):
+            web.command_for_action({"action": "retire", "reason": "obsolete"}, self.base_state("BLOCKED_HUMAN"))
+
+    def test_steer_preserves_exact_gate_and_direction(self):
+        req = web.command_for_action({
+            "action": "steer", "gate": "HG-0021-03", "direction": "Keep the approved test in scope",
+            "allow_new_test": ["tests/test_exact.py"],
+        }, self.base_state("BLOCKED_HUMAN"))
+        self.assertEqual(req.argv[:3], ["steer", "b" * 64, "--gate"])
+        self.assertIn("HG-0021-03", req.argv)
+        self.assertIn("--allow-new-test", req.argv)
+
+    def test_reconciliation_actions_are_explicit(self):
+        with self.assertRaises(web.WebConsoleError):
+            web.command_for_action({"action": "reconcile_commit", "commit": "abc", "reason": "manual"}, self.base_state("READY_TO_COMMIT"))
+        req = web.command_for_action({"action": "reconcile_commit", "commit": "abc", "reason": "manual", "confirm": "ADOPT"}, self.base_state("READY_TO_COMMIT"))
+        self.assertEqual(req.argv[0], "reconcile-commit")
+        with self.assertRaises(web.WebConsoleError):
+            web.command_for_action({"action": "reconcile_push"}, self.base_state("COMMITTED"))
+
+
+class HttpSurfaceTests(unittest.TestCase):
+    def test_health_and_snapshot_are_available_but_write_requires_csrf(self):
+        with WebHarness() as h:
+            h.state()
+            with mock.patch.object(web, "git_snapshot", return_value={"branch": "main", "upstream": "origin/main", "head": "abc", "dirty": False, "dirty_count": 0, "status": []}):
+                server = web.build_server("127.0.0.1", 0, csrf_token="known-token")
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                host, port = server.server_address[:2]
+                try:
+                    health = json.load(urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=3))
+                    self.assertTrue(health["ok"])
+                    snap = json.load(urllib.request.urlopen(f"http://{host}:{port}/api/snapshot", timeout=3))
+                    self.assertEqual(snap["controller"]["status"], "APPROVED")
+                    request = urllib.request.Request(
+                        f"http://{host}:{port}/api/action",
+                        data=json.dumps({"action": "run"}).encode(),
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(request, timeout=3)
+                    self.assertEqual(ctx.exception.code, 403)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=3)
+
+    def test_http_surface_rejects_foreign_host_header(self):
+        with WebHarness() as h:
+            h.state()
+            server = web.build_server("127.0.0.1", 0, csrf_token="known-token")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address[:2]
+            try:
+                request = urllib.request.Request(f"http://{host}:{port}/api/health", headers={"Host": "evil.example:8765"})
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(request, timeout=3)
+                self.assertEqual(ctx.exception.code, 421)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
+    def test_lan_surface_requires_access_token_for_api(self):
+        with WebHarness() as h:
+            h.state()
+            with mock.patch.object(web, "git_snapshot", return_value={"branch": "main", "upstream": "origin/main", "head": "abc", "dirty": False, "dirty_count": 0, "status": []}):
+                server = web.build_server(
+                    "127.0.0.1", 0,
+                    csrf_token="known-csrf",
+                    access_token="known-access",
+                )
+                server.lan_mode = True
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                host, port = server.server_address[:2]
+                try:
+                    request = urllib.request.Request(f"http://{host}:{port}/api/snapshot")
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(request, timeout=3)
+                    self.assertEqual(ctx.exception.code, 401)
+                    request = urllib.request.Request(
+                        f"http://{host}:{port}/api/snapshot",
+                        headers={"X-RALPH-AUTH": "known-access"},
+                    )
+                    snap = json.load(urllib.request.urlopen(request, timeout=3))
+                    self.assertEqual(snap["controller"]["status"], "APPROVED")
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=3)
+
+    def test_index_contains_operator_sections_and_csrf_token(self):
+        page = web.PAGE.replace("__CSRF__", "abc123")
+        for label in ("Plan Progress", "Human Control", "Live Activity", "Completion Report", "Controller Output"):
+            self.assertIn(label, page)
+        self.assertIn("abc123", page)
+        self.assertIn("X-RALPH-AUTH", page)
+
+
+class BackgroundJobTests(unittest.TestCase):
+    def test_second_background_job_is_refused(self):
+        with WebHarness() as h:
+            h.state()
+            web.WEB_JOB.write_text(json.dumps({"active": True, "pid": 1234}), encoding="utf-8")
+            with mock.patch.object(web, "_process_alive", return_value=True):
+                with self.assertRaisesRegex(web.WebConsoleError, "already active"):
+                    web.run_command(web.CommandRequest(["run"], background=True))
+
+
+if __name__ == "__main__":
+    unittest.main()

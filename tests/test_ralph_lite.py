@@ -86,6 +86,7 @@ class PolicyTests(unittest.TestCase):
     def test_ralph_tooling_paths_are_classified_separately(self):
         self.assertTrue(ralph.is_tooling_path("scripts/ralph.py"))
         self.assertTrue(ralph.is_tooling_path("scripts/ralph_gate.py"))
+        self.assertTrue(ralph.is_tooling_path("scripts/ralph_web.py"))
         self.assertTrue(ralph.is_tooling_path("tests/test_ralph_lite.py"))
         self.assertTrue(ralph.is_tooling_path("tests/test_ralph_gate.py"))
         self.assertFalse(ralph.is_tooling_path("app/main.py"))

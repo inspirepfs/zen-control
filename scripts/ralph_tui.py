@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 _COLOR_MODE = "auto"
 
 ANSI = {

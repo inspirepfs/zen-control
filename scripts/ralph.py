@@ -70,6 +70,7 @@ TOOLING_PATHS = {
     "scripts/ralph.py",
     "scripts/ralph_gate.py",
     "scripts/ralph_tui.py",
+    "scripts/ralph_web.py",
     "tests/test_ralph_lite.py",
     "tests/test_ralph_gate.py",
     "tests/test_ralph_lifecycle.py",
@@ -2683,6 +2684,15 @@ def cmd_resolve_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the RALPH-Lite operator web console."""
+    try:
+        import ralph_web
+    except ImportError as exc:
+        raise RuntimeError("RALPH web console module is unavailable") from exc
+    return int(ralph_web.serve(args.host, args.port, allow_lan=bool(args.allow_lan)))
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     init_files()
     state = load_state()
@@ -3096,6 +3106,15 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--details", action="store_true", help="include per-loop token usage")
     usage.add_argument("--json", action="store_true", help="emit machine-readable report")
     usage.set_defaults(func=cmd_usage)
+    serve = sub.add_parser("serve", help="run the local operator web console")
+    serve.add_argument("--host", default="127.0.0.1", help="bind address; default 127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765, help="local console port; default 8765")
+    serve.add_argument(
+        "--allow-lan",
+        action="store_true",
+        help="explicitly allow one private LAN bind; LAN mode requires a per-start browser access token",
+    )
+    serve.set_defaults(func=cmd_serve)
     sub.add_parser("status").set_defaults(func=cmd_status)
     return parser
 

@@ -721,8 +721,9 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(pushed["status"], "PUSHED")
             self.assertTrue(pushed["push_reconciled"])
 
-    def test_parser_exposes_reconciliation_commands(self):
+    def test_parser_exposes_reconciliation_and_web_commands(self):
         parser = ralph.build_parser()
         help_text = parser.format_help()
         self.assertIn("reconcile-commit", help_text)
         self.assertIn("reconcile-push", help_text)
+        self.assertIn("serve", help_text)

@@ -427,6 +427,7 @@ The development loop uses bounded/delta-oriented context rather than repeatedly 
 | `scripts/ralph.py` | deterministic supervisor/state machine |
 | `scripts/ralph_gate.py` | read-only human-gate review surface |
 | `scripts/ralph_tui.py` | dependency-free terminal renderer |
+| `scripts/ralph_web.py` | loopback-only local operator web console |
 | `.ralph/policy.md` | controller policy contract |
 | `.ralph/plan.md` | current immutable approved/proposed plan |
 | `.ralph/state.json` | controller state |
@@ -476,8 +477,96 @@ Use `retire-plan`. Do not edit `.ralph/state.json` to make a plan disappear.
 
 Treat it as a real release/engineering failure. Do not manufacture a PASS or weaken thresholds merely to leave `READY_TO_COMMIT`.
 
-## Web console direction
+## Local web console
 
-A local web UI is intentionally deferred. The v0.2.x TUI and `.ralph/events.jsonl` are the stable operator/event contracts that a future web console should consume.
+RALPH-Lite v0.3.0 adds a zero-dependency local web console on top of the same controller state and structured event stream used by the TUI. It is an operator surface, **not** a second state machine. Every state-changing action invokes the existing `scripts/ralph.py` command path and therefore retains the same plan hashes, authority checks, test policy, recovery checkpoints, human gates and Git publication guards.
 
-Any future control UI should bind to loopback by default and invoke the same controller commands/authority checks rather than creating a second state machine.
+Start it with:
+
+```bash
+python3 scripts/ralph.py serve
+```
+
+Default address:
+
+```text
+http://127.0.0.1:8765/
+```
+
+An alternate loopback port is allowed:
+
+```bash
+python3 scripts/ralph.py serve --port 8877
+```
+
+Loopback remains the default. For a trusted home-lab LAN, v0.3.1 supports an explicit private-LAN mode bound to one specific RFC1918/ULA address. Wildcard binds such as `0.0.0.0`/`::` and public addresses remain refused.
+
+Example:
+
+```bash
+python3 scripts/ralph.py serve --host 192.168.2.10 --allow-lan
+```
+
+LAN mode generates a fresh browser access token on every server start and prints a URL such as:
+
+```text
+http://192.168.2.10:8765/#<access-token>
+```
+
+The token is carried in the browser URL fragment, removed from the visible address bar after page load, and sent to Ralph only in the `X-RALPH-AUTH` request header. API reads and all state-changing actions require that token in LAN mode, while writes continue to require the independent per-process CSRF token as well. Host-header validation permits only the exact configured bind IP, limiting DNS-rebinding exposure.
+
+LAN mode is intended for a trusted private home-lab network. It is not an Internet exposure mode and does not enable wildcard/public binds.
+
+### Web console views
+
+The dashboard shows:
+
+- controller state, active plan hash, current step and loop count;
+- Codex quota headroom and last context-efficiency result;
+- Git branch/upstream/dirty state;
+- approval-time recovery checkpoint;
+- full plan progress and per-step test authority;
+- current human gate/block reason;
+- plan-owned/changed files;
+- the structured `.ralph/events.jsonl` activity stream;
+- bounded controller output;
+- the current completion-report preview when available.
+
+The browser polls local state; it does not ask Codex another question merely to refresh the display.
+
+### Web actions
+
+The console exposes the normal supervised lifecycle where the current controller state makes the action meaningful:
+
+- propose a new bounded goal;
+- approve or reject a proposal;
+- start the approved run;
+- steer, resume or resolve an open human gate;
+- retire an obsolete plan;
+- review finalization;
+- commit a qualified plan;
+- push the committed plan.
+
+Exceptional commit/push reconciliation remains available through the CLI. The browser intentionally keeps the routine happy path prominent and does not turn every recovery mechanism into a one-click action.
+
+### Web control safety
+
+The local server:
+
+- binds to loopback only;
+- generates a new in-memory CSRF token on every server start;
+- requires the CSRF token on all state-changing HTTP requests;
+- exposes no CORS permission for external origins;
+- applies no policy bypass or force-push surface;
+- requires explicit text confirmation before retire, commit and push operations;
+- permits only one background Ralph job at a time;
+- writes background runner output to local ignored `.ralph/web-run.log`;
+- writes local runner metadata to ignored `.ralph/web-job.json`.
+
+The existing CLI remains the authoritative recovery surface if a browser session disappears or a web action is interrupted.
+
+### Background run semantics
+
+`propose` and `run` can take long enough that the browser request should not remain open. The console therefore starts those commands as a single local background Ralph job and continues rendering progress from the event/state files. A second background run is refused while the first process is alive.
+
+The web process itself does not own or infer plan completion. `scripts/ralph.py` continues to update the same durable controller state.
