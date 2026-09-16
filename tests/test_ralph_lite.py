@@ -467,3 +467,120 @@ class SnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ProposalLifecycleTests(unittest.TestCase):
+    def _with_paths(self, directory):
+        return {
+            "STATE": ralph.STATE,
+            "PLAN": ralph.PLAN,
+            "JOURNAL": ralph.JOURNAL,
+            "init_files": ralph.init_files,
+        }
+
+    def test_reject_restores_previous_completed_state_when_snapshot_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._with_paths(td)
+            try:
+                root = Path(td)
+                ralph.STATE = root / "state.json"
+                ralph.PLAN = root / "plan.md"
+                ralph.JOURNAL = root / "journal.md"
+                ralph.JOURNAL.write_text("", encoding="utf-8")
+                ralph.init_files = lambda: None
+                old_plan = valid_plan()
+                old_hash = ralph.plan_hash(old_plan)
+                previous = ralph.default_state()
+                previous.update({
+                    "status": "PLAN_COMPLETE",
+                    "plan_hash": old_hash,
+                    "plan": old_plan,
+                    "current_step": 6,
+                    "loop_count": 9,
+                })
+                proposal = valid_plan()
+                proposal["goal"] = "Replacement proposal"
+                proposal_hash = ralph.plan_hash(proposal)
+                pending = dict(previous)
+                pending.update({
+                    "status": "AWAITING_APPROVAL",
+                    "plan_hash": proposal_hash,
+                    "plan": proposal,
+                    "current_step": 1,
+                    "proposal_previous_state": previous,
+                    "codex_usage": {"schema": "zen_codex_usage_v1"},
+                })
+                ralph.save_state(pending)
+                ralph.PLAN.write_text(ralph.render_plan(proposal), encoding="utf-8")
+
+                rc = ralph.cmd_reject(type("Args", (), {"plan_hash": proposal_hash, "reason": "scope correction"})())
+                self.assertEqual(rc, 0)
+                restored = ralph.load_state()
+                self.assertEqual(restored["status"], "PLAN_COMPLETE")
+                self.assertEqual(restored["plan_hash"], old_hash)
+                self.assertEqual(restored["loop_count"], 9)
+                self.assertEqual(restored["codex_usage"]["schema"], "zen_codex_usage_v1")
+                self.assertEqual(ralph.PLAN.read_text(encoding="utf-8"), ralph.render_plan(old_plan))
+                self.assertIn("Execution authority granted: no", ralph.JOURNAL.read_text(encoding="utf-8"))
+            finally:
+                ralph.STATE = saved["STATE"]
+                ralph.PLAN = saved["PLAN"]
+                ralph.JOURNAL = saved["JOURNAL"]
+                ralph.init_files = saved["init_files"]
+
+    def test_reject_legacy_pending_proposal_returns_idle_without_losing_loop_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._with_paths(td)
+            try:
+                root = Path(td)
+                ralph.STATE = root / "state.json"
+                ralph.PLAN = root / "plan.md"
+                ralph.JOURNAL = root / "journal.md"
+                ralph.JOURNAL.write_text("", encoding="utf-8")
+                ralph.init_files = lambda: None
+                proposal = valid_plan()
+                proposal_hash = ralph.plan_hash(proposal)
+                pending = ralph.default_state()
+                pending.update({
+                    "status": "AWAITING_APPROVAL",
+                    "plan_hash": proposal_hash,
+                    "plan": proposal,
+                    "loop_count": 9,
+                    "codex_usage": {"schema": "zen_codex_usage_v1"},
+                })
+                ralph.save_state(pending)
+                ralph.PLAN.write_text(ralph.render_plan(proposal), encoding="utf-8")
+
+                ralph.cmd_reject(type("Args", (), {"plan_hash": proposal_hash, "reason": "superseded"})())
+                restored = ralph.load_state()
+                self.assertEqual(restored["status"], "IDLE")
+                self.assertIsNone(restored["plan"])
+                self.assertIsNone(restored["plan_hash"])
+                self.assertEqual(restored["loop_count"], 9)
+                self.assertEqual(restored["codex_usage"]["schema"], "zen_codex_usage_v1")
+                self.assertFalse(ralph.PLAN.exists())
+            finally:
+                ralph.STATE = saved["STATE"]
+                ralph.PLAN = saved["PLAN"]
+                ralph.JOURNAL = saved["JOURNAL"]
+                ralph.init_files = saved["init_files"]
+
+    def test_proposal_usage_is_separate_from_last_implementation_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_live = ralph.LIVE
+            try:
+                ralph.LIVE = Path(td) / "live.log"
+                ralph.LIVE.write_text(
+                    "[x] RALPH    loop=0009 step=7/7\n"
+                    "[x] USAGE    cumulative_input=389806 cached=339712 output=9792 reasoning=3672\n"
+                    "[x] CODEX    PLAN PROPOSAL · sandbox=read-only backend=default\n"
+                    "[x] USAGE    cumulative_input=829351 cached=690688 output=9042 reasoning=4354\n"
+                    "[x] CODEX    PLAN PROPOSAL · sandbox=read-only backend=default\n"
+                    "[x] USAGE    cumulative_input=126962 cached=88064 output=6938 reasoning=4503\n",
+                    encoding="utf-8",
+                )
+                scopes = ralph.live_usage_scopes()
+                self.assertEqual(scopes["implementation"][9]["input"], 389806)
+                self.assertEqual([x["input"] for x in scopes["planning"]], [829351, 126962])
+                self.assertEqual(ralph.live_usage_by_loop()[9]["input"], 389806)
+            finally:
+                ralph.LIVE = old_live

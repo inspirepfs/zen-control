@@ -1151,50 +1151,87 @@ def ensure_codex_usage_capacity(state: dict, *, wait: bool = True, poll_seconds:
             return False
 
 
-def live_usage_by_loop() -> dict[int, dict[str, int]]:
-    """Recover cumulative per-turn usage from the operator trace, including older loops."""
+def _usage_numbers(line: str) -> dict[str, int] | None:
+    def number(pattern: str) -> int:
+        found = re.search(pattern, line)
+        return int(found.group(1)) if found else 0
+
+    input_tokens = number(r"(?:cumulative_)?input=(\d+)")
+    if not input_tokens:
+        return None
+    cached = number(r"cached=(\d+)")
+    return {
+        "input": input_tokens,
+        "cached": cached,
+        "noncached": max(0, input_tokens - cached),
+        "cache_write": number(r"cache_write=(\d+)"),
+        "output": number(r"output=(\d+)"),
+        "reasoning": number(r"reasoning=(\d+)"),
+    }
+
+
+def live_usage_scopes() -> dict:
+    """Recover implementation-loop and proposal usage without cross-contamination.
+
+    Older traces did not carry an explicit usage scope.  A RALPH ``loop=`` marker
+    owns subsequent usage until a PLAN PROPOSAL marker appears.  Proposal turns
+    are retained separately and can therefore never overwrite the last real
+    implementation loop.
+    """
+    result = {"implementation": {}, "planning": []}
     if not LIVE.exists():
-        return {}
-    current_loop = None
-    totals: dict[int, dict[str, int]] = {}
+        return result
+    current_loop: int | None = None
+    scope = "unscoped"
     for line in LIVE.read_text(encoding="utf-8", errors="replace").splitlines():
         match = re.search(r"\bRALPH\s+loop=(\d+)", line)
         if match:
             current_loop = int(match.group(1))
+            scope = "implementation"
             continue
-        if current_loop is None or " USAGE " not in line:
+        if " CODEX " in line and "PLAN PROPOSAL" in line:
+            current_loop = None
+            scope = "planning"
             continue
-        def number(pattern: str) -> int:
-            found = re.search(pattern, line)
-            return int(found.group(1)) if found else 0
-        input_tokens = number(r"(?:cumulative_)?input=(\d+)")
-        cached = number(r"cached=(\d+)")
-        if not input_tokens:
+        if " USAGE " not in line:
             continue
-        totals[current_loop] = {
-            "input": input_tokens,
-            "cached": cached,
-            "noncached": max(0, input_tokens - cached),
-            "cache_write": number(r"cache_write=(\d+)"),
-            "output": number(r"output=(\d+)"),
-            "reasoning": number(r"reasoning=(\d+)"),
-        }
-    return totals
+        usage = _usage_numbers(line)
+        if usage is None:
+            continue
+        if scope == "implementation" and current_loop is not None:
+            result["implementation"][current_loop] = usage
+        elif scope == "planning":
+            result["planning"].append(usage)
+    return result
+
+
+def live_usage_by_loop() -> dict[int, dict[str, int]]:
+    """Compatibility helper returning implementation-loop usage only."""
+    return live_usage_scopes()["implementation"]
 
 
 def usage_report_data(state: dict, snapshot: dict | None = None) -> dict:
-    turns = live_usage_by_loop()
+    scoped = live_usage_scopes()
+    turns = scoped["implementation"]
+    planning_turns = scoped["planning"]
     fields = ("input", "cached", "noncached", "cache_write", "output", "reasoning")
-    total = {field: sum(item.get(field, 0) for item in turns.values()) for field in fields}
+    implementation_total = {field: sum(item.get(field, 0) for item in turns.values()) for field in fields}
+    planning_total = {field: sum(item.get(field, 0) for item in planning_turns) for field in fields}
+    total = {field: implementation_total[field] + planning_total[field] for field in fields}
     context = load_context()
     raw_context_bytes = len(CONTEXT.read_bytes()) if CONTEXT.exists() else 0
     result = {
         "plan_hash": state.get("plan_hash"),
         "status": state.get("status"),
         "loop_count": state.get("loop_count", 0),
-        "observed_codex_turns": len(turns),
+        "observed_codex_turns": len(turns) + len(planning_turns),
+        "implementation_codex_turns": len(turns),
+        "planning_codex_turns": len(planning_turns),
         "turns": turns,
+        "planning_turns": planning_turns,
         "totals": total,
+        "implementation_totals": implementation_total,
+        "planning_totals": planning_total,
         "cache_ratio_percent": (total["cached"] / total["input"] * 100.0) if total["input"] else 0.0,
         "handoff_context": {
             "bytes": raw_context_bytes,
@@ -1236,7 +1273,11 @@ def cmd_usage(args: argparse.Namespace) -> int:
         return 0 if snapshot else 2
     totals = report["totals"]
     print("RALPH-Lite Context / Usage Report")
-    print(f"plan={report['plan_hash'] or '-'} status={report['status']} loops={report['loop_count']} observed_codex_turns={report['observed_codex_turns']}")
+    print(
+        f"plan={report['plan_hash'] or '-'} status={report['status']} loops={report['loop_count']} "
+        f"observed_codex_turns={report['observed_codex_turns']} "
+        f"implementation_turns={report['implementation_codex_turns']} planning_turns={report['planning_codex_turns']}"
+    )
     print(
         "tokens cumulative: "
         f"input={totals['input']:,} cached={totals['cached']:,} non-cached={totals['noncached']:,} "
@@ -1256,6 +1297,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
         for loop_no, item in sorted(report["turns"].items()):
             ratio = (item["cached"] / item["input"] * 100.0) if item["input"] else 0.0
             print(f"  loop {loop_no:04d}: input={item['input']:,} non-cached={item['noncached']:,} output={item['output']:,} reasoning={item['reasoning']:,} cache={ratio:.1f}%")
+        for index, item in enumerate(report["planning_turns"], start=1):
+            ratio = (item["cached"] / item["input"] * 100.0) if item["input"] else 0.0
+            print(f"  proposal {index:04d}: input={item['input']:,} non-cached={item['noncached']:,} output={item['output']:,} reasoning={item['reasoning']:,} cache={ratio:.1f}%")
     return 0 if snapshot else 2
 
 def block(state: dict, reason: str) -> None:
@@ -1285,7 +1329,9 @@ def cmd_propose(args: argparse.Namespace) -> int:
     plan = run_codex(plan_prompt(args.goal), PLAN_SCHEMA, "read-only", context="PLAN PROPOSAL")
     validate_plan(plan)
     digest = plan_hash(plan)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None})
+    previous_state = dict(state)
+    previous_state.pop("proposal_previous_state", None)
+    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state})
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
@@ -1304,8 +1350,60 @@ def cmd_approve(args: argparse.Namespace) -> int:
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
         raise RuntimeError("plan.md changed after proposal; proposal must be regenerated before approval")
     state["status"] = "APPROVED"
+    state.pop("proposal_previous_state", None)
     save_state(state)
     print(f"Approved plan {expected}; {len(state['plan']['steps'])} steps ready.")
+    return 0
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    """Reject a pending proposal without granting it execution authority."""
+    init_files()
+    state = load_state()
+    if state.get("status") != "AWAITING_APPROVAL" or not state.get("plan"):
+        raise RuntimeError("no plan is awaiting approval")
+    expected = plan_hash(state["plan"])
+    if args.plan_hash != expected or state.get("plan_hash") != expected:
+        raise RuntimeError("rejection hash does not match the proposed plan")
+
+    current_usage = state.get("codex_usage")
+    previous = state.get("proposal_previous_state")
+    if isinstance(previous, dict) and previous.get("status") in {"IDLE", "PLAN_COMPLETE"}:
+        restored = dict(previous)
+        if isinstance(current_usage, dict):
+            restored["codex_usage"] = current_usage
+        state = restored
+        if state.get("plan"):
+            PLAN.write_text(render_plan(state["plan"]), encoding="utf-8")
+        else:
+            PLAN.unlink(missing_ok=True)
+        restored_to = state.get("status")
+    else:
+        # Legacy v0.1.7 proposals did not retain the previous state object.
+        # Preserve monotonic loop/accounting history but return to a neutral IDLE
+        # state rather than inventing a PLAN_COMPLETE plan that is no longer held.
+        loop_count = int(state.get("loop_count") or 0)
+        last_efficiency = state.get("last_efficiency")
+        fresh = default_state()
+        fresh["loop_count"] = loop_count
+        if isinstance(last_efficiency, dict):
+            fresh["last_efficiency"] = last_efficiency
+        if isinstance(current_usage, dict):
+            fresh["codex_usage"] = current_usage
+        state = fresh
+        PLAN.unlink(missing_ok=True)
+        restored_to = "IDLE"
+
+    save_state(state)
+    with JOURNAL.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"## Proposal rejected — {utc_now()}\n\n"
+            f"- Proposal: `{expected}`\n"
+            f"- Reason: {args.reason}\n"
+            f"- Restored controller state: {restored_to}\n"
+            "- Execution authority granted: no\n\n"
+        )
+    print(f"Rejected proposal {expected}; controller state={restored_to}.")
     return 0
 
 
@@ -1565,6 +1663,10 @@ def build_parser() -> argparse.ArgumentParser:
     approve = sub.add_parser("approve")
     approve.add_argument("plan_hash")
     approve.set_defaults(func=cmd_approve)
+    reject = sub.add_parser("reject", help="reject a pending proposal without granting execution authority")
+    reject.add_argument("plan_hash")
+    reject.add_argument("--reason", required=True)
+    reject.set_defaults(func=cmd_reject)
     run = sub.add_parser("run")
     run.add_argument("--max-loops", type=int, default=DEFAULT_MAX_LOOPS)
     run.add_argument("--wait-for-limits", action=argparse.BooleanOptionalAction, default=True, help="wait and automatically resume after Codex usage limits recover")
