@@ -1068,43 +1068,71 @@ class ActivityStore:
         result.sort(key=lambda item: abs(item["delta_bytes"]), reverse=True)
         return result[:limit]
 
-    def service_detail(self, service_name, hours=24):
+    def service_detail(self, service_name, hours=24, start=None, end=None, client_ip=None):
         service_name = str(service_name or "").strip()
         if not service_name:
             raise ValueError("Service name is required")
-        hours = max(1, min(int(hours), 24 * 31))
-        flow = self._query("""
+        if (start is None) != (end is None):
+            raise ValueError("Activity range requires both start and end boundaries")
+        if start is not None:
+            start, end = self._validate_range(start, end)
+            flow_window = "bucket >= %s AND bucket < %s"
+            dns_window = "event_time >= %s AND event_time < %s"
+            window_params = (start, end)
+        else:
+            hours = max(1, min(int(hours), 24 * 31))
+            flow_window = "bucket >= now() - (%s * interval '1 hour')"
+            dns_window = "event_time >= now() - (%s * interval '1 hour')"
+            window_params = (hours,)
+        selected_client = str(client_ip or "").strip()
+        if selected_client:
+            import ipaddress
+            selected_client = str(ipaddress.ip_address(selected_client))
+
+        flow_conditions = [flow_window, "lower(service)=lower(%s)"]
+        dns_conditions = [dns_window, "lower(service)=lower(%s)"]
+        flow_params = window_params + (service_name,)
+        dns_params = window_params + (service_name,)
+        if selected_client:
+            flow_conditions.append("client_ip=%s")
+            dns_conditions.append("client_ip=%s")
+            flow_params += (selected_client,)
+            dns_params += (selected_client,)
+        flow_where = " AND ".join(flow_conditions)
+        dns_where = " AND ".join(dns_conditions)
+
+        flow = self._query(f"""
             SELECT COALESCE(sum(bytes),0) AS total_bytes, COALESCE(sum(flows),0) AS flows,
                    count(DISTINCT client_ip) AS devices, min(bucket) AS first_seen, max(bucket) AS last_seen
             FROM flow_5m
-            WHERE bucket >= now() - (%s * interval '1 hour') AND lower(service)=lower(%s)
-        """, (hours, service_name))[0]
-        dns = self._query("""
+            WHERE {flow_where}
+        """, flow_params)[0]
+        dns = self._query(f"""
             SELECT count(*) AS queries, count(*) FILTER (WHERE blocked) AS blocked,
                    count(DISTINCT client_ip) AS dns_devices, count(DISTINCT domain) AS domains,
                    min(event_time) AS dns_first_seen, max(event_time) AS dns_last_seen
             FROM dns_queries
-            WHERE event_time >= now() - (%s * interval '1 hour') AND lower(service)=lower(%s)
-        """, (hours, service_name))[0]
-        devices = self._query("""
+            WHERE {dns_where}
+        """, dns_params)[0]
+        devices = self._query(f"""
             SELECT client_ip, COALESCE(sum(bytes),0) AS total_bytes, COALESCE(sum(flows),0) AS flows, max(bucket) AS last_seen
             FROM flow_5m
-            WHERE bucket >= now() - (%s * interval '1 hour') AND lower(service)=lower(%s)
+            WHERE {flow_where}
             GROUP BY client_ip ORDER BY total_bytes DESC LIMIT 30
-        """, (hours, service_name))
-        domains = self._query("""
+        """, flow_params)
+        domains = self._query(f"""
             SELECT domain, count(*) AS queries, count(*) FILTER (WHERE blocked) AS blocked,
                    count(DISTINCT client_ip) AS devices, max(event_time) AS last_seen
             FROM dns_queries
-            WHERE event_time >= now() - (%s * interval '1 hour') AND lower(service)=lower(%s) AND domain <> ''
+            WHERE {dns_where} AND domain <> ''
             GROUP BY domain ORDER BY queries DESC LIMIT 50
-        """, (hours, service_name))
-        series = self._query("""
+        """, dns_params)
+        series = self._query(f"""
             SELECT date_trunc('hour', bucket) AS bucket, COALESCE(sum(bytes),0) AS total_bytes, COALESCE(sum(flows),0) AS flows
             FROM flow_5m
-            WHERE bucket >= now() - (%s * interval '1 hour') AND lower(service)=lower(%s)
+            WHERE {flow_where}
             GROUP BY 1 ORDER BY 1
-        """, (hours, service_name))
+        """, flow_params)
         for item in devices:
             item["total_bytes"] = int(item.get("total_bytes") or 0)
             item["total_bytes_human"] = _format_bytes(item["total_bytes"])
@@ -2015,12 +2043,21 @@ def build_service_intelligence(
                 queries += dns_by_token[token]["queries"]
                 blocked += dns_by_token[token]["blocked"]
         health = health_by_key.get(key)
+        tls_patterns = list(definition.get("tls_patterns") or [])
+        dns_suffixes = list(definition.get("dns_suffixes") or [])
+        has_tls = bool(tls_patterns)
+        has_dns = bool(dns_suffixes)
+        expects_routeros_contract = bool(definition.get("routeros_managed")) and has_tls
         row.update({
             "category": definition.get("category") or "other",
-            "dns_suffixes": list(definition.get("dns_suffixes") or []),
-            "tls_patterns": list(definition.get("tls_patterns") or []),
+            "dns_suffixes": dns_suffixes,
+            "tls_patterns": tls_patterns,
             "classifier_enabled": bool(definition.get("classifier_enabled", True)),
             "routeros_managed": bool(definition.get("routeros_managed")),
+            "enforcement_approved": bool(definition.get("enforcement_approved")),
+            "has_tls_signatures": has_tls,
+            "has_dns_signatures": has_dns,
+            "expects_routeros_contract": expects_routeros_contract,
             "dns_queries": queries,
             "dns_blocked": blocked,
             "router_health": health or {},
@@ -2028,19 +2065,28 @@ def build_service_intelligence(
         })
         if row.get("kind") == "group":
             row["classification_status"] = "aggregate"
-        elif health and health.get("status") in {"reporting", "absent"}:
-            row["classification_status"] = "reporting"
+        elif expects_routeros_contract and not health:
+            # A RouterOS-managed TLS contract is not DNS reporting when its
+            # current RouterOS observation is absent.  Its contract state is
+            # unknown until the reconciler publishes matching evidence.
+            row["classification_status"] = "unverified"
+        elif expects_routeros_contract:
+            # RouterOS contract results describe enforcement, not DNS.  An
+            # explicit reporting/absent result still means the TLS contract is
+            # degraded, even when DNS signatures happen to be configured too.
+            row["classification_status"] = "healthy" if health.get("healthy") else "degraded"
         elif health and health.get("status") == "orphaned":
             row["classification_status"] = "degraded"
-        elif health:
-            row["classification_status"] = "healthy" if health.get("healthy") else "degraded"
-        elif definition.get("dns_suffixes") or definition.get("tls_patterns"):
+        elif has_dns or has_tls:
             row["classification_status"] = "reporting"
         elif row.get("policy_tracked"):
             row["classification_status"] = "unsigned"
         else:
             row["classification_status"] = "observed"
-        row["last_signal"] = "TLS/SNI + DNS" if health and health.get("healthy") else (
-            "DNS classification" if definition.get("dns_suffixes") else "Telemetry label"
+        row["last_signal"] = (
+            "TLS/SNI + DNS" if has_tls and has_dns else
+            "TLS/SNI" if has_tls else
+            "DNS classification" if has_dns else
+            "Telemetry label"
         )
     return base

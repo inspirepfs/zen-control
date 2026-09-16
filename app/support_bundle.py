@@ -317,7 +317,7 @@ def build_commissioning_report(
         "schema": COMMISSIONING_SCHEMA,
         "release": SUPPORT_RELEASE,
         "version": str(version),
-        "captured_at": _now_iso(),
+        "captured_at": str(diagnostics.get("captured_at") or _now_iso()),
         "overall": overall,
         "counts": counts,
         "checks": checks,

@@ -27,12 +27,12 @@
   {% else %}
   <section class="card">
     <div class="card-heading">
-      <div><h2>{{hours}} hour service summary</h2><p class="muted">Retained IPFIX traffic and Pi-hole DNS evidence attributed to this service.</p></div>
-      {% if router_health %}
-        {% if router_health.healthy %}<span class="policy-badge enabled">TLS CONTRACT HEALTHY</span>{% else %}<span class="policy-badge disabled">TLS CONTRACT DEGRADED</span>{% endif %}
-      {% elif service.dns_suffixes or service.tls_patterns %}
-        <span class="policy-badge staging">REPORTING CLASSIFIER</span>
-      {% else %}<span class="policy-badge staging">NO SIGNATURES</span>{% endif %}
+      <div><h2>{% if selected_start %}Selected historical service summary{% else %}{{hours}} hour service summary{% endif %}</h2><p class="muted">Retained IPFIX traffic and Pi-hole DNS evidence attributed to this service{% if selected_start %} from {{selected_start}} to {{selected_end}}{% endif %}{% if selected_client %} for {{selected_client}}{% endif %}.</p></div>
+      {% if service_signal.state == 'healthy' %}
+        {% if router_health.healthy %}<span class="policy-badge enabled">{{service_signal.label}}</span>{% endif %}
+      {% elif service_signal.state in ('degraded', 'unverified') %}
+        <span class="policy-badge disabled">{{service_signal.label}}</span>
+      {% else %}<span class="policy-badge staging">{{service_signal.label}}</span>{% endif %}
     </div>
     <div class="service-drill-grid">
       <div><span>Traffic</span><strong>{{detail.total_bytes_human}}</strong></div>
@@ -56,6 +56,14 @@
       <div><span class="muted small">TLS/SNI search patterns</span><div class="signature-chips">{% for item in service.tls_patterns %}<code>{{item}}</code>{% else %}<span class="muted">No TLS signatures configured.</span>{% endfor %}</div></div>
       <div><span class="muted small">DNS suffixes</span><div class="signature-chips">{% for item in service.dns_suffixes %}<code>{{item}}</code>{% else %}<span class="muted">No DNS suffixes configured.</span>{% endfor %}</div></div>
     </div>
+    {% if service_observation.state == 'missing' %}
+      <div class="muted small">Revision-bound advisory RouterOS TLS contract evidence is MISSING for this revision{% if router_health %}; a read-only current check is shown above{% endif %}.</div>
+    {% elif service_observation.state == 'stale' %}
+      <div class="muted small">RouterOS TLS contract evidence is STALE for this revision; background reconciliation is refreshing it.</div>
+    {% endif %}
+    {% if service_signal.state == 'unverified' %}
+      <div class="conflict-warning">RouterOS TLS contract evidence is {{service_observation.state|default('missing', true)|upper}} for this revision; the enforcement contract is unverified.</div>
+    {% endif %}
     {% if router_health.error %}<div class="conflict-warning">{{router_health.error}}</div>{% endif %}
     {% if service.coverage_note %}<div class="muted small">{{service.coverage_note}}</div>{% endif %}
   </section>

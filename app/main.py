@@ -358,6 +358,50 @@ def runtime_service_catalog():
     return policy_store.routeros_service_catalog()
 
 
+def _service_intelligence_signal(
+    service: dict,
+    router_health: dict | None,
+    service_observation: dict | None,
+    *,
+    router_health_current: bool,
+) -> dict:
+    """Describe only the evidence capabilities this service can honestly claim.
+
+    RouterOS contract health is meaningful only when it comes from a fresh
+    revision-bound observation or this request's read-only fallback. Stale
+    advisory evidence remains useful context, but must never promote an
+    enforcement-approved TLS contract to healthy.
+    """
+    tls_patterns = [
+        str(item).strip() for item in (service.get("tls_patterns") or [])
+        if str(item).strip()
+    ]
+    dns_suffixes = [
+        str(item).strip() for item in (service.get("dns_suffixes") or [])
+        if str(item).strip()
+    ]
+    tls_contract = bool(service.get("routeros_managed") and tls_patterns)
+    observation_state = str((service_observation or {}).get("state") or "missing")
+
+    if tls_contract:
+        if router_health_current and router_health:
+            if router_health.get("healthy"):
+                return {"state": "healthy", "label": "TLS CONTRACT HEALTHY"}
+            return {"state": "degraded", "label": "TLS CONTRACT DEGRADED"}
+        return {
+            "state": "unverified",
+            "label": "TLS CONTRACT UNVERIFIED",
+            "observation_state": observation_state,
+        }
+    if tls_patterns and dns_suffixes:
+        return {"state": "classifiers", "label": "TLS/SNI + DNS CLASSIFIERS"}
+    if tls_patterns:
+        return {"state": "classifier", "label": "TLS/SNI CLASSIFIER"}
+    if dns_suffixes:
+        return {"state": "reporting", "label": "DNS REPORTING"}
+    return {"state": "unsigned", "label": "NO SIGNATURES"}
+
+
 def current_user(request: Request):
     username = request.session.get("user")
     if not username or username not in USERS:
@@ -1564,24 +1608,70 @@ operational_diagnostics = OperationalDiagnostics(
 )
 
 
+def _captured_commissioning_evidence(diagnostics) -> tuple[dict, dict]:
+    """Derive overlapping readiness inputs from one sanitized diagnostics capture."""
+    rows = {
+        str(row.get("key")): row
+        for row in (diagnostics.get("checks") or [])
+        if isinstance(row, dict)
+    } if isinstance(diagnostics, dict) else {}
+
+    def state(key: str) -> str:
+        return str((rows.get(key) or {}).get("state") or "unavailable").lower()
+
+    def usable(key: str) -> bool:
+        # A warning still proves the component is running; failed or absent
+        # evidence never becomes ready in either derived contract.
+        return state(key) in {"healthy", "warning"}
+
+    worker_checks = {
+        "background": "application",
+        "reconciler": "reconciler",
+        "incidents": "incidents",
+        "summary_delivery": "summary_delivery",
+    }
+    workers = {
+        name: {
+            "required": True,
+            "available": key in rows,
+            "alive": usable(key),
+        }
+        for name, key in worker_checks.items()
+    }
+    database_ok = usable("policy_database")
+    runtime_ok = database_ok and all(worker["alive"] for worker in workers.values())
+    runtime_health = {
+        "schema": "zen_runtime_health_v1",
+        "ok": runtime_ok,
+        "status": "healthy" if runtime_ok else "degraded",
+        "version": str(app.version),
+        "workers": workers,
+        "database": {"available": "policy_database" in rows, "healthy": database_ok},
+        "background_read_models": {"captured": True, "failed_latest": 0, "retrying_latest": 0},
+    }
+
+    readiness_checks = {
+        "database": "policy_database",
+        "router": "routeros_api",
+        "security": "security_authority",
+        "reconciler": "reconciler",
+    }
+    components = {name: "ok" if usable(key) else "fail" for name, key in readiness_checks.items()}
+    issues = [name for name, status in components.items() if status != "ok"]
+    operations = {
+        "ok": not issues,
+        "components": components,
+        "issues": issues,
+        "evidence": "operational_diagnostics_capture",
+    }
+    return runtime_health, operations
+
+
 def current_commissioning_report(diagnostics=None, *, include_evidence=False) -> dict:
-    """Compose commissioning state without extending any mutation authority."""
-    diagnostics = diagnostics or operational_diagnostics.capture()
-    try:
-        runtime_health = build_runtime_health(
-            version=app.version,
-            background_worker=background_worker,
-            reconciler=auto_reconciler,
-            incident_monitor=incident_monitor,
-            summary_delivery=summary_delivery,
-            policy_store=policy_store,
-        )
-    except Exception:
-        runtime_health = {"schema": "zen_runtime_health_v1", "ok": False, "status": "degraded"}
-    try:
-        operations = operations_monitor.readiness()
-    except Exception:
-        operations = {"ok": False, "issues": ["runtime readiness probe failed"]}
+    """Compose commissioning state from one diagnostic capture without re-probing it."""
+    if diagnostics is None:
+        diagnostics = operational_diagnostics.capture()
+    runtime_health, operations = _captured_commissioning_evidence(diagnostics)
     try:
         transport = current_secure_transport_status()
     except Exception:
@@ -4169,11 +4259,13 @@ def activity_classification_page(
 
 
 @app.get("/activity/service/{service_key}", response_class=HTMLResponse)
-@coherent_router_request
 def activity_service_page(
     request: Request,
     service_key: str,
     hours: int = 24,
+    start: str = "",
+    end: str = "",
+    client_ip: str = "",
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     definitions = {item["key"]: item for item in policy_store.list_services()}
@@ -4183,17 +4275,54 @@ def activity_service_page(
     if service_key in policy_store.policy_group_keys():
         raise HTTPException(status_code=400, detail="Open a concrete service rather than an aggregate policy group")
 
+    # Activity drilldowns consume the reconciler's revision-bound RouterOS
+    # observation.  This stays advisory: no observation is ever RouterOS write
+    # authority, and a missing/stale observation remains visible to the viewer.
+    health, service_observation = _advisory_router_payload(
+        "router:service-contract-health", max_age_seconds=180
+    )
     router_health = {}
+    router_health_current = service_observation.get("state") == "fresh"
     try:
-        health = router.get_service_contract_health()
-        router_health = next((item for item in health.get("services", []) if item.get("key") == service_key), {})
+        if health is None:
+            # A missing prepared observation may be filled by one read-only
+            # current check. The observation state remains MISSING in the UI,
+            # and this response is never published or used as mutation authority.
+            health = router.get_service_contract_health()
+            router_health_current = True
     except RouterError:
         router_health = {}
+    else:
+        router_health = next(
+            (item for item in health.get("services", []) if item.get("key") == service_key), {}
+        )
+    service_signal = _service_intelligence_signal(
+        definition,
+        router_health,
+        service_observation,
+        router_health_current=router_health_current,
+    )
 
     error = None
     detail = {}
+    selected_client = str(client_ip or "").strip() or None
     try:
-        detail = activity_store.service_detail(definition["name"], hours)
+        if bool(start) != bool(end):
+            raise ValueError("Activity range requires both start and end boundaries")
+        if selected_client:
+            import ipaddress as _ipaddress
+            _ipaddress.ip_address(selected_client)
+        if start:
+            selected_start = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            selected_end = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            detail = activity_store.service_detail(
+                definition["name"], start=selected_start, end=selected_end,
+                client_ip=selected_client,
+            )
+        else:
+            detail = activity_store.service_detail(
+                definition["name"], hours, client_ip=selected_client,
+            )
         name_map = {}
         try:
             live = router.get_restricted_devices()
@@ -4219,8 +4348,13 @@ def activity_service_page(
             "user": user,
             "service": definition,
             "router_health": router_health,
+            "service_signal": service_signal,
+            "service_observation": service_observation,
             "detail": detail,
             "hours": hours,
+            "selected_start": start,
+            "selected_end": end,
+            "selected_client": selected_client,
             "error": error,
         },
         status_code=503 if error else 200,

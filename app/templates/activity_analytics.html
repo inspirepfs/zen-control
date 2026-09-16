@@ -135,7 +135,7 @@
       <div class="card-heading"><div><h2>Top services</h2><p class="muted">What accounted for the most traffic in this period.</p></div></div>
       <div class="analytics-ranked-list">
         {% for item in services %}
-          {% if item.service_key %}<a class="analytics-ranked-row" href="/activity/service/{{item.service_key}}?hours={{window.duration_hours|int}}">{% else %}<div class="analytics-ranked-row">{% endif %}
+          {% if item.service_key %}<a class="analytics-ranked-row" href="/activity/service/{{item.service_key}}?start={{window.start|urlencode}}&amp;end={{window.end|urlencode}}{% if selected_ip %}&amp;client_ip={{selected_ip|urlencode}}{% endif %}">{% else %}<div class="analytics-ranked-row">{% endif %}
             <span><strong>{{item.service_name}}</strong><small>{{item.flows}} flows · {{item.percent}}%</small></span><span>{{item.total_bytes_human}}</span>
           {% if item.service_key %}</a>{% else %}</div>{% endif %}
         {% else %}<p class="muted">No service attribution in this period.</p>{% endfor %}
@@ -149,7 +149,10 @@
            data-category="{{selected_category}}" data-service="{{selected_service}}"
            data-client-ip="{{selected_ip}}" aria-live="polite">
     <div class="card-heading"><div><h2>Traffic category drill-down</h2><p class="muted">Select a category to rank its services, contributors and traffic over time. Filter selections stay in this analytics URL.</p></div></div>
-    <p class="analytics-drill-status" data-drill-status>Loading analytics drill-down…</p>
+    <div class="analytics-drill-status-row">
+      <p class="analytics-drill-status" data-drill-status>Loading analytics drill-down…</p>
+      <button type="button" class="analytics-clear-filters" data-clear-filters aria-label="Clear category, service, and client filters">Clear filters</button>
+    </div>
     <div class="analytics-classification-grid" data-classification></div>
     <div class="analytics-category-list" data-categories></div>
     <div class="analytics-filter-summary" data-filter-summary></div>
@@ -208,6 +211,7 @@
   const categoryList = root.querySelector('[data-categories]');
   const classification = root.querySelector('[data-classification]');
   const filterSummary = root.querySelector('[data-filter-summary]');
+  const clearFilters = root.querySelector('[data-clear-filters]');
   const layout = root.querySelector('.analytics-drill-layout');
   const initial = root.dataset;
   const state = {category: initial.category || '', service: initial.service || '', client_ip: initial.clientIp || ''};
@@ -216,7 +220,7 @@
     while (n >= 1024 && unit < units.length - 1) { n /= 1024; unit += 1; }
     return `${n >= 10 || unit === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[unit]}`;
   };
-  const setState = (next, resetService = false) => {
+  const setState = (next, resetService = false, announcement = '') => {
     Object.assign(state, next);
     if (resetService) state.service = '';
     const url = new URL(window.location.href);
@@ -224,7 +228,7 @@
       if (state[key]) url.searchParams.set(key, state[key]); else url.searchParams.delete(key);
     }
     window.history.replaceState({}, '', url);
-    loadDetail();
+    loadDetail(announcement);
   };
   const error = message => {
     status.textContent = `Could not load analytics drill-down: ${message}`;
@@ -249,21 +253,22 @@
     rows.forEach(row => { const item = document.createElement('div'); item.className = 'analytics-bucket-row'; const stamp = new Date(row.bucket).toLocaleString();
       item.innerHTML = `<span>${stamp}</span><i style="width:${Math.max(2, Number(row.total_bytes) * 100 / maximum)}%"></i><strong>${bytes(row.total_bytes)}</strong>`; target.append(item); });
   };
-  const renderDetail = payload => {
+  const renderDetail = (payload, announcement = '') => {
     const filters = payload.filters || {}; state.category = filters.category || ''; state.service = filters.service || ''; state.client_ip = filters.client_ip || '';
     const chips = [['Category', state.category || 'All categories'], ['Service', state.service || 'All services'], ['Client', state.client_ip || 'All devices']];
     filterSummary.replaceChildren(...chips.map(([name, value]) => Object.assign(document.createElement('span'), {textContent: `${name}: ${value}`})));
-    status.textContent = `${bytes(payload.totals && payload.totals.total_bytes)} matching traffic`;
+    const matchingTraffic = `${bytes(payload.totals && payload.totals.total_bytes)} matching traffic`;
+    status.textContent = announcement ? `${announcement} ${matchingTraffic}` : matchingTraffic;
     status.className = 'analytics-drill-status'; layout.hidden = false;
     renderList(root.querySelector('[data-services]'), payload.services || [], 'service', row => setState({service: row.service}));
     renderList(root.querySelector('[data-clients]'), payload.clients || [], 'client', row => setState({client_ip: row.client_ip}));
     renderBuckets(payload.buckets || []);
   };
-  const loadDetail = async () => {
-    status.textContent = 'Loading analytics drill-down…'; status.className = 'analytics-drill-status';
+  const loadDetail = async (announcement = '') => {
+    status.textContent = announcement ? `${announcement} Loading analytics drill-down…` : 'Loading analytics drill-down…'; status.className = 'analytics-drill-status';
     const query = new URLSearchParams({start: initial.start, end: initial.end, bucket_minutes: '30'});
     Object.entries(state).forEach(([key, value]) => { if (value) query.set(key, value); });
-    try { const response = await fetch(`/api/activity/analytics-drilldown?${query}`); if (!response.ok) throw new Error(await response.text() || response.status); renderDetail(await response.json()); }
+    try { const response = await fetch(`/api/activity/analytics-drilldown?${query}`); if (!response.ok) throw new Error(await response.text() || response.status); renderDetail(await response.json(), announcement); }
     catch (exc) { error(exc.message || 'request failed'); }
   };
   const loadSummary = async () => {
@@ -273,6 +278,11 @@
       if (!categoryList.childElementCount) categoryList.textContent = 'No retained categories in this period.';
     } catch (exc) { classification.textContent = 'Classification state unavailable.'; error(exc.message || 'request failed'); }
   };
+  clearFilters.addEventListener('click', () => setState(
+    {category: '', service: '', client_ip: ''},
+    false,
+    'Filters cleared; showing all categories, services, and devices.'
+  ));
   loadSummary(); loadDetail();
 })();
 </script>

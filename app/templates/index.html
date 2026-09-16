@@ -2115,7 +2115,12 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
             <td>
               {% if s.classification_status == 'healthy' %}<span class="policy-badge enabled">HEALTHY</span>
               {% elif s.classification_status == 'degraded' %}<span class="policy-badge disabled">DEGRADED</span>
-              {% elif s.classification_status == 'reporting' %}<span class="policy-badge staging">DNS REPORTING</span>
+              {% elif s.classification_status == 'unverified' %}<span class="policy-badge disabled">TLS UNVERIFIED</span>
+              {% elif s.classification_status == 'reporting' %}
+                {% if s.has_tls_signatures and s.has_dns_signatures %}<span class="policy-badge staging">TLS/SNI + DNS</span>
+                {% elif s.has_tls_signatures %}<span class="policy-badge staging">TLS/SNI REPORTING</span>
+                {% elif s.has_dns_signatures %}<span class="policy-badge staging">DNS REPORTING</span>
+                {% else %}<span class="policy-badge staging">REPORTING</span>{% endif %}
               {% elif s.classification_status == 'aggregate' %}<span class="policy-badge staging">AGGREGATE</span>
               {% elif s.classification_status == 'unsigned' %}<span class="policy-badge disabled">NO SIGNATURE</span>
               {% else %}<span class="policy-badge staging">OBSERVED</span>{% endif %}
