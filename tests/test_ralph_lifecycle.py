@@ -567,3 +567,162 @@ class ParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OperatorConsoleV022Tests(unittest.TestCase):
+    def tearDown(self):
+        tui.configure("auto")
+
+    def test_step_banner_shows_authority_and_plan_progress(self):
+        tui.configure("never")
+        card = tui.step_banner(
+            loop_no=24, step_no=3, step_count=5, title="TLS evidence",
+            phase="repair", plan_hash="a" * 64, repair=1, quota="69.0% remaining",
+            status="RUNNING", efficiency="PASS", recovery="RP-1", changed_files=8,
+            test_policy="add-only",
+            progress=["✓ 1. First", "✓ 2. Second", "▶ 3. TLS evidence", "○ 4. Next"],
+            acceptance=["Add focused regression tests"],
+        )
+        self.assertIn("Authority tests=add-only", card)
+        self.assertIn("Plan progress", card)
+        self.assertIn("▶ 3. TLS evidence", card)
+        self.assertIn("Acceptance", card)
+
+    def test_completion_card_reports_accepted_breakdown(self):
+        tui.configure("never")
+        card = tui.completion_card({
+            "plan_hash": "b" * 64,
+            "status": "READY_TO_COMMIT",
+            "counts": {
+                "steps_total": 5, "steps_accepted": 5, "steps_passed": 4,
+                "steps_human_confirmed": 1, "steps_recovered": 1,
+                "steps_failed": 0, "loops": 24, "human_gates": 1, "human_steers": 1,
+            },
+            "qualification": {"state": "PASS"},
+            "changes": {"files": 8, "added": 453, "removed": 64},
+            "authority": {"protected_paths_changed": False, "ralph_tooling_changed": False},
+            "recovery_checkpoint": "RP-1", "markdown_path": ".ralph/reports/report.md",
+            "suggested_commit": "feat: example",
+        })
+        self.assertIn("5/5 ACCEPTED", card)
+        self.assertIn("PASS 4", card)
+        self.assertIn("HUMAN_CONFIRMED 1", card)
+        self.assertIn("recovered 1", card)
+
+    def test_commit_overlap_card_explains_safe_action(self):
+        tui.configure("never")
+        card = tui.commit_overlap_card(
+            plan_hash="c" * 64, checkpoint="RP-1", baseline_head="1234567890abcdef",
+            branch="main", upstream="origin/main",
+            overlaps=["app/activity.py", "app/main.py"], plan_files=8,
+        )
+        self.assertIn("COMMIT REVIEW REQUIRED", card)
+        self.assertIn("app/activity.py", card)
+        self.assertIn("reconcile-commit", card)
+        self.assertIn("force push", card)
+
+    def test_step_outcome_summary_distinguishes_human_and_recovered(self):
+        state = ralph.default_state()
+        state["plan"] = valid_plan()
+        state["step_results"] = [
+            {"step": 1, "result": "PASS", "stats": {"repair": 0}},
+            {"step": 2, "result": "HUMAN_CONFIRMED", "stats": {}},
+            {"step": 3, "result": "PASS", "stats": {"repair": 2}},
+            {"step": 4, "result": "PASS", "stats": {"repair": 0}},
+            {"step": 5, "result": "PASS", "stats": {"repair": 0}},
+        ]
+        summary = ralph.summarize_step_outcomes(state)
+        self.assertEqual(summary["accepted"], 5)
+        self.assertEqual(summary["pass"], 4)
+        self.assertEqual(summary["human_confirmed"], 1)
+        self.assertEqual(summary["recovered"], 1)
+        self.assertEqual(summary["failed"], 0)
+
+
+class ReconciliationTests(unittest.TestCase):
+    def _ready_state(self, checkpoint: dict, plan_paths: list[str]) -> dict:
+        plan = valid_plan()
+        digest = ralph.plan_hash(plan)
+        state = ralph.default_state()
+        state.update({
+            "status": "READY_TO_COMMIT",
+            "plan_hash": digest,
+            "plan": plan,
+            "current_step": 6,
+            "recovery_checkpoint": checkpoint["id"],
+            "plan_changed_files": plan_paths,
+            "step_results": [
+                {"step": i, "title": f"Step {i}", "result": "PASS", "summary": "ok", "files": [], "gates": [], "stats": {}}
+                for i in range(1, 6)
+            ],
+            "final_qualification": {"state": "PASS", "gates": ["unit-tests=PASS"]},
+        })
+        manifest_path = ralph.RECOVERY / checkpoint["id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["plan_hash"] = digest
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return state
+
+    def test_reconcile_commit_adopts_verified_manual_commit(self):
+        with RepoHarness(self) as repo:
+            bootstrap = ralph.default_state()
+            bootstrap.update({"plan_hash": "a" * 64, "plan": valid_plan()})
+            checkpoint = ralph.create_recovery_checkpoint(bootstrap)
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            repo.git("add", "app.py")
+            repo.git("commit", "-qm", "manual qualified plan")
+            sha = repo.git("rev-parse", "HEAD").stdout.strip()
+            state = self._ready_state(checkpoint, ["app.py"])
+            ralph.save_state(state)
+            args = type("Args", (), {"plan_hash": state["plan_hash"], "commit": sha, "reason": "Manual closure after approved dirty-overlap review"})()
+            self.assertEqual(ralph.cmd_reconcile_commit(args), 0)
+            adopted = ralph.load_state()
+            self.assertEqual(adopted["status"], "COMMITTED")
+            self.assertEqual(adopted["commit_sha"], sha)
+            self.assertTrue(adopted["commit_reconciled"])
+
+    def test_reconcile_commit_rejects_unexpected_extra_path(self):
+        with RepoHarness(self) as repo:
+            bootstrap = ralph.default_state()
+            bootstrap.update({"plan_hash": "b" * 64, "plan": valid_plan()})
+            checkpoint = ralph.create_recovery_checkpoint(bootstrap)
+            (repo.root / "app.py").write_text("value = 3\n", encoding="utf-8")
+            (repo.root / "surprise.txt").write_text("unexpected\n", encoding="utf-8")
+            repo.git("add", "app.py", "surprise.txt")
+            repo.git("commit", "-qm", "manual bad commit")
+            sha = repo.git("rev-parse", "HEAD").stdout.strip()
+            state = self._ready_state(checkpoint, ["app.py"])
+            ralph.save_state(state)
+            with self.assertRaisesRegex(RuntimeError, "unexpected paths"):
+                ralph._verify_reconciled_commit(state, sha)
+
+    def test_reconcile_push_requires_recorded_commit_on_upstream(self):
+        with RepoHarness(self) as repo:
+            remote_tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(remote_tmp.cleanup)
+            remote = Path(remote_tmp.name) / "remote.git"
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+            repo.git("remote", "add", "origin", str(remote))
+            repo.git("push", "-u", "origin", "master")
+
+            (repo.root / "app.py").write_text("value = 9\n", encoding="utf-8")
+            repo.git("add", "app.py")
+            repo.git("commit", "-qm", "manual commit")
+            sha = repo.git("rev-parse", "HEAD").stdout.strip()
+            state = ralph.default_state()
+            state.update({"status": "COMMITTED", "plan_hash": "c" * 64, "plan": valid_plan(), "commit_sha": sha, "final_qualification": {"state": "PASS", "gates": []}})
+            ralph.save_state(state)
+            args = type("Args", (), {"plan_hash": state["plan_hash"]})()
+            with self.assertRaisesRegex(RuntimeError, "not present"):
+                ralph.cmd_reconcile_push(args)
+            repo.git("push")
+            self.assertEqual(ralph.cmd_reconcile_push(args), 0)
+            pushed = ralph.load_state()
+            self.assertEqual(pushed["status"], "PUSHED")
+            self.assertTrue(pushed["push_reconciled"])
+
+    def test_parser_exposes_reconciliation_commands(self):
+        parser = ralph.build_parser()
+        help_text = parser.format_help()
+        self.assertIn("reconcile-commit", help_text)
+        self.assertIn("reconcile-push", help_text)

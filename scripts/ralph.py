@@ -188,7 +188,10 @@ def default_state() -> dict:
         "step_results": [],
         "final_qualification": None,
         "commit_sha": None,
+        "commit_reconciled": False,
+        "commit_reconcile_note": None,
         "push_upstream": None,
+        "push_reconciled": False,
         "completion_changes": None,
         "updated_at": utc_now(),
     }
@@ -722,6 +725,48 @@ def record_step_result(state: dict, step: dict, result: str, *, summary: str = "
     state["step_results"] = values[-100:]
 
 
+def summarize_step_outcomes(state: dict) -> dict:
+    """Return one terminal outcome per plan step plus useful operator counts."""
+    latest: dict[int, dict] = {}
+    for item in _step_results_from_state(state):
+        step_no = int(item.get("step") or 0)
+        if step_no:
+            latest[step_no] = item
+    values = list(latest.values())
+    passed = [item for item in values if item.get("result") == "PASS"]
+    human = [item for item in values if item.get("result") == "HUMAN_CONFIRMED"]
+    recovered = [
+        item for item in passed
+        if int((item.get("stats") or {}).get("repair") or 0) > 0
+    ]
+    accepted = passed + human
+    return {
+        "latest": latest,
+        "accepted": len(accepted),
+        "pass": len(passed),
+        "human_confirmed": len(human),
+        "recovered": len(recovered),
+        "failed": max(0, len((state.get("plan") or {}).get("steps") or []) - len(accepted)),
+    }
+
+
+def plan_progress_rows(state: dict) -> list[str]:
+    outcomes = summarize_step_outcomes(state)["latest"]
+    current = int(state.get("current_step") or 0)
+    rows: list[str] = []
+    for step in list(((state.get("plan") or {}).get("steps") or [])):
+        step_no = int(step.get("id") or 0)
+        outcome = str((outcomes.get(step_no) or {}).get("result") or "")
+        if outcome in {"PASS", "HUMAN_CONFIRMED"}:
+            marker = "✓"
+        elif step_no == current:
+            marker = "▶"
+        else:
+            marker = "○"
+        rows.append(f"{marker} {step_no}. {str(step.get('title') or '')}")
+    return rows
+
+
 def build_completion_report(state: dict, final_gates: list[str]) -> dict:
     plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
     steps = list(plan.get("steps") or [])
@@ -731,7 +776,8 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
     added = int(saved_changes.get("added") or 0) if saved_changes else sum(int(item.get("added") or 0) for item in entries)
     removed = int(saved_changes.get("removed") or 0) if saved_changes else sum(int(item.get("removed") or 0) for item in entries)
     step_results = _step_results_from_state(state)
-    passed_steps = len({int(item.get("step") or 0) for item in step_results if item.get("result") in {"PASS", "HUMAN_CONFIRMED"}})
+    outcomes = summarize_step_outcomes(state)
+    passed_steps = int(outcomes["accepted"])
     token_totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0, "commands_executed": 0}
     for item in step_results:
         stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
@@ -746,7 +792,11 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         "status": state.get("status"),
         "counts": {
             "steps_total": len(steps),
-            "steps_passed": passed_steps,
+            "steps_accepted": int(outcomes["accepted"]),
+            "steps_passed": int(outcomes["pass"]),
+            "steps_human_confirmed": int(outcomes["human_confirmed"]),
+            "steps_recovered": int(outcomes["recovered"]),
+            "steps_failed": int(outcomes["failed"]),
             "loops": int(state.get("loop_count") or 0),
             "human_gates": len(state.get("human_gate_resolutions") or []),
             "human_steers": len(state.get("human_steering") or []),
@@ -766,6 +816,11 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         "suggested_commit": state.get("commit_message") or _default_commit_message(state),
         "commit": state.get("commit_sha"),
         "push": state.get("push_upstream"),
+        "reconciliation": {
+            "commit_adopted": bool(state.get("commit_reconciled")),
+            "push_adopted": bool(state.get("push_reconciled")),
+            "commit_note": state.get("commit_reconcile_note"),
+        },
     }
     REPORTS.mkdir(parents=True, exist_ok=True)
     stem = str(state.get("plan_hash") or "unknown")[:16]
@@ -779,7 +834,11 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         "# RALPH-Lite Completion Report", "",
         f"**Plan:** `{state.get('plan_hash')}`", f"**Goal:** {plan.get('goal') or '-'}", f"**Status:** {state.get('status')}", "",
         "## Execution", "",
-        f"- Steps: {passed_steps}/{len(steps)} PASS/HUMAN_CONFIRMED",
+        f"- Steps accepted: {outcomes['accepted']}/{len(steps)}",
+        f"- Direct PASS: {outcomes['pass']}",
+        f"- Human-confirmed: {outcomes['human_confirmed']}",
+        f"- Recovered/repaired PASS: {outcomes['recovered']}",
+        f"- Failed/unaccepted: {outcomes['failed']}",
         f"- Implementation loops: {int(state.get('loop_count') or 0)}",
         f"- Human gates resolved: {len(state.get('human_gate_resolutions') or [])}",
         f"- Human steering decisions: {len(state.get('human_steering') or [])}",
@@ -812,6 +871,8 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         f"- Suggested commit: `{report['suggested_commit']}`",
         f"- Commit: `{state.get('commit_sha') or '-'}`",
         f"- Push upstream: `{state.get('push_upstream') or '-'}`",
+        f"- Commit reconciled: {'yes' if state.get('commit_reconciled') else 'no'}",
+        f"- Push reconciled: {'yes' if state.get('push_reconciled') else 'no'}",
         f"- Review: `python3 scripts/ralph.py finalize {state.get('plan_hash')}`",
         f"- Commit: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --commit`",
         f"- Push: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --push`",
@@ -819,6 +880,68 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
     ]
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return report
+
+
+def finalization_review(state: dict) -> dict:
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    baseline = set(checkpoint.get("baseline_dirty_paths") or []) if checkpoint else set()
+    planned = set(state.get("plan_changed_files") or [])
+    current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
+    overlap = sorted((baseline & planned) - {path for path in planned if path.startswith(".ralph/")})
+    unexpected = sorted(current - baseline - planned)
+    protected = sorted(path for path in planned if is_protected_path(path) or is_tooling_path(path))
+    return {
+        "baseline": sorted(baseline),
+        "planned": sorted(planned),
+        "current": sorted(current),
+        "overlap": overlap,
+        "unexpected": unexpected,
+        "protected": protected,
+        "checkpoint": checkpoint,
+    }
+
+
+def _commit_paths(commit_sha: str) -> list[str]:
+    proc = _git(["diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha], check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"cannot inspect commit {commit_sha}: {proc.stdout[-2000:]}")
+    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+
+
+def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
+    if state.get("status") != "READY_TO_COMMIT":
+        raise RuntimeError(f"reconcile-commit requires READY_TO_COMMIT, found {state.get('status')}")
+    if str((state.get("final_qualification") or {}).get("state") or "") != "PASS":
+        raise RuntimeError("final qualification is not PASS; commit reconciliation refused")
+    resolved = _git(["rev-parse", "--verify", f"{commit_sha}^{{commit}}"], check=False)
+    if resolved.returncode != 0:
+        raise RuntimeError(f"commit {commit_sha} does not exist")
+    sha = resolved.stdout.strip()
+    reachable = _git(["merge-base", "--is-ancestor", sha, "HEAD"], check=False)
+    if reachable.returncode != 0:
+        raise RuntimeError("commit is not reachable from current HEAD")
+    planned = set(state.get("plan_changed_files") or [])
+    if not planned:
+        raise RuntimeError("plan has no recorded changed files")
+    protected = sorted(path for path in planned if is_protected_path(path) or is_tooling_path(path))
+    if protected:
+        raise RuntimeError(f"plan records protected/RALPH tooling paths; reconciliation refused: {protected}")
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint:
+        raise RuntimeError("recovery checkpoint is missing; reconciliation refused")
+    baseline = set(checkpoint.get("baseline_dirty_paths") or []) | set(checkpoint.get("baseline_untracked_paths") or [])
+    commit_paths = set(_commit_paths(sha))
+    missing = sorted(planned - commit_paths)
+    if missing:
+        raise RuntimeError(f"manual commit does not contain every recorded plan path: {missing}")
+    unexpected = sorted(commit_paths - planned - baseline)
+    if unexpected:
+        raise RuntimeError(f"manual commit contains unexpected paths outside plan/baseline: {unexpected}")
+    return {
+        "sha": sha,
+        "commit_paths": sorted(commit_paths),
+        "baseline_extras": sorted(commit_paths - planned),
+    }
 
 
 def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
@@ -834,6 +957,15 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
         raise RuntimeError("no RALPH plan changes are recorded; commit refused")
     overlap = sorted(baseline & planned)
     if overlap:
+        print(tui.commit_overlap_card(
+            plan_hash=str(state.get("plan_hash") or ""),
+            checkpoint=str(state.get("recovery_checkpoint") or "-"),
+            baseline_head=str(checkpoint.get("head") or ""),
+            branch=str(checkpoint.get("branch") or "-"),
+            upstream=str(checkpoint.get("upstream") or "-"),
+            overlaps=overlap,
+            plan_files=len(planned),
+        ))
         raise RuntimeError(f"plan changed files that were already dirty at approval; safe automated commit refused: {overlap}")
     current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
     baseline = {path for path in baseline if not path.startswith(".ralph/")}
@@ -908,6 +1040,18 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             raise RuntimeError(f"finalize review requires READY_TO_COMMIT/COMMITTED/PUSHED, found {state.get('status')}")
         report = build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
         print(tui.completion_card(report))
+        review = finalization_review(state)
+        if review.get("overlap"):
+            checkpoint = review.get("checkpoint") or {}
+            print(tui.commit_overlap_card(
+                plan_hash=str(state.get("plan_hash") or ""),
+                checkpoint=str(state.get("recovery_checkpoint") or "-"),
+                baseline_head=str(checkpoint.get("head") or ""),
+                branch=str(checkpoint.get("branch") or "-"),
+                upstream=str(checkpoint.get("upstream") or "-"),
+                overlaps=list(review.get("overlap") or []),
+                plan_files=len(review.get("planned") or []),
+            ))
         print(f"Report: {report['markdown_path']}")
         return 0
 
@@ -962,6 +1106,72 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     live_write(f"pushed commit {str(state.get('commit_sha') or '')[:12]} to configured upstream {upstream}", "COMPLETE")
     print(f"PUSHED plan={state['plan_hash']} upstream={upstream}")
     return 0
+
+def cmd_reconcile_commit(args: argparse.Namespace) -> int:
+    """Adopt an already-created qualified commit after strict controller verification."""
+    init_files()
+    state = load_state()
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("reconcile-commit hash does not match the current plan")
+    verified = _verify_reconciled_commit(state, args.commit)
+    note = " ".join(str(args.reason or "").split())
+    if not note:
+        raise RuntimeError("reconcile-commit requires a non-empty --reason")
+    state["status"] = "COMMITTED"
+    state["commit_sha"] = verified["sha"]
+    state["commit_reconciled"] = True
+    state["commit_reconcile_note"] = note[:1200]
+    state["commit_reconciled_at"] = utc_now()
+    save_state(state)
+    build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
+    append_journal(
+        int(state.get("loop_count") or 0), len((state.get("plan") or {}).get("steps") or []),
+        "reconcile-commit", "COMMITTED", summary=note, files=verified["commit_paths"],
+        next_action="verify/push configured upstream",
+    )
+    live_write(f"reconciled existing commit {verified['sha'][:12]} into completed plan", "COMPLETE")
+    print(tui.reconcile_card(
+        title="COMMIT RECONCILED", plan_hash=str(state.get("plan_hash") or ""),
+        commit=verified["sha"], upstream=git_upstream() or "-",
+        detail=f"Verified {len(verified['commit_paths'])} commit paths; baseline extras={len(verified['baseline_extras'])}",
+    ))
+    return 0
+
+
+def cmd_reconcile_push(args: argparse.Namespace) -> int:
+    """Mark a reconciled/created commit PUSHED only after proving it exists upstream."""
+    init_files()
+    state = load_state()
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("reconcile-push hash does not match the current plan")
+    if state.get("status") not in {"COMMITTED", "PUSHED"}:
+        raise RuntimeError(f"reconcile-push requires COMMITTED/PUSHED, found {state.get('status')}")
+    sha = str(state.get("commit_sha") or "").strip()
+    if not sha:
+        raise RuntimeError("no recorded commit SHA")
+    upstream = git_upstream()
+    if not upstream or "/" not in upstream:
+        raise RuntimeError("current branch has no configured upstream")
+    remote, _branch = upstream.split("/", 1)
+    fetch = _git(["fetch", "--quiet", "--prune", remote], check=False)
+    if fetch.returncode != 0:
+        raise RuntimeError(f"could not refresh configured upstream: {fetch.stdout[-3000:]}")
+    pushed = _git(["merge-base", "--is-ancestor", sha, upstream], check=False)
+    if pushed.returncode != 0:
+        raise RuntimeError(f"recorded commit {sha[:12]} is not present on configured upstream {upstream}")
+    state["status"] = "PUSHED"
+    state["push_upstream"] = upstream
+    state["push_reconciled"] = True
+    state["pushed_at"] = utc_now()
+    save_state(state)
+    build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
+    live_write(f"reconciled upstream {upstream} containing commit {sha[:12]}", "COMPLETE")
+    print(tui.reconcile_card(
+        title="PUSH RECONCILED", plan_hash=str(state.get("plan_hash") or ""),
+        commit=sha, upstream=upstream, detail="Configured upstream contains the recorded commit",
+    ))
+    return 0
+
 
 def init_files() -> None:
     RALPH.mkdir(parents=True, exist_ok=True)
@@ -2119,7 +2329,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     digest = plan_hash(plan)
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "step_results": [], "final_qualification": None, "commit_sha": None, "push_upstream": None, "completion_changes": None})
+    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None})
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
@@ -2538,6 +2748,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             efficiency=str(efficiency_state.get("status") or "PASS"),
             recovery=str(state.get("recovery_checkpoint") or "-"),
             changed_files=len(state.get("plan_changed_files") or []),
+            test_policy=str(step.get("test_change_policy") or "none"),
+            progress=plan_progress_rows(state),
+            acceptance=list(step.get("acceptance") or []),
         ))
         live_write(
             f"loop={loop_no:04d} step={step['id']}/{len(state['plan']['steps'])} phase={phase} repair={repair_no} title={step['title']}",
@@ -2871,6 +3084,14 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--push", action="store_true", help="push the committed plan to the current configured upstream")
     finalize.add_argument("--message", help="explicit commit subject; used only with --commit")
     finalize.set_defaults(func=cmd_finalize)
+    reconcile_commit = sub.add_parser("reconcile-commit", help="adopt a manually created qualified commit after strict verification")
+    reconcile_commit.add_argument("plan_hash")
+    reconcile_commit.add_argument("--commit", required=True, help="commit SHA to adopt")
+    reconcile_commit.add_argument("--reason", required=True, help="human explanation for the manual commit path")
+    reconcile_commit.set_defaults(func=cmd_reconcile_commit)
+    reconcile_push = sub.add_parser("reconcile-push", help="mark the recorded commit pushed after proving it exists on the configured upstream")
+    reconcile_push.add_argument("plan_hash")
+    reconcile_push.set_defaults(func=cmd_reconcile_push)
     usage = sub.add_parser("usage", help="show RALPH context/token usage and live Codex remaining limits")
     usage.add_argument("--details", action="store_true", help="include per-loop token usage")
     usage.add_argument("--json", action="store_true", help="emit machine-readable report")

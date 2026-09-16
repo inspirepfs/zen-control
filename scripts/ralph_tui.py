@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 _COLOR_MODE = "auto"
 
 ANSI = {
@@ -151,17 +151,27 @@ def step_banner(
     efficiency: str = "PASS",
     recovery: str = "-",
     changed_files: int = 0,
+    test_policy: str = "none",
+    progress: Iterable[str] = (),
+    acceptance: Iterable[str] = (),
 ) -> str:
     rows = [
-        f"{title}",
-        f"Plan {plan_hash[:12]}…   Phase {phase.upper()}   Repair {repair}",
-        f"State {status}   Efficiency {efficiency}   Plan files {changed_files}",
+        f"{style('CURRENT OBJECTIVE', 'bold')}  {title}",
+        f"Plan {style(plan_hash[:12] + '…', 'magenta')}   Phase {phase.upper()}   Repair {repair}",
+        f"State {style(status, 'cyan')}   Efficiency {style(efficiency, 'green' if efficiency == 'PASS' else 'yellow')}   Plan files {changed_files}",
         f"Recovery {recovery}",
+        f"Authority tests={test_policy} · existing tests protected · RALPH tooling protected",
     ]
     if quota:
         rows.append(f"Quota {quota}")
-    return box(f"RALPH-Lite v{VERSION} · LOOP {loop_no:04d} · STEP {step_no}/{step_count}", rows, tone="cyan")
-
+    accepted = list(acceptance)
+    if accepted:
+        rows.append("Acceptance: " + clip(accepted[0], 120))
+    progress_rows = list(progress)
+    if progress_rows:
+        rows.append("Plan progress:")
+        rows.extend(f"  {clip(item, 105)}" for item in progress_rows[:10])
+    return box(f"RALPH-Lite v{VERSION} · LOOP {loop_no:04d} · STEP {step_no}/{step_count}", rows, width=88, tone="cyan")
 
 def change_card(entries: list[dict]) -> str:
     if not entries:
@@ -175,7 +185,8 @@ def change_card(entries: list[dict]) -> str:
         removed = int(item.get("removed") or 0)
         totals_add += added
         totals_del += removed
-        rows.append(f"{action:<7} {path}   +{added}/-{removed}")
+        tone = {"CREATE": "green", "EDIT": "yellow", "DELETE": "red", "MOVE": "magenta"}.get(action, "white")
+        rows.append(f"{style(f'{action:<7}', tone)} {style(path, 'blue')}   +{added}/-{removed}")
         symbols = [str(s) for s in item.get("symbols") or []][:5]
         if symbols:
             rows.append("          ↳ " + " · ".join(symbols))
@@ -229,22 +240,34 @@ def policy_gate_card(
     protected: list[str],
 ) -> str:
     rows = [
-        f"Gate {gate_id} · Step {step_no}/{step_count} · {title}",
-        f"Test policy {test_policy}",
+        f"Gate {style(gate_id, 'magenta')} · Step {step_no}/{step_count} · {title}",
+        f"Policy tests={test_policy}",
+        "",
+        "REQUESTED CHANGE / FILE ORIGIN",
     ]
     for path in paths[:8]:
-        rows.append(f"TEST    {path} · origin={origins.get(path, 'unknown')}")
+        origin = origins.get(path, "unknown")
+        rows.append(f"TEST    {style(path, 'blue')} · origin={origin}")
     for path in protected[:8]:
-        rows.append(f"PROTECT {path}")
+        rows.append(f"PROTECT {style(path, 'red')}")
     if acceptance:
-        rows.append("Approved acceptance:")
+        rows.append("")
+        rows.append("APPROVED STEP")
         rows.extend(f"  • {clip(item, 120)}" for item in acceptance[:4])
+    origin_values = set(origins.values())
+    if paths and origin_values <= {"absent", "plan-owned"} and test_policy == "add-only":
+        recommendation = "STEER/RETRY within existing approved add-only authority"
+    elif protected:
+        recommendation = "REPLAN or remove the protected-path change; do not override protection"
+    else:
+        recommendation = "REVIEW DIFF, then STEER bounded direction or RETIRE/REPLAN"
     rows.extend([
-        "Options: review diff · steer bounded direction · resume retry · retire/replan",
-        f'Steer: python3 scripts/ralph.py steer <plan-hash> --gate {gate_id} --direction "<direction>"',
+        "",
+        f"RECOMMENDED ACTION  {recommendation}",
+        "ACTIONS  steer bounded direction · view diff · resume retry · retire/replan",
+        f'STEER   python3 scripts/ralph.py steer <plan-hash> --gate {gate_id} --direction "<direction>"',
     ])
-    return box("HUMAN POLICY REVIEW", rows, tone="magenta")
-
+    return box("HUMAN POLICY REVIEW", rows, width=92, tone="magenta")
 
 def steer_card(*, gate_id: str, step_no: int, step_count: int, title: str, direction: str, allowed_new_tests: list[str]) -> str:
     rows = [
@@ -282,9 +305,11 @@ def completion_card(report: dict) -> str:
     change = report.get("changes") or {}
     qualification = report.get("qualification") or {}
     authority = report.get("authority") or {}
+    accepted = counts.get("steps_accepted", counts.get("steps_passed", 0))
     rows = [
         f"Plan {str(report.get('plan_hash') or '')[:16]}…",
-        f"Steps {counts.get('steps_passed', 0)}/{counts.get('steps_total', 0)} PASS · loops {counts.get('loops', 0)}",
+        f"Implementation {accepted}/{counts.get('steps_total', 0)} ACCEPTED · loops {counts.get('loops', 0)}",
+        f"  PASS {counts.get('steps_passed', 0)} · HUMAN_CONFIRMED {counts.get('steps_human_confirmed', 0)} · recovered {counts.get('steps_recovered', 0)} · failed {counts.get('steps_failed', 0)}",
         f"Human gates {counts.get('human_gates', 0)} · steering decisions {counts.get('human_steers', 0)}",
         f"Final qualification {qualification.get('state', 'UNKNOWN')}",
         f"Files {change.get('files', 0)} · +{change.get('added', 0)}/-{change.get('removed', 0)}",
@@ -292,8 +317,45 @@ def completion_card(report: dict) -> str:
         f"Recovery {report.get('recovery_checkpoint') or '-'}",
         f"Report {report.get('markdown_path') or '-'}",
         f"Suggested commit {clip(report.get('suggested_commit') or '-', 70)}",
-        "READY TO COMMIT",
+        "READY TO COMMIT" if report.get("status") == "READY_TO_COMMIT" else f"State {report.get('status')}",
         f"Next: python3 scripts/ralph.py finalize {report.get('plan_hash')} --commit",
     ]
-    return box(f"RALPH-Lite v{VERSION} · PLAN COMPLETE", rows, tone="green")
+    return box(f"RALPH-Lite v{VERSION} · PLAN COMPLETE", rows, width=92, tone="green")
+
+
+def commit_overlap_card(
+    *,
+    plan_hash: str,
+    checkpoint: str,
+    baseline_head: str,
+    branch: str,
+    upstream: str,
+    overlaps: list[str],
+    plan_files: int,
+) -> str:
+    rows = [
+        f"Plan {plan_hash[:16]}… · recovery {checkpoint}",
+        f"Baseline HEAD {baseline_head[:12]} · branch {branch} · upstream {upstream}",
+        f"Plan files {plan_files} · overlapping dirty-at-approval files {len(overlaps)}",
+        "",
+        "OVERLAPPING FILES",
+        *[f"  • {style(path, 'yellow')}" for path in overlaps[:15]],
+        "",
+        "WHY RALPH STOPPED",
+        "  Ralph cannot safely separate pre-existing edits from this plan's edits.",
+        "RECOMMENDED ACTION",
+        "  Review/commit the qualified product delta manually, then use reconcile-commit.",
+        "NOT SAFE  git add -A · force commit · force push",
+    ]
+    return box("COMMIT REVIEW REQUIRED", rows, width=92, tone="yellow")
+
+
+def reconcile_card(*, title: str, plan_hash: str, commit: str, upstream: str, detail: str) -> str:
+    rows = [
+        f"Plan {plan_hash[:16]}…",
+        f"Commit {commit[:12]}",
+        f"Upstream {upstream}",
+        detail,
+    ]
+    return box(title, rows, width=84, tone="green")
 
