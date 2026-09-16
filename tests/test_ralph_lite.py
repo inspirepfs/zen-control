@@ -224,6 +224,8 @@ class ContextTests(unittest.TestCase):
                 self.assertIn("Batch related reads into one discovery command", prompt)
                 self.assertIn("Normally inspect no more than 6-8 relevant files", prompt)
                 self.assertIn("Do not broadly scan docs/", prompt)
+                self.assertIn("use `python3`", prompt)
+                self.assertIn('blocker_class="validation-only"', prompt)
             finally:
                 ralph.CONTEXT = old_context
 
@@ -308,6 +310,38 @@ class EfficiencyBudgetTests(unittest.TestCase):
         findings = ralph.efficiency_findings(stats)
         self.assertIn("cumulative-input 700000>600000", findings)
         self.assertIn("non-cached-input 110000>100000", findings)
+
+
+class ControllerQualificationAuthorityTests(unittest.TestCase):
+    def test_validation_only_blocker_defers_to_controller_gates(self):
+        result = {
+            "needs_human": False,
+            "blocker_class": "validation-only",
+            "blockers": ["focused tests could not run"],
+        }
+        blocked, reason = ralph.codex_requires_human_before_gates(result)
+        self.assertFalse(blocked)
+        self.assertEqual(reason, "")
+
+    def test_human_decision_blocker_still_blocks_before_gates(self):
+        result = {
+            "needs_human": True,
+            "blocker_class": "human-decision",
+            "blockers": ["operator must choose migration policy"],
+        }
+        blocked, reason = ralph.codex_requires_human_before_gates(result)
+        self.assertTrue(blocked)
+        self.assertIn("migration policy", reason)
+
+    def test_current_python_command_budget_block_is_recoverable(self):
+        reason = "Focused tests were not run: `python` is unavailable and the six-command shell budget was exhausted before retrying with `python3`."
+        self.assertTrue(ralph.is_recoverable_validation_block(reason))
+        self.assertFalse(ralph.is_recoverable_validation_block("policy violation: protected paths ['.env']"))
+
+    def test_result_schema_requires_explicit_blocker_class(self):
+        required = ralph.RESULT_SCHEMA["required"]
+        self.assertIn("blocker_class", required)
+        self.assertIn("validation_notes", required)
 
 
 class SnapshotTests(unittest.TestCase):

@@ -89,6 +89,8 @@ RESULT_SCHEMA = {
         "ideas": {"type": "array", "items": {"type": "string"}},
         "blockers": {"type": "array", "items": {"type": "string"}},
         "needs_human": {"type": "boolean"},
+        "blocker_class": {"type": "string", "enum": ["none", "validation-only", "human-decision", "policy"]},
+        "validation_notes": {"type": "array", "items": {"type": "string"}},
         "context": {
             "type": "object",
             "properties": {
@@ -100,7 +102,7 @@ RESULT_SCHEMA = {
             "additionalProperties": False,
         },
     },
-    "required": ["summary", "ideas", "blockers", "needs_human", "context"],
+    "required": ["summary", "ideas", "blockers", "needs_human", "blocker_class", "validation_notes", "context"],
     "additionalProperties": False,
 }
 
@@ -762,6 +764,70 @@ def efficiency_findings(stats: dict | None) -> list[str]:
     return findings
 
 
+def codex_requires_human_before_gates(result: dict) -> tuple[bool, str]:
+    """Only policy/human-decision blockers may pre-empt controller qualification.
+
+    Local/focused validation is advisory: the deterministic controller owns the
+    authoritative qualification gates and must be allowed to run them.
+    """
+    blocker_class = str(result.get("blocker_class") or "none")
+    blockers = [str(item).strip() for item in (result.get("blockers") or []) if str(item).strip()]
+    if blocker_class == "validation-only":
+        return False, ""
+    if blocker_class in {"human-decision", "policy"} or result.get("needs_human"):
+        return True, "; ".join(blockers or ["Codex requested human review"])
+    if blockers:
+        return True, "; ".join(blockers)
+    return False, ""
+
+
+def is_recoverable_validation_block(reason: str) -> bool:
+    """Conservative migration check for pre-v0.1.6 validation-only blocks."""
+    text = str(reason or "").lower()
+    required = ("test", "validation", "command budget", "python")
+    return any(marker in text for marker in required) and not any(
+        marker in text for marker in ("policy violation", "secret", "credential", "routeros", "human decision")
+    )
+
+
+def git_changed_paths() -> list[str]:
+    """Return current tracked/untracked worktree paths without reading file contents."""
+    proc = run_process(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    if proc.returncode != 0:
+        raise RuntimeError(f"git status failed ({proc.returncode}): {proc.stdout[-2000:]}")
+    entries = proc.stdout.split("\0")
+    paths: list[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        payload = entry[3:] if len(entry) >= 4 else ""
+        if " -> " in payload:
+            payload = payload.split(" -> ", 1)[1]
+        payload = payload.strip()
+        if payload and payload not in paths:
+            paths.append(payload)
+    return sorted(paths)
+
+
+def validate_recovery_paths(paths: Iterable[str], step: dict) -> None:
+    paths = list(paths)
+    tooling = [path for path in paths if is_tooling_path(path)]
+    protected = [path for path in paths if is_protected_path(path)]
+    if tooling:
+        raise RuntimeError(f"blocked-change recovery refuses RALPH tooling changes: {tooling}")
+    if protected:
+        raise RuntimeError(f"blocked-change recovery refuses protected paths: {protected}")
+    policy = step.get("test_change_policy")
+    test_paths = [p for p in paths if p == "tests" or p.startswith("tests/")]
+    if policy == "none" and test_paths:
+        raise RuntimeError(f"blocked-change recovery violates test policy none: {test_paths}")
+    if policy == "add-only":
+        for path in test_paths:
+            proc = run_process(["git", "cat-file", "-e", f"HEAD:{path}"])
+            if proc.returncode == 0:
+                raise RuntimeError(f"blocked-change recovery modifies existing test under add-only policy: {path}")
+
+
 def plan_prompt(goal: str) -> str:
     return f"""You are planning work for ZEN Control under RALPH-Lite. Inspect the repository read-only.
 Goal: {goal}
@@ -793,6 +859,8 @@ CONTEXT-EFFICIENCY RULES:
 - HARD BUDGET: use at most {PROMPT_COMMAND_BUDGET} shell command executions for this implementation turn. If safe completion genuinely needs more, return needs_human=true with a blocker instead of continuing exploration.
 - Batch related reads into one discovery command. Prefer rg -n plus narrow sed/range reads or targeted symbols; do not repeatedly read whole large files.
 - Aim for one discovery bundle, one implementation/edit bundle, and no more than two focused validation commands. The external controller runs the full authoritative gates.
+- Python command contract: use `python3` (or the repository's explicit interpreter), never bare `python`.
+- Failure of a focused/local validation command after implementation is NOT a human blocker. Set blocker_class="validation-only", needs_human=false, record the detail in validation_notes, and return so the controller can run authoritative gates.
 - Normally inspect no more than 6-8 relevant files before implementation. If more are genuinely required, stop and request human review rather than expanding silently.
 - Do not broadly scan docs/, README.md, CHANGELOG.md, or Git history unless directly necessary for this step.
 - Stop discovery once there is enough evidence to implement safely.
@@ -800,6 +868,7 @@ CONTEXT-EFFICIENCY RULES:
 
 Read .ralph/policy.md and obey it. Do not edit any file under .ralph. Do not interact with live RouterOS, secrets, credentials, or external production systems. Stay inside the repository. Do not disable, skip, delete, or weaken qualification to obtain a pass. Make only changes necessary for this step. You may run focused local tests while working, but the external controller will run authoritative gates afterwards.
 If you discover useful out-of-scope work, return it in ideas and continue the approved step rather than implementing it.
+Use blocker_class="human-decision" only when genuine human judgement is required and blocker_class="policy" only when safe completion would break policy. In those cases return needs_human=true with blockers. Otherwise use blocker_class="none" (or "validation-only" as described above).
 If safe completion requires breaking policy or human judgement, make no speculative workaround: return needs_human=true with blockers.
 """
 
@@ -958,11 +1027,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
 
         append_ideas(loop_no, result.get("ideas", []))
-        if result.get("needs_human") or result.get("blockers"):
-            reason = "; ".join(result.get("blockers") or ["Codex requested human review"])
+        requires_human, reason = codex_requires_human_before_gates(result)
+        if requires_human:
             append_journal(loop_no, step["id"], phase, "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
             block(state, reason)
             return 2
+        if result.get("blocker_class") == "validation-only":
+            notes = "; ".join(result.get("validation_notes") or result.get("blockers") or ["focused validation unavailable"])
+            live_write(f"focused validation advisory: {notes}; controller gates remain authoritative", "VALIDATE")
 
         passed, gates, fp, gate_output, gate_durations = run_gates()
         stats = loop_stats(loop_started, result, gate_durations=gate_durations, repair=repair_no)
@@ -1011,6 +1083,81 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_recover_validation_block(args: argparse.Namespace) -> int:
+    """Human-triggered controller qualification for a validation-only historical block."""
+    init_files()
+    state = load_state()
+    if state.get("status") != "BLOCKED_HUMAN":
+        raise RuntimeError("recover-validation-block requires BLOCKED_HUMAN status")
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("recovery hash does not match the approved plan")
+    if not is_recoverable_validation_block(state.get("block_reason") or ""):
+        raise RuntimeError("current block is not classified as a recoverable validation-only block")
+    if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
+        raise RuntimeError("approved plan file changed; recovery refused")
+
+    step = state["plan"]["steps"][state["current_step"] - 1]
+    files = git_changed_paths()
+    if not files:
+        raise RuntimeError("no working-tree changes found to qualify")
+    validate_recovery_paths(files, step)
+    change_class = classify_changes(files)
+    if change_class != "product-development":
+        raise RuntimeError(f"recovery requires product-development changes only, found {change_class}")
+
+    live_write(f"human-triggered qualification of blocked step {step['id']} over {len(files)} worktree paths", "RECOVER")
+    started = time.monotonic()
+    passed, gates, fp, gate_output, gate_durations = run_gates()
+    stats = {
+        "duration_seconds": time.monotonic() - started,
+        "codex_seconds": 0.0,
+        "commands_executed": 0,
+        "files_inspected": 0,
+        "gate_durations": gate_durations,
+    }
+    if passed:
+        result = {
+            "summary": "Human-triggered controller qualification passed for the previously blocked implementation.",
+            "context": {
+                "relevant_files": files[:8],
+                "accepted_findings": ["Previously blocked implementation passed the full authoritative RALPH qualification gates."],
+                "files_inspected": [],
+            },
+        }
+        append_journal(
+            state["loop_count"], step["id"], "human-qualification", "PASS",
+            summary=result["summary"], files=files, gates=gates, next_action="next approved step",
+            change_class=change_class, stats=stats,
+        )
+        state["last_result"] = "PASS"
+        state["last_failure"] = None
+        state["active_failure"] = None
+        state["block_reason"] = None
+        state["last_efficiency"] = {"status": "PASS", "findings": []}
+        update_context_after_pass(state, step, result, files)
+        state["current_step"] += 1
+        state["status"] = "APPROVED"
+        save_state(state)
+        live_write(f"step={step['id']} recovered qualification PASS; advanced to step={state['current_step']}", "PASS")
+        print(f"RECOVERED_PASS plan={state['plan_hash']} step={state['current_step']} loops={state['loop_count']}")
+        return 0
+
+    state["last_result"] = "FAIL"
+    state["last_failure"] = {"fingerprint": fp, "output": gate_output[-6000:], "gates": gates}
+    state["active_failure"] = fp
+    state["block_reason"] = None
+    state["status"] = "APPROVED"
+    append_journal(
+        state["loop_count"], step["id"], "human-qualification", "FAIL",
+        summary="Controller qualification failed; next RALPH run will repair the same approved step.",
+        files=files, gates=gates, fingerprint=fp, next_action="repair same approved step",
+        change_class=change_class, stats=stats,
+    )
+    save_state(state)
+    print(f"RECOVERED_FAIL plan={state['plan_hash']} step={state['current_step']} fingerprint={fp}")
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RALPH-Lite deterministic Codex development-loop supervisor")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1028,6 +1175,9 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("plan_hash")
     resume.add_argument("--reason", required=True)
     resume.set_defaults(func=cmd_resume)
+    recover = sub.add_parser("recover-validation-block")
+    recover.add_argument("plan_hash")
+    recover.set_defaults(func=cmd_recover_validation_block)
     sub.add_parser("status").set_defaults(func=cmd_status)
     return parser
 
