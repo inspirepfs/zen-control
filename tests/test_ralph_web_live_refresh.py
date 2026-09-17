@@ -27,7 +27,7 @@ class LiveRefreshContractTests(unittest.TestCase):
 
         self.assertIn('id="goalInput"', source)
         self.assertIn('id="steerInput"', source)
-        self.assertIn("const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'']);", source)
+        self.assertIn("const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);", source)
         self.assertIn("if(identity===renderedControlsIdentity)return;", source)
         self.assertLess(
             source.index("if(identity===renderedControlsIdentity)return;"),
@@ -42,6 +42,23 @@ class LiveRefreshContractTests(unittest.TestCase):
         self.assertIn("const renderedValues=new WeakMap(),pendingTargetUpdates=new Map()", self.page)
         self.assertIn("for(const [kind,update] of updates)renderValue(target,kind,update.value,update.write);", self.page)
         self.assertIn("document.addEventListener('selectionchange',flushPendingTargetUpdates);", self.page)
+
+    def test_self_hosting_submission_narrows_to_displayed_paths_and_retains_feedback(self):
+        submission = re.search(r"async function submitSelfHosting\(\)\{(.*?)\nasync function logout", self.page, re.DOTALL)
+        self.assertIsNotNone(submission)
+        source = submission.group(1)
+
+        self.assertIn("const authority=latestSnapshot?.gate?.authority_block", source)
+        self.assertIn("filter(path=>allowed.has(path))", source)
+        self.assertIn("paths.length!==context.paths.length", source)
+        self.assertIn("if(button)button.disabled=true;try", source)
+        self.assertIn("finally{if(button)button.disabled=false;}", source)
+        self.assertIn("renderActionResult('authorize_self_hosting',j,context.paths);await refresh();", source)
+        self.assertIn("catch(e){renderActionFailure('authorize_self_hosting',e.message);}", source)
+        self.assertIn("function renderActionFailure(action,message){actionFeedback={action,error:message||'action failed'}", self.page)
+        self.assertIn("actionFeedback={action,stdout:j.stdout,stderr:j.stderr,grantedPaths};renderActionFeedback();", self.page)
+        self.assertIn("Granted authority over named RALPH tooling paths:\\n${feedback.grantedPaths.join('\\n')}", self.page)
+        self.assertIn("renderSelfHostingReview();renderActionFeedback();renderHTML('error','')", self.page)
 
     def test_unchanged_read_only_output_avoids_rewrites_and_event_scroll(self):
         self.assertIn("if(values.get(kind)===next)", self.page)

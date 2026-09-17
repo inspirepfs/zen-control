@@ -144,6 +144,8 @@ class AuthorizeSelfHostingCommandTests(unittest.TestCase):
         self.assertEqual(grant["step"], 2)
         self.assertEqual(grant["gate_id"], "HG-0007-02")
         self.assertEqual(grant["paths"], ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"])
+        self.assertEqual(state["plan_hash"], grant["plan_hash"])
+        self.assertEqual(state["current_step"], grant["step"])
         self.assertEqual(state["status"], "APPROVED")
         self.assertIsNone(state["block_reason"])
         self.assertIsNone(state["self_hosting_candidate"])
@@ -217,6 +219,80 @@ class SandboxEnvironmentClassificationTests(unittest.TestCase):
 
 
 
+class FinalizationSelfHostingTests(unittest.TestCase):
+    def state(self):
+        state = ralph.default_state()
+        state.update({
+            "status": "READY_TO_COMMIT",
+            "plan_hash": "plan-123",
+            "recovery_checkpoint": "RP-test",
+            "plan_changed_files": ["scripts/ralph.py", "tests/test_ralph_web_live_refresh.py"],
+            "self_hosting_grant_history": [{
+                "plan_hash": "plan-123",
+                "step": 1,
+                "gate_id": "HG-0001-01",
+                "paths": ["scripts/ralph.py"],
+            }],
+            "final_qualification": {"state": "PASS", "delta_fingerprint": "abc"},
+        })
+        return state
+
+    def test_authorized_paths_come_only_from_same_plan_grant_history(self):
+        state = self.state()
+        state["self_hosting_grant_history"].append({
+            "plan_hash": "other-plan", "paths": ["scripts/ralph_web.py"]
+        })
+        self.assertEqual(ralph.authorized_self_hosting_paths(state), {"scripts/ralph.py"})
+
+    def test_qualified_delta_requires_bound_matching_fingerprint(self):
+        state = self.state()
+        with mock.patch.object(ralph, "plan_delta_fingerprint", return_value="abc"):
+            self.assertTrue(ralph.qualified_delta_matches(state)[0])
+        state["final_qualification"].pop("delta_fingerprint")
+        self.assertIn("requalification", ralph.qualified_delta_matches(state)[1])
+        state["final_qualification"]["delta_fingerprint"] = "abc"
+        with mock.patch.object(ralph, "plan_delta_fingerprint", return_value="changed"):
+            self.assertIn("changed after final qualification", ralph.qualified_delta_matches(state)[1])
+
+    def test_finalization_guard_allows_authorized_tooling_and_rejects_ungranted_tooling(self):
+        state = self.state()
+        checkpoint = {"baseline_dirty_paths": [], "baseline_staged_paths": []}
+        current = set(state["plan_changed_files"])
+        ok = type("P", (), {"returncode": 0, "stdout": ""})()
+        with (
+            mock.patch.object(ralph, "qualified_delta_matches", return_value=(True, "ok")),
+            mock.patch.object(ralph, "load_recovery_checkpoint", return_value=checkpoint),
+            mock.patch.object(ralph, "git_changed_paths", return_value=sorted(current)),
+            mock.patch.object(ralph, "_git", return_value=ok),
+            mock.patch.object(ralph, "run_process", return_value=ok),
+        ):
+            planned, _ = ralph._finalization_guard(state)
+            self.assertEqual(set(planned), current)
+            state["plan_changed_files"].append("scripts/ralph_web.py")
+            with self.assertRaisesRegex(RuntimeError, "without same-plan self-hosting authority"):
+                ralph._finalization_guard(state)
+
+    def test_requalify_records_delta_binding_and_keeps_ready_state(self):
+        state = self.state()
+        state["final_qualification"] = {"state": "PASS"}
+        args = argparse.Namespace(plan_hash="plan-123")
+        saved = []
+        with (
+            mock.patch.object(ralph, "init_files"),
+            mock.patch.object(ralph, "load_state", return_value=state),
+            mock.patch.object(ralph, "run_final_qualification", return_value=(True, ["unit-tests=PASS"], {"unit-tests": 1.0}, "")),
+            mock.patch.object(ralph, "plan_delta_fingerprint", return_value="bound-delta"),
+            mock.patch.object(ralph, "change_entries", return_value=[]),
+            mock.patch.object(ralph, "save_state", side_effect=lambda value: saved.append(dict(value))),
+            mock.patch.object(ralph, "build_completion_report"),
+            mock.patch.object(ralph, "live_write"),
+        ):
+            self.assertEqual(ralph.cmd_requalify(args), 0)
+        self.assertEqual(state["status"], "READY_TO_COMMIT")
+        self.assertEqual(state["final_qualification"]["delta_fingerprint"], "bound-delta")
+        self.assertTrue(saved)
+
+
 class BootstrapSourceFlowTests(unittest.TestCase):
     def test_parser_exposes_explicit_authorization_command(self):
         parser = ralph.build_parser()
@@ -234,6 +310,11 @@ class BootstrapSourceFlowTests(unittest.TestCase):
         )
         self.assertIs(args.func, ralph.cmd_authorize_self_hosting)
 
+    def test_parser_exposes_requalify_command(self):
+        parser = ralph.build_parser()
+        args = parser.parse_args(["requalify", "plan-123"])
+        self.assertIs(args.func, ralph.cmd_requalify)
+
     def test_run_checks_exact_grant_before_restoring_authority(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         changed = source.index("changed_authority = authority_changed_paths(authority)")
@@ -246,11 +327,18 @@ class BootstrapSourceFlowTests(unittest.TestCase):
 
     def test_successful_step_expires_active_grant(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
-        grant = source.index('state["self_hosting_grant"] = None')
-        candidate = source.index('state["self_hosting_candidate"] = None', grant)
-        advance = source.index('state["current_step"] += 1', candidate)
-        self.assertLess(grant, candidate)
-        self.assertLess(candidate, advance)
+        run = source.index("def cmd_run")
+        clear = source.index("clear_self_hosting_context(state)", run)
+        advance = source.index('state["current_step"] += 1', run)
+        self.assertLess(clear, advance)
+
+    def test_lifecycle_transitions_expire_self_hosting_context(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        clear = "clear_self_hosting_context(state)"
+        self.assertIn(clear, source[source.index("def cmd_approve"):source.index("def cmd_reject")])
+        self.assertIn(clear, source[source.index("def cmd_retire_plan"):source.index("def cmd_steer")])
+        self.assertIn(clear, source[source.index("def cmd_steer"):source.index("def cmd_authorize_self_hosting")])
+        self.assertIn(clear, source[source.index("def cmd_resume"):source.index("def cmd_resolve_gate")])
 
     def test_authority_block_persists_controller_candidate_after_restoration(self):
         source = MODULE_PATH.read_text(encoding="utf-8")

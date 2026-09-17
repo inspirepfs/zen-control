@@ -891,6 +891,70 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
     return report
 
 
+def _is_runtime_authority_path(path: str) -> bool:
+    path = _normalize_repo_path(path)
+    return path == ".ralph" or path.startswith(".ralph/")
+
+
+def authorized_self_hosting_paths(state: dict) -> set[str]:
+    """Return tooling paths explicitly granted during this exact approved plan."""
+    plan_digest = str(state.get("plan_hash") or "")
+    allowed: set[str] = set()
+    history = state.get("self_hosting_grant_history") if isinstance(state.get("self_hosting_grant_history"), list) else []
+    for grant in history:
+        if not isinstance(grant, dict) or str(grant.get("plan_hash") or "") != plan_digest:
+            continue
+        for raw in grant.get("paths") or []:
+            path = _normalize_repo_path(str(raw))
+            if not path or _is_runtime_authority_path(path) or is_protected_path(path) or not is_tooling_path(path):
+                continue
+            allowed.add(path)
+    return allowed
+
+
+def plan_delta_fingerprint(state: dict) -> str:
+    """Bind qualification to the exact recorded plan delta currently on disk."""
+    planned = sorted({_normalize_repo_path(str(path)) for path in state.get("plan_changed_files") or [] if str(path).strip()})
+    if not planned:
+        raise RuntimeError("plan has no recorded changed files")
+    digest = hashlib.sha256()
+    digest.update(str(state.get("plan_hash") or "").encode())
+    digest.update(b"\0")
+    digest.update(str(state.get("recovery_checkpoint") or "").encode())
+    for path in planned:
+        digest.update(b"\0PATH\0" + path.encode())
+        status = _git(["status", "--porcelain=v1", "--", path], check=False).stdout
+        digest.update(b"\0STATUS\0" + status.encode())
+        full = ROOT / path
+        if full.is_symlink():
+            digest.update(b"\0SYMLINK\0" + os.readlink(full).encode())
+        elif full.exists() and full.is_file():
+            digest.update(b"\0FILE\0")
+            with full.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            digest.update(b"\0MISSING\0")
+    return digest.hexdigest()
+
+
+def qualified_delta_matches(state: dict) -> tuple[bool, str]:
+    qualification = state.get("final_qualification") if isinstance(state.get("final_qualification"), dict) else {}
+    if str(qualification.get("state") or "") != "PASS":
+        return False, "final qualification is not PASS"
+    expected = str(qualification.get("delta_fingerprint") or "").strip()
+    if not expected:
+        planned = {_normalize_repo_path(str(path)) for path in state.get("plan_changed_files") or []}
+        self_hosted = any(is_tooling_path(path) for path in planned) or bool(authorized_self_hosting_paths(state))
+        if self_hosted:
+            return False, "self-hosting final qualification predates delta binding; requalification is required"
+        return True, "legacy non-self-hosting qualification has no delta fingerprint"
+    actual = plan_delta_fingerprint(state)
+    if expected != actual:
+        return False, "working-tree delta changed after final qualification; requalification is required"
+    return True, "qualified delta fingerprint matches"
+
+
 def finalization_review(state: dict) -> dict:
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     baseline = set(checkpoint.get("baseline_dirty_paths") or []) if checkpoint else set()
@@ -898,7 +962,9 @@ def finalization_review(state: dict) -> dict:
     current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
     overlap = sorted((baseline & planned) - {path for path in planned if path.startswith(".ralph/")})
     unexpected = sorted(current - baseline - planned)
-    protected = sorted(path for path in planned if is_protected_path(path) or is_tooling_path(path))
+    protected = sorted(path for path in planned if is_protected_path(path) or _is_runtime_authority_path(path))
+    tooling = sorted(path for path in planned if is_tooling_path(path) and not _is_runtime_authority_path(path))
+    unauthorized_tooling = sorted(set(tooling) - authorized_self_hosting_paths(state))
     return {
         "baseline": sorted(baseline),
         "planned": sorted(planned),
@@ -906,6 +972,8 @@ def finalization_review(state: dict) -> dict:
         "overlap": overlap,
         "unexpected": unexpected,
         "protected": protected,
+        "tooling": tooling,
+        "unauthorized_tooling": unauthorized_tooling,
         "checkpoint": checkpoint,
     }
 
@@ -932,9 +1000,13 @@ def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
     planned = set(state.get("plan_changed_files") or [])
     if not planned:
         raise RuntimeError("plan has no recorded changed files")
-    protected = sorted(path for path in planned if is_protected_path(path) or is_tooling_path(path))
+    protected = sorted(path for path in planned if is_protected_path(path) or _is_runtime_authority_path(path))
     if protected:
-        raise RuntimeError(f"plan records protected/RALPH tooling paths; reconciliation refused: {protected}")
+        raise RuntimeError(f"plan records protected/runtime authority paths; reconciliation refused: {protected}")
+    tooling = sorted(path for path in planned if is_tooling_path(path))
+    unauthorized_tooling = sorted(set(tooling) - authorized_self_hosting_paths(state))
+    if unauthorized_tooling:
+        raise RuntimeError(f"plan records RALPH tooling without same-plan self-hosting authority: {unauthorized_tooling}")
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     if not checkpoint:
         raise RuntimeError("recovery checkpoint is missing; reconciliation refused")
@@ -946,6 +1018,9 @@ def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
     unexpected = sorted(commit_paths - planned - baseline)
     if unexpected:
         raise RuntimeError(f"manual commit contains unexpected paths outside plan/baseline: {unexpected}")
+    qualified, qualified_reason = qualified_delta_matches(state)
+    if not qualified:
+        raise RuntimeError(f"commit reconciliation refused: {qualified_reason}")
     return {
         "sha": sha,
         "commit_paths": sorted(commit_paths),
@@ -981,12 +1056,22 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
     unexpected = sorted(current - baseline - planned)
     if unexpected:
         raise RuntimeError(f"unexpected working-tree delta outside baseline/plan; automated commit refused: {unexpected}")
-    protected = sorted(path for path in planned if is_protected_path(path) or is_tooling_path(path))
+    protected = sorted(path for path in planned if is_protected_path(path) or _is_runtime_authority_path(path))
     if protected:
-        raise RuntimeError(f"automated commit refuses protected/RALPH tooling paths: {protected}")
+        raise RuntimeError(f"automated commit refuses protected/runtime authority paths: {protected}")
+    tooling = sorted(path for path in planned if is_tooling_path(path))
+    unauthorized_tooling = sorted(set(tooling) - authorized_self_hosting_paths(state))
+    if unauthorized_tooling:
+        raise RuntimeError(f"automated commit refuses RALPH tooling without same-plan self-hosting authority: {unauthorized_tooling}")
+    staged_now = sorted(line.strip() for line in _git(["diff", "--cached", "--name-only"], check=False).stdout.splitlines() if line.strip())
+    if staged_now:
+        raise RuntimeError(f"working tree contains staged changes before RALPH commit; automated commit refused: {staged_now}")
     missing = sorted(path for path in planned if path not in current)
     if missing:
         raise RuntimeError(f"recorded plan paths are no longer present in the working-tree delta: {missing}")
+    qualified, qualified_reason = qualified_delta_matches(state)
+    if not qualified:
+        raise RuntimeError(f"automated commit refused: {qualified_reason}")
     proc = _git(["diff", "--check", "--", *sorted(planned)], check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"git diff --check failed: {proc.stdout[-3000:]}")
@@ -1038,6 +1123,46 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_requalify(args: argparse.Namespace) -> int:
+    """Re-run final qualification and bind it to the exact current plan delta."""
+    init_files()
+    state = load_state()
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("requalify hash does not match the current plan")
+    if state.get("status") != "READY_TO_COMMIT":
+        raise RuntimeError(f"requalify requires READY_TO_COMMIT, found {state.get('status')}")
+    passed, gates, durations, output = run_final_qualification()
+    state["final_qualification"] = {
+        "state": "PASS" if passed else "FAIL",
+        "gates": gates,
+        "durations": durations,
+        "output": output[-6000:],
+        "completed_at": utc_now(),
+        "delta_fingerprint": plan_delta_fingerprint(state) if passed else None,
+    }
+    if not passed:
+        state["status"] = "BLOCKED_HUMAN"
+        state["block_reason"] = "final requalification failed for current plan delta"
+        save_state(state)
+        live_write(state["block_reason"], "FAIL")
+        if output:
+            print(output[-6000:])
+        return 2
+    entries = change_entries(state.get("plan_changed_files") or [])
+    state["completion_changes"] = {
+        "entries": entries,
+        "files": len(entries),
+        "added": sum(int(item.get("added") or 0) for item in entries),
+        "removed": sum(int(item.get("removed") or 0) for item in entries),
+    }
+    state["block_reason"] = None
+    save_state(state)
+    build_completion_report(state, gates)
+    live_write(f"final requalification PASS · delta={state['final_qualification']['delta_fingerprint'][:12]}", "READY")
+    print(f"REQUALIFIED plan={state['plan_hash']} delta={state['final_qualification']['delta_fingerprint']}")
+    return 0
+
+
 def cmd_finalize(args: argparse.Namespace) -> int:
     init_files()
     state = load_state()
@@ -1069,6 +1194,10 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             raise RuntimeError(f"finalize --commit requires READY_TO_COMMIT, found {state.get('status')}")
         planned, _baseline = _finalization_guard(state)
         _git(["add", "--", *planned])
+        staged = sorted(line.strip() for line in _git(["diff", "--cached", "--name-only"], check=False).stdout.splitlines() if line.strip())
+        if staged != sorted(planned):
+            _git(["reset"], check=False)
+            raise RuntimeError(f"staged commit scope does not exactly match qualified plan delta: staged={staged} planned={sorted(planned)}")
         message = args.message or _default_commit_message(state)
         proc = _git(["commit", "-m", message, "-m", f"RALPH-Plan: {state.get('plan_hash')}"] , check=False)
         if proc.returncode != 0:
@@ -1407,6 +1536,12 @@ def self_hosting_grant_allows(state: dict, step_no: int, changed: Iterable[str])
     if extra:
         return False, f"authority changes exceed exact self-hosting grant: {extra}"
     return True, f"exact self-hosting grant permits {paths}"
+
+
+def clear_self_hosting_context(state: dict) -> None:
+    """Expire one-step authority material when its gate can no longer be current."""
+    state["self_hosting_grant"] = None
+    state["self_hosting_candidate"] = None
 
 
 def protected_snapshot() -> dict[Path, bytes]:
@@ -2687,7 +2822,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     state["plan_owned_files"] = []
     state["human_steering"] = []
     state["steering_allowed_new_tests"] = []
-    state["self_hosting_grant"] = None
+    clear_self_hosting_context(state)
     state["step_results"] = []
     state.pop("proposal_previous_state", None)
     save_state(state)
@@ -2831,8 +2966,8 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
         "last_failure": None,
         "last_result": "RETIRED",
         "block_reason": None,
-        "self_hosting_grant": None,
     })
+    clear_self_hosting_context(state)
     state.pop("proposal_previous_state", None)
 
     PLAN.unlink(missing_ok=True)
@@ -2907,6 +3042,7 @@ def cmd_steer(args: argparse.Namespace) -> int:
         if not any(isinstance(item, dict) and int(item.get("step") or 0) == step_no and item.get("path") == path for item in grants):
             grants.append(grant)
     state["steering_allowed_new_tests"] = grants[-100:]
+    clear_self_hosting_context(state)
     state["status"] = "APPROVED"
     state["block_reason"] = None
     save_state(state)
@@ -3054,6 +3190,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         raise RuntimeError("resume is only valid from BLOCKED_HUMAN/BLOCKED_ENVIRONMENT")
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("resume hash does not match the approved plan")
+    clear_self_hosting_context(state)
     state["status"] = "APPROVED"
     state["block_reason"] = None
     save_state(state)
@@ -3101,6 +3238,7 @@ def cmd_resolve_gate(args: argparse.Namespace) -> int:
     append_human_gate_resolution(state, step, expected_gate, reason, original_block)
     record_step_result(state, step, "HUMAN_CONFIRMED", summary=reason)
 
+    clear_self_hosting_context(state)
     state["last_result"] = "HUMAN_CONFIRMED"
     state["block_reason"] = None
     state["current_step"] = int(state["current_step"]) + 1
@@ -3369,8 +3507,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 tests=gates,
                 tokens=stats,
             ))
-            state["self_hosting_grant"] = None
-            state["self_hosting_candidate"] = None
+            clear_self_hosting_context(state)
             state["current_step"] += 1
             state["status"] = "APPROVED"
             save_state(state)
@@ -3403,6 +3540,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "durations": final_durations,
         "output": final_output[-6000:],
         "completed_at": utc_now(),
+        "delta_fingerprint": plan_delta_fingerprint(state) if passed else None,
     }
     state["block_reason"] = None
     try:
@@ -3590,6 +3728,9 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="regenerate the current plan completion report")
     report.add_argument("plan_hash")
     report.set_defaults(func=cmd_report)
+    requalify = sub.add_parser("requalify", help="re-run final qualification and bind it to the exact current plan delta")
+    requalify.add_argument("plan_hash")
+    requalify.set_defaults(func=cmd_requalify)
     finalize = sub.add_parser("finalize", help="review, commit, or push a fully qualified completed plan")
     finalize.add_argument("plan_hash")
     action = finalize.add_mutually_exclusive_group()

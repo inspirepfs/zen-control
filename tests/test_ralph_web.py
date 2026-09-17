@@ -145,21 +145,57 @@ class SnapshotTests(unittest.TestCase):
                     "paths": ["scripts/ralph.py"], "detected_at": "2026-09-17T00:00:00+00:00",
                 },
             )
-            candidate = web.snapshot()["gate"]["self_hosting_candidate"]
+            gate = web.snapshot()["gate"]
+            candidate = gate["self_hosting_candidate"]
+            self.assertEqual(candidate["plan_hash"], "a" * 64)
+            self.assertEqual(candidate["step"], 3)
             self.assertEqual(candidate["paths"], ["scripts/ralph.py"])
             self.assertEqual(candidate["gate_id"], "HG-0021-03")
-
-    def test_snapshot_hides_stale_or_ordinary_block_candidates(self):
-        with WebHarness() as h:
-            h.state(
-                status="BLOCKED_HUMAN", current_step=3, loop_count=21,
-                block_reason="operator must provide runtime evidence",
-                self_hosting_candidate={
-                    "plan_hash": "a" * 64, "step": 3, "gate_id": "HG-0021-03",
+            self.assertEqual(gate["block_reason"], "Codex attempted to change RALPH controller/tooling authority")
+            self.assertEqual(
+                gate["authority_block"],
+                {
+                    "kind": "controller_self_hosting_authority",
+                    "plan_hash": "a" * 64,
+                    "step": 3,
+                    "gate_id": "HG-0021-03",
                     "paths": ["scripts/ralph.py"],
                 },
             )
-            self.assertNotIn("self_hosting_candidate", web.snapshot()["gate"])
+
+    def test_authority_block_echoes_controller_candidate_without_web_path_vetting(self):
+        with WebHarness() as h:
+            h.state(
+                status="BLOCKED_HUMAN", current_step=3, loop_count=21,
+                block_reason="Codex attempted to change RALPH controller/tooling authority",
+                self_hosting_candidate={
+                    "plan_hash": "a" * 64, "step": 3, "gate_id": "HG-0021-03",
+                    "paths": ["controller-reported/path"],
+                },
+            )
+            authority = web.snapshot()["gate"]["authority_block"]
+            self.assertEqual(authority["paths"], ["controller-reported/path"])
+
+    def test_snapshot_hides_stale_or_ordinary_block_candidates(self):
+        with WebHarness() as h:
+            for candidate, block_reason in (
+                (
+                    {"plan_hash": "a" * 64, "step": 3, "gate_id": "HG-0021-03", "paths": ["scripts/ralph.py"]},
+                    "operator must provide runtime evidence",
+                ),
+                (
+                    {"plan_hash": "stale-plan", "step": 3, "gate_id": "HG-0021-03", "paths": ["scripts/ralph.py"]},
+                    "Codex attempted to change RALPH controller/tooling authority",
+                ),
+            ):
+                with self.subTest(candidate=candidate, block_reason=block_reason):
+                    h.state(
+                        status="BLOCKED_HUMAN", current_step=3, loop_count=21,
+                        block_reason=block_reason, self_hosting_candidate=candidate,
+                    )
+                    gate = web.snapshot()["gate"]
+                    self.assertNotIn("self_hosting_candidate", gate)
+                    self.assertNotIn("authority_block", gate)
 
     def test_event_tail_is_bounded(self):
         with WebHarness() as h:
@@ -186,6 +222,13 @@ class ActionAuthorityTests(unittest.TestCase):
             web.command_for_action({"action": "propose", "goal": "short"}, {"status": "IDLE"})
         with self.assertRaises(web.WebConsoleError):
             web.command_for_action({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "RUNNING"})
+
+    def test_requalify_action_is_ready_to_commit_only_and_background(self):
+        req = web.command_for_action({"action": "requalify"}, self.base_state("READY_TO_COMMIT"))
+        self.assertEqual(req.argv, ["requalify", "b" * 64])
+        self.assertTrue(req.background)
+        with self.assertRaisesRegex(web.WebConsoleError, "READY_TO_COMMIT"):
+            web.command_for_action({"action": "requalify"}, self.base_state("APPROVED"))
 
     def test_destructive_actions_require_explicit_confirmation(self):
         state = self.base_state("READY_TO_COMMIT")
@@ -229,10 +272,24 @@ class ActionAuthorityTests(unittest.TestCase):
             "paths": ["scripts/ralph_web.py", "scripts/ralph.py"],
             "reason": "bounded operator approval",
         }, self.self_hosting_state())
-        self.assertEqual(req.argv[:4], ["authorize-self-hosting", "b" * 64, "--gate", "HG-0021-03"])
-        self.assertEqual(req.argv.count("--path"), 2)
-        self.assertIn("scripts/ralph.py", req.argv)
-        self.assertIn("scripts/ralph_web.py", req.argv)
+        self.assertEqual(
+            req.argv,
+            [
+                "authorize-self-hosting", "b" * 64, "--gate", "HG-0021-03",
+                "--path", "scripts/ralph.py", "--path", "scripts/ralph_web.py",
+                "--reason", "bounded operator approval",
+            ],
+        )
+
+    def test_self_hosting_action_ignores_forged_plan_hash_and_normalizes_reason(self):
+        req = web.command_for_action({
+            "action": "authorize_self_hosting",
+            "plan_hash": "c" * 64,
+            "gate": "HG-0021-03",
+            "paths": ["scripts/ralph.py", "scripts/ralph_web.py"],
+            "reason": "  bounded\n operator\tapproval  ",
+        }, self.self_hosting_state())
+        self.assertEqual(req.argv[:2], ["authorize-self-hosting", "b" * 64])
         self.assertEqual(req.argv[-2:], ["--reason", "bounded operator approval"])
 
     def test_self_hosting_action_rejects_broadened_or_narrowed_paths(self):
@@ -265,7 +322,22 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertIn("Authorize Self-Hosting", web.PAGE)
         self.assertIn("submitSelfHosting", web.PAGE)
         self.assertIn("renderActionFailure", web.PAGE)
+        self.assertIn("actionFeedback=null", web.PAGE)
+        self.assertIn("renderSelfHostingReview();renderActionFeedback();renderHTML('error','')", web.PAGE)
+        self.assertIn("You are granting authority over named RALPH tooling paths", web.PAGE)
+        self.assertIn("Granted authority over named RALPH tooling paths", web.PAGE)
         self.assertIn("data-self-host-path", web.PAGE)
+        self.assertIn("selfHostingContext", web.PAGE)
+        self.assertIn("Controller-reported context only", web.PAGE)
+        self.assertIn("Requalify delta", web.PAGE)
+        self.assertIn("renderActionFailure(action,e.message)", web.PAGE)
+
+    def test_self_hosting_submission_uses_current_snapshot_authority_context(self):
+        self.assertIn("const authority=latestSnapshot?.gate?.authority_block", web.PAGE)
+        self.assertIn("const allowed=new Set(context?.paths||[])", web.PAGE)
+        self.assertIn("filter(path=>allowed.has(path))", web.PAGE)
+        self.assertIn("gate:context.gate,paths,reason", web.PAGE)
+        self.assertIn("paths.length!==context.paths.length", web.PAGE)
 
     def test_reconciliation_actions_are_explicit(self):
         with self.assertRaises(web.WebConsoleError):
@@ -311,6 +383,51 @@ class UsageMonitorTests(unittest.TestCase):
 
 
 class HttpSurfaceTests(unittest.TestCase):
+    def test_self_hosting_action_forwards_controller_context_and_preserves_rejection(self):
+        with WebHarness() as h:
+            state = h.state(
+                status="BLOCKED_HUMAN", current_step=3, loop_count=21,
+                block_reason="Codex attempted to change RALPH controller/tooling authority",
+                self_hosting_candidate={
+                    "plan_hash": "a" * 64, "step": 3, "gate_id": "HG-0021-03",
+                    "paths": ["scripts/ralph.py", "scripts/ralph_web.py"],
+                },
+            )
+            server = web.build_server("127.0.0.1", 0, csrf_token="known-token")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address[:2]
+            payload = {
+                "action": "authorize_self_hosting", "plan_hash": "forged-plan",
+                "gate": "HG-0021-03", "paths": ["scripts/ralph_web.py", "scripts/ralph.py"],
+                "reason": "bounded operator approval",
+            }
+            request = urllib.request.Request(
+                f"http://{host}:{port}/api/action", data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json", "X-RALPH-CSRF": "known-token"}, method="POST",
+            )
+            try:
+                with mock.patch.object(web, "run_command", return_value={"ok": True, "stdout": "controller accepted"}) as run:
+                    self.assertEqual(json.load(urllib.request.urlopen(request, timeout=3))["stdout"], "controller accepted")
+                self.assertEqual(
+                    run.call_args.args[0].argv,
+                    [
+                        "authorize-self-hosting", state["plan_hash"], "--gate", "HG-0021-03",
+                        "--path", "scripts/ralph.py", "--path", "scripts/ralph_web.py",
+                        "--reason", "bounded operator approval",
+                    ],
+                )
+                controller_error = "controller rejected this exact candidate"
+                with mock.patch.object(web, "run_command", return_value={"ok": False, "error": controller_error}):
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(request, timeout=3)
+                self.assertEqual(ctx.exception.code, 409)
+                self.assertEqual(json.load(ctx.exception)["error"], controller_error)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
     def test_health_and_snapshot_are_available_but_write_requires_csrf(self):
         with WebHarness() as h:
             h.state()
