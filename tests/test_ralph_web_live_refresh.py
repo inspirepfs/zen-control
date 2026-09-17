@@ -76,15 +76,19 @@ class LiveRefreshContractTests(unittest.TestCase):
         self.assertIn("COMMITTING", self.page)
         self.assertIn("PUSHING", self.page)
 
-    def test_usage_layout_is_compact_and_plan_comments_expand_in_place(self):
+    def test_usage_layout_is_compact_and_plan_details_expand_in_place(self):
         self.assertIn("usage-grid{display:grid;grid-template-columns:repeat(6", self.page)
         self.assertIn("wins.slice(0,2)", self.page)
-        self.assertIn('<details class="plan-comment">', self.page)
-        self.assertIn('class="plan-comment-body"', self.page)
-        self.assertIn('class="usage-tokens"', self.page)
-        self.assertIn("-webkit-line-clamp:2", self.page)
-        self.assertIn("minmax(230px,280px)", self.page)
-        self.assertIn("max-height:90px;overflow:auto", self.page)
+        self.assertIn('<details class="plan-usage-detail">', self.page)
+        self.assertIn('class="plan-usage-summary"', self.page)
+        self.assertIn('class="plan-usage-meta"', self.page)
+        self.assertIn('class="plan-breakdown"', self.page)
+        self.assertIn("breakdownTable('Scope'", self.page)
+        self.assertIn("breakdownTable('Phase'", self.page)
+        self.assertIn("breakdownTable('Step'", self.page)
+        self.assertIn("${cache}%", self.page)
+        self.assertIn("plan-usage-summary:before{content:'▸';position:absolute", self.page)
+        self.assertIn("plan-usage-head", self.page)
 
     def test_completion_report_supports_safe_rendered_and_raw_markdown_views(self):
         self.assertIn('id="reportRenderedButton"', self.page)
