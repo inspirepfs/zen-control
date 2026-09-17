@@ -2,6 +2,8 @@
 
 Self-hosted household network policy, parental controls and observability for MikroTik RouterOS.
 
+This page is the concise project orientation. Start with the route for your role; detailed operational and implementation material lives under [docs/](docs/README.md).
+
 ZEN Control keeps RouterOS as the enforcement authority while adding a parent-friendly control plane for managed-device policy, schedules, service controls, temporary access, rewards, quotas, telemetry, explainability and operational evidence.
 
 > Current maintenance release: **v0.59.0.12**. The application/PWA reports version **0.59.0**; `v0.59.0.x` tags are qualified maintenance releases on that runtime line. v0.59.0.12 adds supply-chain scanning, SBOM evidence, immutable GitHub Action pins and Dependabot automation; v0.59.0.11 added destructive fresh-install/first-run commissioning acceptance on isolated CI runners.
@@ -10,13 +12,12 @@ ZEN Control keeps RouterOS as the enforcement authority while adding a parent-fr
 
 ## Start here
 
-If you are new to ZEN, use the documentation in this order:
+- **Operators:** [install and commission](docs/INSTALL.md), review the [RouterOS authority boundary](routeros/README.md), then use the [operator guide](docs/OPERATOR_GUIDE.md).
+- **Developers:** read the [ZEN system overview](docs/ZEN.md), [architecture](docs/ARCHITECTURE.md), and [contribution guide](CONTRIBUTING.md).
+- **RALPH users:** begin at the [RALPH documentation tree](docs/ralph/README.md) for the supervised engineering lifecycle and controller-owned gates.
+- **Future adopters:** use the [ZEN system overview](docs/ZEN.md), [installation prerequisites](docs/INSTALL.md#before-you-start), and [security policy](SECURITY.md) to decide whether ZEN fits your network.
 
-1. **Understand the safety model** in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [routeros/README.md](routeros/README.md).
-2. **Prepare and install** with [docs/INSTALL.md](docs/INSTALL.md) and the reviewed [RouterOS setup bundle](routeros/setup/README.md).
-3. **Configure safely** with [.env.example](.env.example) and [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
-4. **Operate and recover** with [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
-5. **Contribute or review security-sensitive changes** with [CONTRIBUTING.md](CONTRIBUTING.md), [docs/RALPH-LITE.md](docs/RALPH-LITE.md), [SECURITY.md](SECURITY.md), [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md) and [docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md).
+For all documentation routes, including the shared glossary and maintenance map, see [docs/README.md](docs/README.md).
 
 ZEN is designed for technically confident operators. It intentionally exposes evidence and failure states instead of hiding them behind a one-click appliance model.
 

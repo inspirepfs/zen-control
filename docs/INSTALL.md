@@ -222,8 +222,6 @@ Before relying on automatic enforcement:
 7. Review Operational Diagnostics and Release Readiness.
 8. Render both `/login` and an authenticated dashboard page after any framework/dependency change; health APIs alone do not prove the Jinja/UI path is compatible.
 
-### First-run acceptance checklist
-
 ### Automated fresh-install proof
 
 Every qualified release now runs an isolated destructive fresh-install acceptance in GitHub Actions. The harness starts from a Compose project with no retained containers, networks or volumes, creates the policy database from scratch, proves built-in/default state is seeded while operator-owned policy state is empty, authenticates through the real container, exercises commissioning/support export and repeats the entire cycle after deleting the first data volumes.

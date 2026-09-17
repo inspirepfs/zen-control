@@ -1,0 +1,52 @@
+# RALPH-Lite lifecycle
+
+This reference uses the controller's actual persisted `status` names. **Repair** and **final qualification** are phases/actions, not status nodes. `RETIRED` is an audited event returning to `IDLE`, not a persisted terminal status. `PLAN_COMPLETE` is only a legacy proposal-entry status, not current normal completion.
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> AWAITING_APPROVAL: propose
+  PLAN_COMPLETE --> AWAITING_APPROVAL: propose (legacy entry)
+  PUSHED --> AWAITING_APPROVAL: propose
+  AWAITING_APPROVAL --> APPROVED: approve exact SHA-256 and checkpoint
+  AWAITING_APPROVAL --> IDLE: reject (no prior plan)
+  APPROVED --> RUNNING: run current step
+  RUNNING --> APPROVED: qualified step PASS / next step
+  RUNNING --> RUNNING: qualification FAIL / repair same step
+  RUNNING --> BLOCKED_HUMAN: policy, human gate, repair limit, final FAIL
+  RUNNING --> BLOCKED_ENVIRONMENT: environment failure
+  RUNNING --> PAUSED_USAGE_LIMIT: usage reserve reached
+  PAUSED_USAGE_LIMIT --> APPROVED: capacity recovered
+  BLOCKED_ENVIRONMENT --> APPROVED: resume
+  BLOCKED_HUMAN --> APPROVED: steer, eligible resolve-gate, or resume
+  APPROVED --> IDLE: retire-plan (RETIRED)
+  BLOCKED_HUMAN --> IDLE: retire-plan (RETIRED)
+  BLOCKED_ENVIRONMENT --> IDLE: retire-plan (RETIRED)
+  PAUSED_USAGE_LIMIT --> IDLE: retire-plan (RETIRED)
+  RUNNING --> READY_TO_COMMIT: all steps accepted + final PASS
+  READY_TO_COMMIT --> READY_TO_COMMIT: requalify PASS
+  READY_TO_COMMIT --> BLOCKED_HUMAN: requalify FAIL
+  READY_TO_COMMIT --> COMMITTED: finalize --commit or reconcile-commit
+  COMMITTED --> PUSHED: finalize --push or reconcile-push
+```
+
+## State reference
+
+| State | Entry and persisted evidence | Available / prohibited actions | Recovery, exit, successor |
+| --- | --- | --- | --- |
+| `IDLE` | Neutral initial or retirement/rejection reset; no active plan authority. Retirement history may retain plan/hash/reason. | Propose. No step execution, approval without a plan, or publication. | Valid proposal persists plan/hash → `AWAITING_APPROVAL`. |
+| `AWAITING_APPROVAL` | Validated proposal, SHA-256 hash, current step, and prior-state snapshot persisted. | Human approve exact hash or reject. No implementation, steering, resume, or approval of edited plan. | Matching hash and rendered plan creates checkpoint → `APPROVED`; rejection restores prior eligible state or `IDLE`. |
+| `APPROVED` | Exact approval, checkpoint id/ref, plan baseline, current step, reset repair context persisted; also pause point between steps. | Run, or retire. No plan edit, policy bypass, or use of old qualification for new work. | Run → `RUNNING`; retirement records `RETIRED` → `IDLE`; usage guard can → `PAUSED_USAGE_LIMIT`. |
+| `RUNNING` | Loop count and current step persisted before turn. Evidence includes result, changed paths/class, gates/durations, and failure fingerprint. Repair uses `active_failure` in this status. | Controller runs current step, policies, qualification, and same-step repair. No different step, self-acceptance, repair-limit bypass, or publication. | PASS records step and → `APPROVED`; FAIL remains for repair; policy/human/final failure → `BLOCKED_HUMAN`; environment failure → `BLOCKED_ENVIRONMENT`; all steps plus final PASS → `READY_TO_COMMIT`. |
+| `PAUSED_USAGE_LIMIT` | Usage snapshot, pause details, and reason persisted before another model turn. | Wait/poll or retire. No spending through reserve, success claim, or manual quota recovery claim. | Controller-confirmed capacity → `APPROVED`; retirement → `IDLE`. |
+| `BLOCKED_HUMAN` | Block reason/gate and journal evidence; may retain policy evidence, active failure, or qualification output. | Review, bounded steer, resume, narrowly eligible resolve-gate, recover validation-only block, or retire. No generic confirmation of policy/repair failure, plan-hash change, or self-acceptance. | Steer/resume → `APPROVED` same step; eligible resolution records `HUMAN_CONFIRMED`, advances → `APPROVED`; recovery either advances on PASS or makes repair eligible; retirement → `IDLE`. |
+| `BLOCKED_ENVIRONMENT` | Environment reason and journal entry persisted; plan/current step retained. | Repair environment then resume, or retire. No treating environment failure as PASS or skipping step. | Resume → `APPROVED` same step; retirement → `IDLE`. |
+| `READY_TO_COMMIT` | All step results accepted; final qualification PASS, gates/output/durations/time, delta fingerprint, change summary, report persisted. | Review/report, requalify, guarded commit/reconcile, retire. No model publication, unrelated commit paths, push before commit, or reuse after delta change. | Requalify PASS remains; FAIL → `BLOCKED_HUMAN`; verified commit → `COMMITTED`; retirement → `IDLE`. |
+| `COMMITTED` | Commit SHA/message or reconciliation note/time and refreshed report persisted. | Review, guarded push, reconcile-push. No force push, unrecorded commit, or unverified remote claim. | Push or verified upstream reconciliation → `PUSHED`. |
+| `PUSHED` | Commit SHA, configured upstream, and push time persisted; reconciliation marker when applicable. | Review/report or propose new plan. No deployment, runtime-health, or RouterOS-enforcement claim. | New proposal → `AWAITING_APPROVAL`; otherwise completed published state. |
+
+## Phase rules
+
+Repair stays in `RUNNING`, is bound to the same failure fingerprint and current step, and blocks after three repair attempts. Audited human steering can reset the failure epoch but cannot accept the implementation.
+
+Final qualification runs after the last step and writes evidence before transition: PASS → `READY_TO_COMMIT`; FAIL → `BLOCKED_HUMAN`. There is no `FINAL_QUALIFICATION` status. `resolve-gate` can record `HUMAN_CONFIRMED` only for operator/runtime evidence explicitly delegated by the approved step, never policy violations, active implementation failures, repair exhaustion, or ordinary judgement.

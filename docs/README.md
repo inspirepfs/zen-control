@@ -1,45 +1,54 @@
 # ZEN Control Documentation
 
-ZEN Control is a self-hosted control plane for MikroTik RouterOS. The documentation is deliberately split by **operator journey** rather than mirroring the source-tree layout.
+ZEN Control is a self-hosted control plane for MikroTik RouterOS. Start with the route that matches your role; every major documentation area is linked here or from the [documentation map](reference/documentation-map.md).
 
-## Recommended reading order
+## Choose a route
 
-### New installation
+### ZEN fundamentals
 
-1. [Architecture](ARCHITECTURE.md) — understand RouterOS authority, evidence classes, persistence and failure boundaries.
-2. [Installation and commissioning](INSTALL.md) — host, networking, Docker Compose, RouterOS preparation, HTTPS and first-run acceptance.
-3. [Environment contract](ENVIRONMENT.md) — what belongs in `.env`, which settings are secret/conditional, and when changes require recreation.
-4. [RouterOS integration](../routeros/README.md) — operator-owned authority and the read/write boundary.
-5. [RouterOS setup bundle](../routeros/setup/README.md) — reviewed templates and safe installation order.
+- [ZEN system overview](ZEN.md) — component relationships, authority limits, persistence, and implementation entry points.
+- [Project overview](../README.md) — concise product orientation and role-based next steps.
+- [Architecture](ARCHITECTURE.md) — authority boundaries, data stores, evidence, and failure semantics.
+- [Shared glossary](reference/glossary.md) — the meaning of ZEN and RALPH terms used throughout the project.
+- [Documentation map](reference/documentation-map.md) — document purpose, audience, ownership, duplication, and planned maintenance work.
 
-### Day-2 operation
+### Operator: install and run ZEN
 
-- [Operator guide](OPERATOR_GUIDE.md) — routine health, degraded-state interpretation, commissioning diagnostics, safe support-bundle collection, backup/recovery, upgrade/rollback and incident triage.
-- [Release history](../CHANGELOG.md) — maintenance/hotfix history and contract changes.
+1. [Installation and commissioning](INSTALL.md) — host, networking, Compose, HTTPS, and first-run acceptance.
+2. [Environment contract](ENVIRONMENT.md) — settings, secrets, conditional configuration, and recreation requirements.
+3. [RouterOS integration](../routeros/README.md) — the operator-owned authority boundary.
+4. [RouterOS setup bundle](../routeros/setup/README.md) — reviewed templates and safe installation order.
+5. [Operator guide](OPERATOR_GUIDE.md) — health, degraded evidence, diagnostics, recovery, and incidents.
 
-### Contribution, security and release
+### Developer: change ZEN safely
 
-- [Contributing](../CONTRIBUTING.md) — development principles, quality gates and pull-request expectations.
-- [Security policy](../SECURITY.md) — threat model, deployment responsibilities and vulnerability reporting.
-- [Supply-chain security](SUPPLY_CHAIN.md) — immutable CI action pins, dependency automation, vulnerability scanning and SBOM evidence.
-- [Release and maintenance checklist](PUBLIC_RELEASE.md) — source audit, runtime smoke, qualification and publication gates.
+- [Contributing](../CONTRIBUTING.md) — development principles, local quality gates, and pull-request expectations.
+- [Architecture](ARCHITECTURE.md) — contracts a change must preserve.
+- [Security policy](../SECURITY.md) — trust model, safe reporting, and sensitive-change concerns.
+- [Supply-chain security](SUPPLY_CHAIN.md) — dependency, image, workflow, and SBOM controls.
+- [Release and maintenance checklist](PUBLIC_RELEASE.md) — audit, runtime smoke, qualification, and publication gates.
 
-## Version terminology
+### RALPH: supervised autonomous engineering
 
-The application/PWA runtime currently reports **`0.59.0`**. Qualified maintenance releases are tagged **`v0.59.0.x`**. A maintenance tag may therefore change documentation, dependencies or compatibility code without changing the runtime/PWA version. Always identify a deployed build by both the application version and the Git release tag/commit when troubleshooting.
+- [RALPH documentation tree](ralph/README.md) — RALPH’s place in this repository and the available process documentation.
+- [Historical RALPH-Lite operator guide](RALPH-LITE.md) — protected legacy reference retained for context; use the RALPH documentation tree for current lifecycle and command behavior.
+- [Shared glossary](reference/glossary.md#ralph-lite-terms) — plan, step, checkpoint, qualification, and block-state definitions.
+- [Documentation map](reference/documentation-map.md#maintenance-findings) — documentation work deliberately deferred to later approved steps.
 
-## Evidence terminology
+### Future adopter: evaluate ZEN
 
-Across the documentation, these words are intentional:
+- [Project overview](../README.md) — what ZEN does and its safety model.
+- [Architecture](ARCHITECTURE.md) — trust, authority, persistence, and evidence boundaries.
+- [Installation prerequisites](INSTALL.md#before-you-start) — the host, RouterOS, and network commitments.
+- [Security policy](../SECURITY.md) — deployment responsibilities and reporting process.
+- [Release history](../CHANGELOG.md) — historical changes and maintenance context.
 
-- **desired** means policy intent computed by ZEN;
-- **enforced/live** means supported by current RouterOS evidence;
-- **retained activity** means network/DNS evidence kept for reporting;
-- **UNKNOWN / UNAVAILABLE / PENDING** are not aliases for zero, healthy or PASS;
-- **reporting-only** means evidence/classification exists without an approved enforcement contract.
+## Reference and supporting material
 
-## Screenshots and PWA status
+- [Screenshots and visual-asset guidance](screenshots/README.md) — text-first documentation and sanitized-image expectations.
+- [RouterOS inspection script](../routeros/inspect.rsc) and [verification script](../routeros/setup/99-verify.rsc) — operator-run implementation companions; use them only through the RouterOS guides above.
+- [Documentation map](reference/documentation-map.md) — also records document ownership and duplicates that need future consolidation or historical marking.
 
-The public documentation remains text-first. Real sanitized screenshots can be added later; synthetic screenshots are not used as operational evidence.
+## Version and evidence language
 
-Android installation is proven on at least one real device. Multi-device/tablet installability diagnostics and installed-PWA push commissioning remain open follow-up items because browser/device installability is not fully controlled by ZEN.
+The application/PWA runtime currently reports **`0.59.0`**; qualified maintenance releases are tagged **`v0.59.0.x`**. Identify a deployment by runtime version and Git release tag/commit. See the [glossary](reference/glossary.md) for the intentional distinctions among desired, enforced, retained activity, `UNKNOWN`, `UNAVAILABLE`, `PENDING`, and reporting-only evidence.
