@@ -31,21 +31,22 @@ if str(_SCRIPT_DIR) not in sys.path:
 import ralph_tui as tui
 import ralph_efficiency as efficiency_policy
 import ralph_model as model_policy
+from ralph_profile import ZEN_PROFILE
 
-ROOT = Path(__file__).resolve().parents[1]
-RALPH = ROOT / ".ralph"
-STATE = RALPH / "state.json"
-PLAN = RALPH / "plan.md"
-IDEAS = RALPH / "ideas.md"
-JOURNAL = RALPH / "journal.md"
-POLICY = RALPH / "policy.md"
-LIVE = RALPH / "live.log"
-CONTEXT = RALPH / "context.json"
-EVENTS = RALPH / "events.jsonl"
-RECOVERY = RALPH / "recovery"
-REPORTS = RALPH / "reports"
-USAGE_LEDGER = RALPH / "usage-ledger.jsonl"
-USAGE_STATS_RESET = RALPH / "usage-stats-reset.json"
+ROOT = ZEN_PROFILE.repository_root(__file__)
+RALPH = ZEN_PROFILE.runtime_directory(ROOT)
+STATE = ZEN_PROFILE.artifact(ROOT, "state")
+PLAN = ZEN_PROFILE.artifact(ROOT, "plan")
+IDEAS = ZEN_PROFILE.artifact(ROOT, "ideas")
+JOURNAL = ZEN_PROFILE.artifact(ROOT, "journal")
+POLICY = ZEN_PROFILE.artifact(ROOT, "policy")
+LIVE = ZEN_PROFILE.artifact(ROOT, "live")
+CONTEXT = ZEN_PROFILE.artifact(ROOT, "context")
+EVENTS = ZEN_PROFILE.artifact(ROOT, "events")
+RECOVERY = ZEN_PROFILE.artifact(ROOT, "recovery")
+REPORTS = ZEN_PROFILE.artifact(ROOT, "reports")
+USAGE_LEDGER = ZEN_PROFILE.artifact(ROOT, "usage_ledger")
+USAGE_STATS_RESET = ZEN_PROFILE.artifact(ROOT, "usage_stats_reset")
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
@@ -71,33 +72,12 @@ USAGE_APP_SERVER_TIMEOUT_SECONDS = 15
 USAGE_POLL_SECONDS = 300
 USAGE_LEDGER_MAX_ROWS = 20_000
 _CODEX_PREFIX: list[str] | None = None
-EXCLUDED_DIRS = {
-    ".git", ".ralph", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    ".venv", "venv", "node_modules", "data", "logs", "diagnostics", "backup", "backups",
-}
-PROTECTED_PREFIXES = ("secrets/", "certs/")
-PROTECTED_EXACT = {".npmrc", ".pypirc", ".netrc", ".envrc"}
-PROTECTED_DIR_PREFIXES = (".codex/", ".direnv/")
-PROTECTED_SUFFIXES = (".token", ".secret", ".secrets", ".credentials")
-TOOLING_PATHS = {
-    ".gitignore",
-    ".ralph/policy.md",
-    "scripts/ralph.py",
-    "scripts/ralph_efficiency.py",
-    "scripts/ralph_model.py",
-    "scripts/ralph_gate.py",
-    "scripts/ralph_tui.py",
-    "scripts/ralph_web.py",
-    "tests/test_ralph_lite.py",
-    "tests/test_ralph_efficiency.py",
-    "tests/test_ralph_model.py",
-    "tests/test_ralph_gate.py",
-    "tests/test_ralph_lifecycle.py",
-    "tests/test_ralph_retry_hardening.py",
-    "tests/test_ralph_web.py",
-    "tests/test_ralph_self_hosting.py",
-    "docs/RALPH-LITE.md",
-}
+EXCLUDED_DIRS = ZEN_PROFILE.excluded_dirs
+PROTECTED_PREFIXES = ZEN_PROFILE.protected_prefixes
+PROTECTED_EXACT = ZEN_PROFILE.protected_exact
+PROTECTED_DIR_PREFIXES = ZEN_PROFILE.protected_dir_prefixes
+PROTECTED_SUFFIXES = ZEN_PROFILE.protected_suffixes
+TOOLING_PATHS = ZEN_PROFILE.tooling_paths
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -703,14 +683,7 @@ def bounded_diff(paths: Iterable[str], *, base_ref: str = "HEAD", max_chars: int
 
 def final_qualification_gates() -> list[tuple[str, list[str]]]:
     gates = list(qualification_gates())
-    optional = [
-        ("environment", ROOT / "scripts" / "env_validate.py"),
-        ("supply-chain", ROOT / "scripts" / "supply_chain_validate.py"),
-        ("public-audit", ROOT / "scripts" / "public_release_audit.py"),
-    ]
-    for name, path in optional:
-        if path.exists():
-            gates.append((name, [sys.executable, str(path.relative_to(ROOT))]))
+    gates.extend(ZEN_PROFILE.final_validator_gates(ROOT, sys.executable))
     gates.append(("diff-check", ["git", "diff", "--check"]))
     return gates
 
@@ -1108,7 +1081,7 @@ def _default_commit_message(state: dict) -> str:
     goal = re.sub(r"[^A-Za-z0-9 ._/-]+", "", goal).strip()
     if len(goal) > 64:
         goal = goal[:61].rstrip() + "..."
-    return f"chore(zen): {goal[0].lower() + goal[1:] if goal else 'ralph plan completion'}"
+    return f"{ZEN_PROFILE.completion_commit_prefix} {goal[0].lower() + goal[1:] if goal else 'ralph plan completion'}"
 
 
 def cmd_checkpoints(_: argparse.Namespace) -> int:
@@ -1855,12 +1828,7 @@ def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex"
 
 
 def qualification_gates() -> list[tuple[str, list[str]]]:
-    py_files = sorted(str(p.relative_to(ROOT)) for base in (ROOT / "app", ROOT / "scripts") if base.exists() for p in base.glob("*.py"))
-    return [
-        ("python-compile", [sys.executable, "-m", "py_compile", *py_files]),
-        ("unit-tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]),
-        ("ux-validator", [sys.executable, "scripts/ux_validate.py"]),
-    ]
+    return ZEN_PROFILE.qualification_gates(ROOT, sys.executable)
 
 
 def run_gates() -> tuple[bool, list[str], str | None, str, dict[str, float]]:
@@ -2152,7 +2120,7 @@ def validate_recovery_paths(paths: Iterable[str], step: dict) -> None:
 
 
 def plan_prompt(goal: str) -> str:
-    return f"""You are planning work for ZEN Control under RALPH-Lite. Inspect the repository read-only.
+    return f"""You are planning work for {ZEN_PROFILE.identity} under RALPH-Lite. Inspect the repository read-only.
 Goal: {goal}
 Return exactly 5-10 ordered, concrete implementation steps. Keep steps small enough to implement and qualify independently.
 For each step choose test_change_policy: none, add-only, or modify. Prefer add-only; use modify only when modifying existing tests is genuinely required.
@@ -2173,7 +2141,7 @@ def step_prompt(state: dict, step: dict, repair_fp: str | None, repair_no: int) 
             + repair_failure_evidence(state, repair_fp)
         )
     prior = context_handoff(state)
-    return f"""Execute exactly ONE approved RALPH-Lite plan step in ZEN Control.
+    return f"""Execute exactly ONE approved RALPH-Lite plan step in {ZEN_PROFILE.identity}.
 Approved plan hash: {state['plan_hash']}
 Step {step['id']}: {step['title']}
 Objective: {step['objective']}

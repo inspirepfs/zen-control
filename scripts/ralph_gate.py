@@ -19,15 +19,20 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from ralph_profile import ZEN_PROFILE
+
 VERSION = "0.2.1"
 SCHEMA = "ralph_human_gate_v1"
 MAX_TEXT = 480
 
-ROOT = Path(__file__).resolve().parents[1]
-RALPH_DIR = ROOT / ".ralph"
-STATE = RALPH_DIR / "state.json"
-JOURNAL = RALPH_DIR / "journal.md"
-LIVE = RALPH_DIR / "live.log"
+ROOT = ZEN_PROFILE.repository_root(__file__)
+RALPH_DIR = ZEN_PROFILE.runtime_directory(ROOT)
+STATE = ZEN_PROFILE.artifact(ROOT, "state")
+JOURNAL = ZEN_PROFILE.artifact(ROOT, "journal")
+LIVE = ZEN_PROFILE.artifact(ROOT, "live")
 
 ANSI = {
     "reset": "\033[0m",
@@ -145,58 +150,16 @@ def _gate_class(reason: str, step_title: str = "") -> str:
 
 
 def _guidance(gate_class: str, reason: str) -> dict[str, list[str]]:
+    # Incident and performance wording is project guidance, not gate behavior.
+    # Keep the profile-owned text/commands intact while this module classifies
+    # controller state and renders the read-only review surface.
     lower = reason.lower()
     if gate_class == "policy_review":
-        return {
-            "actions": [
-                "Compare the requested path/action with the approved step and its test-change policy.",
-                "Use steer for bounded human direction when the objective is still correct; use --allow-new-test only for an exact test path absent at plan approval.",
-                "Retire/re-plan if the approved objective genuinely needs broader existing-file authority.",
-            ],
-            "success": [
-                "The requested change is demonstrably inside the approved step or is explicitly bounded by a human steering record.",
-                "Existing protected/tooling paths and pre-existing tests remain unchanged unless the approved plan already permits them.",
-            ],
-            "forbidden": [
-                "Do not use steering to bypass protected paths, RALPH tooling authority, secrets or existing-test protection.",
-                "Do not broaden the whole step merely to clear one blocked path.",
-            ],
-        }
+        return ZEN_PROFILE.guidance(ZEN_PROFILE.policy_review_guidance)
     if gate_class == "runtime_evidence" and "incident" in lower:
-        return {
-            "actions": [
-                "Review the currently active ZEN incidents and identify the underlying condition.",
-                "Correct the underlying operational condition where appropriate; do not clear evidence merely for release acceptance.",
-                "Run a fresh Incident Monitor scan after the underlying condition has cleared.",
-                "Capture fresh operational diagnostics and verify the Incident Monitor is healthy with zero active incidents.",
-            ],
-            "success": [
-                "Incident Monitor diagnostic state is healthy.",
-                "Active durable incident count is 0.",
-                "Fresh evidence is produced by the normal monitor/diagnostic path.",
-            ],
-            "forbidden": [
-                "Do not disable Incident Monitor to obtain PASS.",
-                "Do not edit/delete the incident database to obtain PASS.",
-                "Do not manufacture or manually rewrite release evidence.",
-            ],
-        }
+        return ZEN_PROFILE.guidance(ZEN_PROFILE.incident_gate_guidance)
     if gate_class == "validation_evidence" and "performance" in lower:
-        return {
-            "actions": [
-                "Exercise the real workload required by the existing performance contract.",
-                "Capture a fresh operator-owned performance snapshot outside the repository.",
-                "Validate it with python3 scripts/perf_acceptance.py ../zen-performance.json.",
-            ],
-            "success": [
-                "All configured request-class sample minima and latency budgets pass.",
-                "Prepared-view effectiveness and mutation-lane evidence pass without threshold relaxation.",
-            ],
-            "forbidden": [
-                "Do not lower sample minima, latency budgets or acceptance thresholds.",
-                "Do not inject synthetic PASS evidence.",
-            ],
-        }
+        return ZEN_PROFILE.guidance(ZEN_PROFILE.performance_gate_guidance)
     return {
         "actions": [
             "Review the blocker summary and the approved step acceptance criteria.",
@@ -312,6 +275,7 @@ def build_gate(state: dict[str, Any]) -> dict[str, Any]:
         "test_change_policy": str(item.get("test_change_policy") or ""),
         "paths": [{"path": path, "origin": _path_origin(state, path)} for path in policy_paths],
     } if gate_class == "policy_review" else {}
+    controller_command = ZEN_PROFILE.controller_display_command(ROOT)
     return {
         "schema": SCHEMA,
         "version": VERSION,
@@ -349,21 +313,21 @@ def build_gate(state: dict[str, Any]) -> dict[str, Any]:
         "resolution_allowed": resolution_allowed,
         "policy": policy_detail,
         "steer": (
-            f"python3 scripts/ralph.py steer {plan_hash} --gate {gate_id} --direction \"<bounded human direction>\""
+            f"{controller_command} steer {plan_hash} --gate {gate_id} --direction \"<bounded human direction>\""
             if plan_hash and gate_class == "policy_review" else ""
         ),
         "resolve": (
-            f"python3 scripts/ralph.py resolve-gate {plan_hash} --gate {gate_id} --reason \"<evidence / action satisfying this gate>\""
+            f"{controller_command} resolve-gate {plan_hash} --gate {gate_id} --reason \"<evidence / action satisfying this gate>\""
             if plan_hash and resolution_allowed else ""
         ),
         "resume": (
-            f"python3 scripts/ralph.py resume {plan_hash} --reason \"<new input requiring Ralph to retry this same step>\""
-            if plan_hash else "python3 scripts/ralph.py resume <plan-hash> --reason \"<reason>\""
+            f"{controller_command} resume {plan_hash} --reason \"<new input requiring Ralph to retry this same step>\""
+            if plan_hash else f"{controller_command} resume <plan-hash> --reason \"<reason>\""
         ),
         "sources": {
-            "state": str(STATE.relative_to(ROOT)),
-            "journal": str(JOURNAL.relative_to(ROOT)),
-            "live": str(LIVE.relative_to(ROOT)),
+            "state": ZEN_PROFILE.relative_path(ROOT, STATE),
+            "journal": ZEN_PROFILE.relative_path(ROOT, JOURNAL),
+            "live": ZEN_PROFILE.relative_path(ROOT, LIVE),
         },
     }
 
@@ -382,13 +346,14 @@ def _rule(title: str) -> list[str]:
 
 
 def _command_lines(gate: dict[str, Any]) -> list[str]:
+    controller_command = ZEN_PROFILE.controller_display_command(ROOT)
     commands: list[str] = []
     if gate.get("class") == "policy_review" and gate.get("steer"):
         commands.extend([gate["steer"], gate["resume"]])
     elif gate.get("resolution_allowed") and gate.get("resolve"):
-        commands.extend([gate["resolve"], "python3 scripts/ralph.py run"])
+        commands.extend([gate["resolve"], f"{controller_command} run"])
     else:
-        commands.extend([gate["resume"], "python3 scripts/ralph.py run"])
+        commands.extend([gate["resume"], f"{controller_command} run"])
     return commands
 
 

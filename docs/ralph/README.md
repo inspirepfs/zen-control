@@ -18,8 +18,12 @@ RALPH does not make RouterOS decisions, access live production systems, read or 
 
 - [Concepts](concepts.md) — plans, digest-bound approval, gates, evidence, and authority.
 - [Architecture](architecture.md) — controller components, persisted records, and trust boundaries.
+- [Split-ready documentation map](architecture/README.md) — core/host routes and intentional documentation duplication.
+- [Lifecycle map](lifecycle/README.md), [state map](state/README.md), [authority map](authority/README.md), and [validation map](validation/README.md) — focused routes into the embedded boundary.
+- [Recovery map](recovery/README.md), [observability map](observability/README.md), and [integration map](integration/README.md) — recovery, evidence, and ZEN adapter ownership.
 - [Authority, validation, and recovery](authority-validation-recovery.md) — who may decide what, how qualification is evidenced, and how to recover safely.
 - [Extraction readiness](extraction/EXTRACTION_READINESS.md) — current ZEN coupling, host-adoption requirements, and the boundary ledger for a future standalone RALPH.
+- [Extraction dry run](extraction/DRY_RUN.md) — actual file dispositions and explicit extraction debt.
 - [Lifecycle](lifecycle.md) — actual controller statuses, transitions, recovery, and finalization.
 - [Reconciliation SITREP](RECONCILIATION_SITREP.md) — documentation maturity, legacy disposition, validation record, and remaining debt for this documentation set.
 - [Historical operator guide](../RALPH-LITE.md) — protected legacy reference; use the lifecycle and operator reference pages here for current behavior. It is retained pending controller-authorized reconciliation.

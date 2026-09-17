@@ -33,16 +33,17 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 import ralph_efficiency as efficiency_policy
 import ralph_model as model_policy
+from ralph_profile import ZEN_PROFILE
 
-ROOT = Path(__file__).resolve().parents[1]
-RALPH = ROOT / ".ralph"
-STATE = RALPH / "state.json"
-EVENTS = RALPH / "events.jsonl"
-LIVE = RALPH / "live.log"
-REPORTS = RALPH / "reports"
-WEB_JOB = RALPH / "web-job.json"
-WEB_LOG = RALPH / "web-run.log"
-RALPH_CLI = ROOT / "scripts" / "ralph.py"
+ROOT = ZEN_PROFILE.repository_root(__file__)
+RALPH = ZEN_PROFILE.runtime_directory(ROOT)
+STATE = ZEN_PROFILE.artifact(ROOT, "state")
+EVENTS = ZEN_PROFILE.artifact(ROOT, "events")
+LIVE = ZEN_PROFILE.artifact(ROOT, "live")
+REPORTS = ZEN_PROFILE.artifact(ROOT, "reports")
+WEB_JOB = ZEN_PROFILE.artifact(ROOT, "web_job")
+WEB_LOG = ZEN_PROFILE.artifact(ROOT, "web_log")
+RALPH_CLI = ZEN_PROFILE.controller_cli(ROOT)
 VERSION = "0.4.0"
 MAX_EVENTS = 240
 MAX_LOG_LINES = 160
@@ -73,7 +74,7 @@ def _read_lines(path: Path, limit: int) -> list[str]:
 
 def _git(args: list[str], *, timeout: int = 8) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args], cwd=ROOT, text=True, capture_output=True,
+        ZEN_PROFILE.git_command(*args), cwd=ZEN_PROFILE.git_worktree(ROOT), text=True, capture_output=True,
         timeout=timeout, check=False,
     )
 
@@ -234,7 +235,12 @@ def _latest_report(state: dict[str, Any]) -> dict[str, Any] | None:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    return {"path": str(path.relative_to(ROOT)), "preview": "\n".join(text.splitlines()[:100])}
+    return {"path": ZEN_PROFILE.relative_path(ROOT, path), "preview": "\n".join(text.splitlines()[:100])}
+
+
+def _controller_command(*argv: str) -> list[str]:
+    """Build an existing controller invocation from the host-project profile."""
+    return [sys.executable, str(ZEN_PROFILE.controller_cli(ROOT)), *argv]
 
 
 def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -258,6 +264,7 @@ def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "schema": "zen_ralph_web_snapshot_v1",
         "version": VERSION,
+        "project": ZEN_PROFILE.project_metadata(ROOT),
         "controller": {
             "status": effective_status,
             "durable_status": durable_status,
@@ -445,7 +452,7 @@ class UsageMonitor:
             return report
 
     def refresh(self) -> dict[str, Any]:
-        command = [sys.executable, str(RALPH_CLI), "usage", "--json", "--no-save", "--include-reset-details"]
+        command = _controller_command("usage", "--json", "--no-save", "--include-reset-details")
         try:
             result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=25, check=False)
             report = json.loads(result.stdout) if result.stdout.strip() else {}
@@ -454,7 +461,7 @@ class UsageMonitor:
             error = str(report.get("live_limit_error") or "").strip() or None
             try:
                 model_result = subprocess.run(
-                    [sys.executable, str(RALPH_CLI), "models", "--json"], cwd=ROOT, text=True,
+                    _controller_command("models", "--json"), cwd=ROOT, text=True,
                     capture_output=True, timeout=20, check=False,
                 )
                 catalog = json.loads(model_result.stdout) if model_result.stdout.strip() else {}
@@ -705,7 +712,7 @@ def _write_web_job(job: dict[str, Any]) -> None:
 
 
 def run_command(request: CommandRequest) -> dict[str, Any]:
-    command = [sys.executable, str(RALPH_CLI), *request.argv]
+    command = _controller_command(*request.argv)
     current = web_job_status()
     if current.get("active") and not request.allow_while_active:
         raise WebConsoleError(f"Ralph action already active ({current.get('activity') or 'RUNNING'})")

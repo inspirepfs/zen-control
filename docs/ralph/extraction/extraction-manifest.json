@@ -1,0 +1,69 @@
+{
+  "schema": "ralph_extraction_manifest_v1",
+  "plan_hash": "e2c3bfa3fbbd27bf9af14c5f4fba18829b4d074f4e1ea09d71cbd2a97d9a55e2",
+  "step": 2,
+  "purpose": "Tracked map of existing repository paths; this is not a package or migration manifest.",
+  "groups": {
+    "core": [
+      "scripts/ralph.py",
+      "scripts/ralph_tui.py",
+      "scripts/ralph_efficiency.py",
+      "scripts/ralph_model.py"
+    ],
+    "adapter": [
+      "scripts/ralph_gate.py",
+      "scripts/ralph_web.py",
+      "scripts/ux_validate.py"
+    ],
+    "test": {
+      "ralph_core": [
+        "tests/test_ralph_lifecycle.py",
+        "tests/test_ralph_lite.py",
+        "tests/test_ralph_retry_hardening.py",
+        "tests/test_ralph_efficiency.py",
+        "tests/test_ralph_model.py"
+      ],
+      "ralph_zen_integration": [
+        "tests/test_ralph_gate.py",
+        "tests/test_ralph_self_hosting.py",
+        "tests/test_ralph_web.py",
+        "tests/test_ralph_web_live_refresh.py"
+      ],
+      "zen": [
+        "tests"
+      ],
+      "future_extraction_boundary": []
+    },
+    "documentation": [
+      "docs/ralph/extraction/BEHAVIOURAL_BASELINE.md",
+      "docs/ralph/extraction/DEPENDENCY_LEDGER.md",
+      "docs/ralph/extraction/EXTRACTION_READINESS.md",
+      "docs/ralph/extraction/CORE_BOUNDARY.md",
+      "docs/ralph/extraction/PROJECT_CONTRACT.md",
+      "docs/ralph/extraction/STATE_OWNERSHIP.md",
+      "docs/ralph/extraction/CONFIGURATION_OWNERSHIP.md",
+      "docs/ralph/extraction/TEST_DISPOSITION.md"
+    ],
+    "runtime-state": [
+      ".ralph/context.json",
+      ".ralph/efficiency-policy.json",
+      ".ralph/events.jsonl",
+      ".ralph/ideas.md",
+      ".ralph/journal.md",
+      ".ralph/live.log",
+      ".ralph/plan.md",
+      ".ralph/policy.md",
+      ".ralph/reports",
+      ".ralph/state.json",
+      ".ralph/usage-ledger.jsonl",
+      ".ralph/web-job.json",
+      ".ralph/web-run.log"
+    ],
+    "review": [
+      "docs/ralph/extraction/CORE_BOUNDARY.md",
+      "docs/ralph/extraction/CONFIGURATION_OWNERSHIP.md",
+      "docs/ralph/extraction/STATE_OWNERSHIP.md",
+      "docs/ralph/extraction/TEST_DISPOSITION.md"
+    ]
+  }
+}

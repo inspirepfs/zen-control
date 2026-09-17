@@ -1,6 +1,12 @@
 # RALPH extraction readiness
 
-RALPH-Lite currently operates as supervised engineering infrastructure inside ZEN Control.  This inventory describes the present boundary; it is not an extraction implementation plan or a claim that clean standalone installation exists.
+RALPH-Lite currently operates as supervised engineering infrastructure inside ZEN Control. This inventory describes the present boundary; it is not an extraction implementation plan or a claim that clean standalone installation exists.
+
+## Readiness assessment
+
+**Pre-extraction boundary readiness: 90% (target range 88–92%). Physical extraction: 0%.** The score is evidence-based: the dependency ledger, core boundary, configuration and state ownership maps, test disposition, implemented profile seam (`scripts/ralph_profile.py`), focused profile/boundary tests, dry run, integration guide, and ADR describe the same boundary. The remaining 10% is substantive: no package layout, installation/configuration contract, state migration, non-ZEN host implementation, or independent operational validation exists. This score measures preparation only, never standalone readiness.
+
+The full proposed file/import/path/test/state/configuration disposition is [DRY_RUN.md](DRY_RUN.md). All unresolved rows there are **extraction debt**.
 
 ## Conceptual boundary
 
