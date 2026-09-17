@@ -63,7 +63,7 @@ class LiveRefreshContractTests(unittest.TestCase):
     def test_unchanged_read_only_output_avoids_rewrites_and_event_scroll(self):
         self.assertIn("if(values.get(kind)===next)", self.page)
         self.assertIn("return false;", self.page)
-        self.assertIn("renderText('report',s.report?.preview||'No completion report yet.')", self.page)
+        self.assertIn("renderReport(s.report)", self.page)
         self.assertIn("renderText('log',(s.live_log||[]).join('\\n')||'No output yet.')", self.page)
         self.assertIn("if(renderHTML('events',events))document.getElementById('events').scrollTop", self.page)
 
@@ -81,7 +81,20 @@ class LiveRefreshContractTests(unittest.TestCase):
         self.assertIn("wins.slice(0,2)", self.page)
         self.assertIn('<details class="plan-comment">', self.page)
         self.assertIn('class="plan-comment-body"', self.page)
+        self.assertIn('class="usage-tokens"', self.page)
+        self.assertIn("-webkit-line-clamp:2", self.page)
+        self.assertIn("minmax(230px,280px)", self.page)
         self.assertIn("max-height:90px;overflow:auto", self.page)
+
+    def test_completion_report_supports_safe_rendered_and_raw_markdown_views(self):
+        self.assertIn('id="reportRenderedButton"', self.page)
+        self.assertIn('id="reportMarkdownButton"', self.page)
+        self.assertIn("let reportMode='rendered'", self.page)
+        self.assertIn("function renderMarkdown(text)", self.page)
+        self.assertIn("function markdownInline(text){let value=esc(text)", self.page)
+        self.assertIn("function setReportMode(mode)", self.page)
+        self.assertIn("renderHTML('reportRendered',renderMarkdown(text))", self.page)
+        self.assertIn("renderText('reportMarkdown',text)", self.page)
 
     def test_polling_interval_and_csrf_action_path_remain_stable(self):
         self.assertIn("refresh();setInterval(refresh,1500);", self.page)
