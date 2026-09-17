@@ -135,6 +135,32 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(gate["test_change_policy"], "add-only")
             self.assertIn("authority mismatch", gate["recommendation"])
 
+    def test_snapshot_exposes_only_matching_controller_self_hosting_candidate(self):
+        with WebHarness() as h:
+            h.state(
+                status="BLOCKED_HUMAN", current_step=3, loop_count=21,
+                block_reason="Codex attempted to change RALPH controller/tooling authority",
+                self_hosting_candidate={
+                    "plan_hash": "a" * 64, "step": 3, "gate_id": "HG-0021-03",
+                    "paths": ["scripts/ralph.py"], "detected_at": "2026-09-17T00:00:00+00:00",
+                },
+            )
+            candidate = web.snapshot()["gate"]["self_hosting_candidate"]
+            self.assertEqual(candidate["paths"], ["scripts/ralph.py"])
+            self.assertEqual(candidate["gate_id"], "HG-0021-03")
+
+    def test_snapshot_hides_stale_or_ordinary_block_candidates(self):
+        with WebHarness() as h:
+            h.state(
+                status="BLOCKED_HUMAN", current_step=3, loop_count=21,
+                block_reason="operator must provide runtime evidence",
+                self_hosting_candidate={
+                    "plan_hash": "a" * 64, "step": 3, "gate_id": "HG-0021-03",
+                    "paths": ["scripts/ralph.py"],
+                },
+            )
+            self.assertNotIn("self_hosting_candidate", web.snapshot()["gate"])
+
     def test_event_tail_is_bounded(self):
         with WebHarness() as h:
             h.state()
@@ -180,6 +206,66 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertEqual(req.argv[:3], ["steer", "b" * 64, "--gate"])
         self.assertIn("HG-0021-03", req.argv)
         self.assertIn("--allow-new-test", req.argv)
+
+    def self_hosting_state(self):
+        return {
+            "status": "BLOCKED_HUMAN",
+            "plan_hash": "b" * 64,
+            "current_step": 3,
+            "loop_count": 21,
+            "block_reason": "Codex attempted to change RALPH controller/tooling authority",
+            "self_hosting_candidate": {
+                "plan_hash": "b" * 64,
+                "step": 3,
+                "gate_id": "HG-0021-03",
+                "paths": ["scripts/ralph.py", "scripts/ralph_web.py"],
+            },
+        }
+
+    def test_self_hosting_action_delegates_exact_controller_candidate(self):
+        req = web.command_for_action({
+            "action": "authorize_self_hosting",
+            "gate": "HG-0021-03",
+            "paths": ["scripts/ralph_web.py", "scripts/ralph.py"],
+            "reason": "bounded operator approval",
+        }, self.self_hosting_state())
+        self.assertEqual(req.argv[:4], ["authorize-self-hosting", "b" * 64, "--gate", "HG-0021-03"])
+        self.assertEqual(req.argv.count("--path"), 2)
+        self.assertIn("scripts/ralph.py", req.argv)
+        self.assertIn("scripts/ralph_web.py", req.argv)
+        self.assertEqual(req.argv[-2:], ["--reason", "bounded operator approval"])
+
+    def test_self_hosting_action_rejects_broadened_or_narrowed_paths(self):
+        state = self.self_hosting_state()
+        for paths in (["scripts/ralph.py"], ["scripts/ralph.py", "scripts/ralph_web.py", "tests/test_ralph_web.py"]):
+            with self.subTest(paths=paths):
+                with self.assertRaisesRegex(web.WebConsoleError, "exactly match"):
+                    web.command_for_action({
+                        "action": "authorize_self_hosting",
+                        "gate": "HG-0021-03",
+                        "paths": paths,
+                        "reason": "bounded operator approval",
+                    }, state)
+
+    def test_self_hosting_action_requires_reason_and_matching_gate(self):
+        state = self.self_hosting_state()
+        with self.assertRaisesRegex(web.WebConsoleError, "reason is required"):
+            web.command_for_action({
+                "action": "authorize_self_hosting", "gate": "HG-0021-03",
+                "paths": state["self_hosting_candidate"]["paths"],
+            }, state)
+        with self.assertRaisesRegex(web.WebConsoleError, "does not match current gate"):
+            web.command_for_action({
+                "action": "authorize_self_hosting", "gate": "HG-9999-99",
+                "paths": state["self_hosting_candidate"]["paths"],
+                "reason": "bounded operator approval",
+            }, state)
+
+    def test_page_contains_self_hosting_control_and_persistent_feedback(self):
+        self.assertIn("Authorize Self-Hosting", web.PAGE)
+        self.assertIn("submitSelfHosting", web.PAGE)
+        self.assertIn("renderActionFailure", web.PAGE)
+        self.assertIn("data-self-host-path", web.PAGE)
 
     def test_reconciliation_actions_are_explicit(self):
         with self.assertRaises(web.WebConsoleError):

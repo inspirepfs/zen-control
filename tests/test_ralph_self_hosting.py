@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -105,6 +106,13 @@ class AuthorizeSelfHostingCommandTests(unittest.TestCase):
                 },
             }
         )
+        state["self_hosting_candidate"] = {
+            "plan_hash": "plan-123",
+            "step": 2,
+            "gate_id": "HG-0007-02",
+            "paths": ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"],
+            "detected_at": "2026-09-17T00:00:00+00:00",
+        }
         return state
 
     def call(self, state, paths):
@@ -138,6 +146,7 @@ class AuthorizeSelfHostingCommandTests(unittest.TestCase):
         self.assertEqual(grant["paths"], ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"])
         self.assertEqual(state["status"], "APPROVED")
         self.assertIsNone(state["block_reason"])
+        self.assertIsNone(state["self_hosting_candidate"])
         self.assertEqual(state["human_steering"][-1]["self_hosting_paths"], grant["paths"])
 
     def test_command_refuses_runtime_state(self):
@@ -150,11 +159,62 @@ class AuthorizeSelfHostingCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "registered RALPH tooling"):
             self.call(state, ["app/main.py"])
 
+    def test_command_refuses_paths_that_do_not_match_controller_candidate(self):
+        state = self.base_state()
+        with self.assertRaisesRegex(RuntimeError, "exactly match the controller-derived candidate"):
+            self.call(state, ["scripts/ralph.py"])
+
     def test_command_only_works_for_exact_authority_block(self):
         state = self.base_state()
         state["block_reason"] = "policy violation: protected paths ['secrets/x']"
         with self.assertRaisesRegex(RuntimeError, "only for the current RALPH tooling authority block"):
             self.call(state, ["scripts/ralph.py"])
+
+
+class SandboxEnvironmentClassificationTests(unittest.TestCase):
+    def test_command_output_with_detector_source_is_not_environment_failure(self):
+        output = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "aggregated_output": (
+                    'return "bwrap:" in text and "setting up uid map: permission denied" in text'
+                ),
+            },
+        })
+        error_output = ralph.codex_environment_error_output(output)
+        self.assertEqual(error_output, "")
+        self.assertFalse(ralph.is_bwrap_bootstrap_failure(error_output))
+
+    def test_agent_content_with_markers_is_not_environment_failure(self):
+        output = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "bwrap: failed RTM_NEWADDR appears in repository source",
+            },
+        })
+        self.assertEqual(ralph.codex_environment_error_output(output), "")
+
+    def test_turn_failed_bwrap_message_is_environment_failure(self):
+        output = json.dumps({
+            "type": "turn.failed",
+            "error": {"message": "bwrap: setting up uid map: permission denied"},
+        })
+        error_output = ralph.codex_environment_error_output(output)
+        self.assertTrue(ralph.is_bwrap_bootstrap_failure(error_output))
+
+    def test_top_level_error_bwrap_message_is_environment_failure(self):
+        output = json.dumps({"type": "error", "message": "bwrap: failed RTM_NEWADDR"})
+        error_output = ralph.codex_environment_error_output(output)
+        self.assertTrue(ralph.is_bwrap_bootstrap_failure(error_output))
+
+    def test_raw_process_bwrap_failure_is_environment_failure(self):
+        error_output = ralph.codex_environment_error_output(
+            "bwrap: write failed /proc/self/uid_map"
+        )
+        self.assertTrue(ralph.is_bwrap_bootstrap_failure(error_output))
+
 
 
 class BootstrapSourceFlowTests(unittest.TestCase):
@@ -186,8 +246,21 @@ class BootstrapSourceFlowTests(unittest.TestCase):
 
     def test_successful_step_expires_active_grant(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
-        marker = 'state["self_hosting_grant"] = None\n            state["current_step"] += 1'
-        self.assertIn(marker, source)
+        grant = source.index('state["self_hosting_grant"] = None')
+        candidate = source.index('state["self_hosting_candidate"] = None', grant)
+        advance = source.index('state["current_step"] += 1', candidate)
+        self.assertLess(grant, candidate)
+        self.assertLess(candidate, advance)
+
+    def test_authority_block_persists_controller_candidate_after_restoration(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        restore = source.index("restore_authority(authority)")
+        candidate_paths = source.index("candidate_paths = sorted", restore)
+        candidate_state = source.index('state["self_hosting_candidate"] = candidate', candidate_paths)
+        blocked = source.index('block(state, "Codex attempted to change RALPH controller/tooling authority")', candidate_state)
+        self.assertLess(restore, candidate_paths)
+        self.assertLess(candidate_paths, candidate_state)
+        self.assertLess(candidate_state, blocked)
 
 
 if __name__ == "__main__":

@@ -192,6 +192,7 @@ def default_state() -> dict:
         "human_steering": [],
         "steering_allowed_new_tests": [],
         "self_hosting_grant": None,
+        "self_hosting_candidate": None,
         "self_hosting_grant_history": [],
         "step_results": [],
         "final_qualification": None,
@@ -1597,6 +1598,34 @@ def is_bwrap_bootstrap_failure(output: str) -> bool:
     )
 
 
+def codex_environment_error_output(output: str) -> str:
+    """Extract only process/turn errors eligible for sandbox classification."""
+    errors: list[str] = []
+    for raw in output.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            if is_bwrap_bootstrap_failure(stripped):
+                errors.append(stripped)
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type == "turn.failed":
+            error = event.get("error") if isinstance(event.get("error"), dict) else {}
+            message = str(error.get("message") or "").strip()
+            if message:
+                errors.append(message)
+        elif event_type == "error":
+            message = str(event.get("message") or "").strip()
+            if message:
+                errors.append(message)
+    return "\n".join(errors)
+
+
 class EnvironmentBlocked(RuntimeError):
     """Environment prerequisite failed; metrics are retained if a turn had already started."""
 
@@ -1645,10 +1674,11 @@ def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex"
         returncode, output, metrics = stream_codex_process(command)
         metrics["codex_seconds"] = time.monotonic() - started
 
-        if is_bwrap_bootstrap_failure(output):
+        environment_error = codex_environment_error_output(output)
+        if is_bwrap_bootstrap_failure(environment_error):
             raise EnvironmentBlocked(
                 "Codex default sandbox failed inside the model turn; automatic legacy fallback is disabled: "
-                + normalize_failure(output)[-1200:],
+                + normalize_failure(environment_error)[-1200:],
                 metrics=metrics,
             )
         if returncode != 0:
@@ -2632,7 +2662,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     )
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None})
+    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "self_hosting_candidate": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None})
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
@@ -2957,6 +2987,21 @@ def cmd_authorize_self_hosting(args: argparse.Namespace) -> int:
     if not requested:
         raise RuntimeError("authorize-self-hosting requires at least one exact --path")
 
+    candidate = state.get("self_hosting_candidate") if isinstance(state.get("self_hosting_candidate"), dict) else {}
+    candidate_paths = sorted({_normalize_repo_path(str(path)) for path in candidate.get("paths") or [] if str(path).strip()})
+    if (
+        str(candidate.get("plan_hash") or "") != str(state.get("plan_hash") or "")
+        or int(candidate.get("step") or 0) != step_no
+        or str(candidate.get("gate_id") or "") != expected_gate
+        or not candidate_paths
+    ):
+        raise RuntimeError("self-hosting candidate is missing or stale for the current plan/step/gate")
+    if sorted(requested) != candidate_paths:
+        raise RuntimeError(
+            "self-hosting paths must exactly match the controller-derived candidate: "
+            f"{candidate_paths}"
+        )
+
     grant = {
         "plan_hash": state.get("plan_hash"),
         "step": step_no,
@@ -2968,6 +3013,7 @@ def cmd_authorize_self_hosting(args: argparse.Namespace) -> int:
     history = state.get("self_hosting_grant_history") if isinstance(state.get("self_hosting_grant_history"), list) else []
     state["self_hosting_grant_history"] = [*history[-19:], grant]
     state["self_hosting_grant"] = grant
+    state["self_hosting_candidate"] = None
 
     steering = state.get("human_steering") if isinstance(state.get("human_steering"), list) else []
     steering_record = {
@@ -3198,6 +3244,23 @@ def cmd_run(args: argparse.Namespace) -> int:
             if not granted:
                 restore_authority(authority)
                 state = load_state()
+                candidate_paths = sorted(
+                    path for path in changed_authority
+                    if path != ".ralph"
+                    and not path.startswith(".ralph/")
+                    and not is_protected_path(path)
+                    and is_tooling_path(path)
+                )
+                candidate = None
+                if candidate_paths:
+                    candidate = {
+                        "plan_hash": state.get("plan_hash"),
+                        "step": int(step["id"]),
+                        "gate_id": gate_id_for_state(state),
+                        "paths": candidate_paths,
+                        "detected_at": utc_now(),
+                    }
+                state["self_hosting_candidate"] = candidate
                 detail = f"authority paths {changed_authority}"
                 reason = f"Codex changed {detail}; original contents restored; {grant_reason}"
                 live_write(reason, "POLICY")
@@ -3307,6 +3370,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 tokens=stats,
             ))
             state["self_hosting_grant"] = None
+            state["self_hosting_candidate"] = None
             state["current_step"] += 1
             state["status"] = "APPROVED"
             save_state(state)
