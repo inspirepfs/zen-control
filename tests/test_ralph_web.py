@@ -197,6 +197,18 @@ class SnapshotTests(unittest.TestCase):
                     self.assertNotIn("self_hosting_candidate", gate)
                     self.assertNotIn("authority_block", gate)
 
+    def test_snapshot_reports_active_web_operation_without_mutating_durable_state(self):
+        with WebHarness() as h:
+            h.state(status="READY_TO_COMMIT")
+            web.WEB_JOB.write_text(json.dumps({
+                "active": True, "mode": "foreground", "pid": 999,
+                "activity": "COMMITTING", "argv": ["finalize", "abc", "--commit"],
+            }), encoding="utf-8")
+            snap = web.snapshot()
+            self.assertEqual(snap["controller"]["status"], "COMMITTING")
+            self.assertEqual(snap["controller"]["durable_status"], "READY_TO_COMMIT")
+            self.assertEqual(snap["job"]["activity"], "COMMITTING")
+
     def test_event_tail_is_bounded(self):
         with WebHarness() as h:
             h.state()
@@ -214,6 +226,19 @@ class ActionAuthorityTests(unittest.TestCase):
         request = web.command_for_action({"action": "run", "max_loops": 999}, self.base_state())
         self.assertTrue(request.background)
         self.assertEqual(request.argv[-1], "40")
+
+    def test_actions_expose_immediate_operational_state(self):
+        cases = [
+            ({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "IDLE"}, "PLANNING"),
+            ({"action": "run"}, self.base_state("APPROVED"), "RUNNING"),
+            ({"action": "requalify"}, self.base_state("READY_TO_COMMIT"), "QUALIFYING"),
+            ({"action": "finalize_review"}, self.base_state("READY_TO_COMMIT"), "REVIEWING"),
+            ({"action": "finalize_commit", "confirm": "COMMIT"}, self.base_state("READY_TO_COMMIT"), "COMMITTING"),
+            ({"action": "finalize_push", "confirm": "PUSH"}, self.base_state("COMMITTED"), "PUSHING"),
+        ]
+        for payload, state, activity in cases:
+            with self.subTest(action=payload["action"]):
+                self.assertEqual(web.command_for_action(payload, state).activity, activity)
 
     def test_propose_requires_idle_like_state_and_goal(self):
         req = web.command_for_action({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "IDLE"})
@@ -517,6 +542,25 @@ class HttpSurfaceTests(unittest.TestCase):
         self.assertIn("actionResult", page)
         self.assertNotIn("alert((j.stdout", page)
         self.assertNotIn("X-RALPH-AUTH", page)
+        human = page.index('<section class="card span12"><h2>Human Control</h2>')
+        progress = page.index('<section class="card span12"><h2>Plan Progress</h2>')
+        live = page.index('<section class="card span9"><h2>Live Activity</h2>')
+        files = page.index('<section class="card span3"><h2>Plan Files</h2>')
+        report = page.index('<section class="card span12"><h2>Completion Report</h2>')
+        output = page.index('<section class="card span12"><h2>Controller Output</h2>')
+        self.assertLess(human, progress)
+        self.assertLess(progress, live)
+        self.assertLess(live, files)
+        self.assertLess(files, report)
+        self.assertLess(report, output)
+        self.assertIn('grid-template-columns:repeat(6,minmax(0,1fr))', page)
+        self.assertIn('class="plan-comment"', page)
+        self.assertIn('class="plan-comment-body"', page)
+        self.assertIn("function actionState(action)", page)
+        self.assertIn("'QUALIFYING'", page)
+        self.assertIn("'REVIEWING'", page)
+        self.assertIn("'COMMITTING'", page)
+        self.assertIn("'PUSHING'", page)
 
 
 class BackgroundJobTests(unittest.TestCase):

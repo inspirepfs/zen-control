@@ -67,6 +67,22 @@ class LiveRefreshContractTests(unittest.TestCase):
         self.assertIn("renderText('log',(s.live_log||[]).join('\\n')||'No output yet.')", self.page)
         self.assertIn("if(renderHTML('events',events))document.getElementById('events').scrollTop", self.page)
 
+    def test_operator_actions_publish_transient_state_before_waiting_for_controller(self):
+        self.assertIn("function actionState(action)", self.page)
+        self.assertIn("showActionState(action);const j=await post(p)", self.page)
+        self.assertIn("localActionState||c.status", self.page)
+        self.assertIn("QUALIFYING", self.page)
+        self.assertIn("REVIEWING", self.page)
+        self.assertIn("COMMITTING", self.page)
+        self.assertIn("PUSHING", self.page)
+
+    def test_usage_layout_is_compact_and_plan_comments_expand_in_place(self):
+        self.assertIn("usage-grid{display:grid;grid-template-columns:repeat(6", self.page)
+        self.assertIn("wins.slice(0,2)", self.page)
+        self.assertIn('<details class="plan-comment">', self.page)
+        self.assertIn('class="plan-comment-body"', self.page)
+        self.assertIn("max-height:90px;overflow:auto", self.page)
+
     def test_polling_interval_and_csrf_action_path_remain_stable(self):
         self.assertIn("refresh();setInterval(refresh,1500);", self.page)
         self.assertIn(

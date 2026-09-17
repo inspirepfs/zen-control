@@ -113,6 +113,8 @@ def web_job_status() -> dict[str, Any]:
     job = _read_json(WEB_JOB, {})
     if not isinstance(job, dict) or not job:
         return {"active": False}
+    if str(job.get("mode") or "background") == "foreground":
+        return {**job, "active": bool(job.get("active"))}
     pid = int(job.get("pid") or 0)
     active = _process_alive(pid)
     if job.get("active") and not active:
@@ -242,11 +244,15 @@ def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
     efficiency = state.get("last_efficiency") if isinstance(state.get("last_efficiency"), dict) else {}
     plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
     steering = state.get("human_steering") if isinstance(state.get("human_steering"), list) else []
+    job = web_job_status()
+    durable_status = str(state.get("status") or "IDLE")
+    effective_status = str(job.get("activity") or durable_status) if job.get("active") else durable_status
     return {
         "schema": "zen_ralph_web_snapshot_v1",
         "version": VERSION,
         "controller": {
-            "status": str(state.get("status") or "IDLE"),
+            "status": effective_status,
+            "durable_status": durable_status,
             "plan_hash": state.get("plan_hash"),
             "current_step": int(state.get("current_step") or 0),
             "step_count": len(plan.get("steps") or []),
@@ -280,7 +286,7 @@ def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
             "last_event_at": ledger.get("last_event_at"),
         },
         "git": git_snapshot(),
-        "job": web_job_status(),
+        "job": job,
         "report": _latest_report(state),
         "events": event_tail(),
         "live_log": _read_lines(WEB_LOG if WEB_LOG.exists() else LIVE, MAX_LOG_LINES),
@@ -477,6 +483,7 @@ class CommandRequest:
     argv: list[str]
     background: bool = False
     confirm: str | None = None
+    activity: str | None = None
 
 
 def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> CommandRequest:
@@ -496,17 +503,17 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
             raise WebConsoleError(f"cannot propose while status={status}")
         if len(goal) < 20:
             raise WebConsoleError("proposal goal must be at least 20 characters")
-        return CommandRequest(["propose", "--goal", goal], background=True)
+        return CommandRequest(["propose", "--goal", goal], background=True, activity="PLANNING")
     if not plan_hash:
         raise WebConsoleError("active plan hash is required")
     if action == "approve":
-        return CommandRequest(["approve", plan_hash])
+        return CommandRequest(["approve", plan_hash], activity="APPROVING")
     if action == "reject":
-        return CommandRequest(["reject", plan_hash, "--reason", reason()])
+        return CommandRequest(["reject", plan_hash, "--reason", reason()], activity="REJECTING")
     if action == "run":
         max_loops = int(payload.get("max_loops") or 40)
         max_loops = max(1, min(max_loops, 40))
-        return CommandRequest(["run", "--color", "never", "--max-loops", str(max_loops)], background=True)
+        return CommandRequest(["run", "--color", "never", "--max-loops", str(max_loops)], background=True, activity="RUNNING")
     if action == "steer":
         gate = str(payload.get("gate") or "").strip()
         direction = " ".join(str(payload.get("direction") or "").split())
@@ -517,14 +524,14 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
             item = str(item).strip()
             if item:
                 argv += ["--allow-new-test", item]
-        return CommandRequest(argv)
+        return CommandRequest(argv, activity="STEERING")
     if action == "resume":
-        return CommandRequest(["resume", plan_hash, "--reason", reason()])
+        return CommandRequest(["resume", plan_hash, "--reason", reason()], activity="RESUMING")
     if action == "resolve_gate":
         gate = str(payload.get("gate") or "").strip()
         if not gate:
             raise WebConsoleError("gate is required")
-        return CommandRequest(["resolve-gate", plan_hash, "--gate", gate, "--reason", reason()])
+        return CommandRequest(["resolve-gate", plan_hash, "--gate", gate, "--reason", reason()], activity="RESOLVING")
     if action == "authorize_self_hosting":
         # This action is bound exclusively to the state snapshot that the
         # authenticated /api/action handler just reread.  In particular, do
@@ -558,19 +565,19 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
         for path in candidate_paths:
             argv += ["--path", path]
         argv += ["--reason", reason()]
-        return CommandRequest(argv)
+        return CommandRequest(argv, activity="AUTHORIZING")
     if action == "retire":
         if str(payload.get("confirm") or "") != "RETIRE":
             raise WebConsoleError("retire requires confirm=RETIRE")
-        return CommandRequest(["retire-plan", plan_hash, "--reason", reason()], confirm="RETIRE")
+        return CommandRequest(["retire-plan", plan_hash, "--reason", reason()], confirm="RETIRE", activity="RETIRING")
     if action == "report":
-        return CommandRequest(["report", plan_hash])
+        return CommandRequest(["report", plan_hash], activity="REPORTING")
     if action == "requalify":
         if status != "READY_TO_COMMIT":
             raise WebConsoleError("requalify requires READY_TO_COMMIT")
-        return CommandRequest(["requalify", plan_hash], background=True)
+        return CommandRequest(["requalify", plan_hash], background=True, activity="QUALIFYING")
     if action == "finalize_review":
-        return CommandRequest(["finalize", plan_hash])
+        return CommandRequest(["finalize", plan_hash], activity="REVIEWING")
     if action == "finalize_commit":
         if str(payload.get("confirm") or "") != "COMMIT":
             raise WebConsoleError("commit requires confirm=COMMIT")
@@ -578,34 +585,40 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
         message = " ".join(str(payload.get("message") or "").split())
         if message:
             argv += ["--message", message]
-        return CommandRequest(argv, confirm="COMMIT")
+        return CommandRequest(argv, confirm="COMMIT", activity="COMMITTING")
     if action == "finalize_push":
         if str(payload.get("confirm") or "") != "PUSH":
             raise WebConsoleError("push requires confirm=PUSH")
-        return CommandRequest(["finalize", plan_hash, "--push"], confirm="PUSH")
+        return CommandRequest(["finalize", plan_hash, "--push"], confirm="PUSH", activity="PUSHING")
     if action == "reconcile_commit":
         if str(payload.get("confirm") or "") != "ADOPT":
             raise WebConsoleError("reconcile-commit requires confirm=ADOPT")
         commit = str(payload.get("commit") or "").strip()
         if not commit:
             raise WebConsoleError("commit SHA is required")
-        return CommandRequest(["reconcile-commit", plan_hash, "--commit", commit, "--reason", reason()], confirm="ADOPT")
+        return CommandRequest(["reconcile-commit", plan_hash, "--commit", commit, "--reason", reason()], confirm="ADOPT", activity="RECONCILING")
     if action == "reconcile_push":
         if str(payload.get("confirm") or "") != "PUSHED":
             raise WebConsoleError("reconcile-push requires confirm=PUSHED")
-        return CommandRequest(["reconcile-push", plan_hash], confirm="PUSHED")
+        return CommandRequest(["reconcile-push", plan_hash], confirm="PUSHED", activity="RECONCILING")
     raise WebConsoleError(f"unsupported action: {action or '-'}")
+
+
+def _write_web_job(job: dict[str, Any]) -> None:
+    RALPH.mkdir(parents=True, exist_ok=True)
+    WEB_JOB.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def run_command(request: CommandRequest) -> dict[str, Any]:
     command = [sys.executable, str(RALPH_CLI), *request.argv]
+    current = web_job_status()
+    if current.get("active"):
+        raise WebConsoleError(f"Ralph action already active ({current.get('activity') or 'RUNNING'})")
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    activity = str(request.activity or "WORKING")
     if request.background:
-        job = web_job_status()
-        if job.get("active"):
-            raise WebConsoleError(f"background Ralph job already active (pid={job.get('pid')})")
         RALPH.mkdir(parents=True, exist_ok=True)
         log_handle = WEB_LOG.open("a", encoding="utf-8")
-        started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         log_handle.write(f"\n=== WEB JOB {started} :: {' '.join(request.argv[:3])} ===\n")
         log_handle.flush()
         proc = subprocess.Popen(
@@ -614,14 +627,32 @@ def run_command(request: CommandRequest) -> dict[str, Any]:
         )
         job = {
             "active": True,
+            "mode": "background",
             "pid": proc.pid,
             "argv": request.argv,
+            "activity": activity,
             "started_at": started,
         }
-        WEB_JOB.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _write_web_job(job)
         log_handle.close()
-        return {"ok": True, "background": True, "pid": proc.pid, "argv": request.argv}
-    result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=60, check=False)
+        return {"ok": True, "background": True, "pid": proc.pid, "argv": request.argv, "activity": activity}
+
+    job = {
+        "active": True,
+        "mode": "foreground",
+        "pid": os.getpid(),
+        "argv": request.argv,
+        "activity": activity,
+        "started_at": started,
+    }
+    _write_web_job(job)
+    try:
+        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=60, check=False)
+    finally:
+        finished = dict(job)
+        finished["active"] = False
+        finished["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        _write_web_job(finished)
     return {
         "ok": result.returncode == 0,
         "background": False,
@@ -629,6 +660,7 @@ def run_command(request: CommandRequest) -> dict[str, Any]:
         "stdout": result.stdout[-12000:],
         "stderr": result.stderr[-8000:],
         "argv": request.argv,
+        "activity": activity,
     }
 
 
@@ -637,9 +669,9 @@ PAGE = r'''<!doctype html>
 <title>RALPH-Lite</title>
 <style>
 :root{color-scheme:dark;--bg:#081018;--panel:#101b26;--panel2:#0c151e;--text:#dce7f2;--muted:#8495a7;--green:#5ee19a;--yellow:#f4ca64;--red:#ff6b73;--blue:#6ab7ff;--cyan:#61d7e6;--magenta:#c98aff;--line:#263647;--shadow:0 10px 28px rgba(0,0,0,.28)}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}.wrap{width:min(100%,2400px);max-width:2400px;margin:auto;padding:14px 22px}.top{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:center;margin-bottom:12px}.brand{font-size:22px;font-weight:800}.sub{color:var(--muted)}.badge{display:inline-block;padding:4px 8px;border:1px solid var(--line);border-radius:999px;margin:2px}.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}.info{color:var(--cyan)}.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:12px;padding:12px;box-shadow:var(--shadow);min-width:0}.span3{grid-column:span 3}.span4{grid-column:span 4}.span5{grid-column:span 5}.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span9{grid-column:span 9}.span12{grid-column:span 12}h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--cyan);margin:0 0 9px}h3{font-size:14px;margin:8px 0 5px}.metric{font-size:27px;font-weight:800}.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px}.kv>div:nth-child(odd){color:var(--muted)}.usage-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.usage-box{background:#08131d;border:1px solid var(--line);border-radius:9px;padding:10px;min-width:0}.usage-value{font-size:22px;font-weight:800}.usage-windows,.plan-usage{display:grid;gap:5px;margin-top:9px}.usage-row{display:grid;grid-template-columns:120px 1fr 1fr 1fr;gap:8px;padding:6px 8px;background:#08131d;border-radius:6px}.usage-row>span:first-child{font-weight:700}.steps{display:grid;gap:6px}.step{border-left:3px solid var(--line);padding:7px 9px;background:#0a131c}.step.PASS,.step.ACCEPTED,.step.HUMAN_CONFIRMED{border-color:var(--green)}.step.CURRENT{border-color:var(--cyan)}.step.PENDING{border-color:#39495a}.step-title{font-weight:700}.small{font-size:12px;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#071019;border:1px solid var(--line);border-radius:8px;padding:9px;max-height:460px;overflow:auto;margin:0}.events{height:600px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#071019}.event{padding:5px 9px;border-bottom:1px solid #132131}.READ{color:var(--blue)}.EDIT,.WARN,.POLICY{color:var(--yellow)}.CREATE,.PASS,.COMPLETE,.READY{color:var(--green)}.DELETE,.FAIL,.ERROR,.ENV{color:var(--red)}.BLOCKED,.STEER,.GATE-HUMAN{color:var(--magenta)}.RUN,.CMD,.COMMAND,.GATE,.VALIDATE,.CHECKPOINT,.USAGE{color:var(--cyan)}button{font:inherit;background:#172535;color:var(--text);border:1px solid #395069;border-radius:7px;padding:8px 11px;cursor:pointer;min-height:38px}button:hover{border-color:var(--cyan)}button.danger{border-color:#7a3138;color:#ff9ba1}button.good{border-color:#2d7350;color:#8bf0b7}input,textarea{width:100%;font:inherit;background:#071019;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px}textarea{min-height:90px}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.form{display:grid;gap:7px}.notice{padding:9px;border-left:3px solid var(--cyan);background:#09141e;margin:8px 0}.gate{border-left-color:var(--magenta)}.errorbox{border-left-color:var(--red)}.file{color:var(--blue)}.criteria{margin:6px 0 0 20px;padding:0}.criteria li{margin:3px 0}.action-result{margin-top:10px;padding:9px;background:#08131d;border:1px solid var(--line);border-radius:8px}.action-result:empty{display:none}.action-result .action-title{font-weight:800;color:var(--green);margin-bottom:5px}.pretty-object{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:3px 10px}.pretty-object>div:nth-child(odd){color:var(--muted)}.footer{margin:12px 0;color:var(--muted);font-size:12px}
-@media(max-width:1150px){.span3{grid-column:span 6}.span4,.span5,.span6,.span7,.span8,.span9{grid-column:span 12}.usage-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.usage-row{grid-template-columns:100px 1fr 1fr}}
-@media(max-width:720px){body{font-size:13px}.wrap{padding:8px}.top{grid-template-columns:1fr;gap:7px}.top>div:last-child{text-align:left}.brand{font-size:20px}.grid{gap:8px}.card,.span3,.span4,.span5,.span6,.span7,.span8,.span9,.span12{grid-column:span 12;padding:10px}.usage-grid{grid-template-columns:1fr}.usage-row{grid-template-columns:1fr 1fr;gap:4px}.usage-row>span:first-child{grid-column:1/-1}.events{height:340px}pre{max-height:300px}button{min-height:44px;flex:1 1 auto}input,textarea{font-size:16px}.metric{font-size:23px}.kv{grid-template-columns:110px minmax(0,1fr)}.footer{padding-bottom:max(8px,env(safe-area-inset-bottom))}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}.wrap{width:min(100%,2400px);max-width:2400px;margin:auto;padding:14px 22px}.top{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:center;margin-bottom:12px}.brand{font-size:22px;font-weight:800}.sub{color:var(--muted)}.badge{display:inline-block;padding:4px 8px;border:1px solid var(--line);border-radius:999px;margin:2px}.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}.info{color:var(--cyan)}.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:12px;padding:12px;box-shadow:var(--shadow);min-width:0}.span3{grid-column:span 3}.span4{grid-column:span 4}.span5{grid-column:span 5}.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span9{grid-column:span 9}.span12{grid-column:span 12}h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--cyan);margin:0 0 9px}h3{font-size:14px;margin:8px 0 5px}.metric{font-size:27px;font-weight:800}.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px}.kv>div:nth-child(odd){color:var(--muted)}.usage-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px}.usage-box{background:#08131d;border:1px solid var(--line);border-radius:8px;padding:7px 8px;min-width:0}.usage-value{font-size:18px;font-weight:800;line-height:1.15}.usage-window .usage-value{font-size:16px}.usage-windows{display:none}.plan-usage{display:grid;gap:1px;margin-top:4px}.usage-row{display:grid;grid-template-columns:110px 90px 170px minmax(0,1fr);gap:6px;padding:3px 6px;background:#08131d;border-radius:4px;align-items:center}.usage-row>span:first-child{font-weight:700}.plan-comment{min-width:0}.plan-comment summary{cursor:pointer;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;list-style:none}.plan-comment summary::-webkit-details-marker{display:none}.plan-comment summary::before{content:'▸ ';color:var(--cyan)}.plan-comment[open] summary::before{content:'▾ '}.plan-comment-body{max-height:90px;overflow:auto;margin-top:4px;padding:5px 7px;background:#071019;border:1px solid var(--line);border-radius:5px;color:var(--text)}.steps{display:grid;gap:6px}.step{border-left:3px solid var(--line);padding:7px 9px;background:#0a131c}.step.PASS,.step.ACCEPTED,.step.HUMAN_CONFIRMED{border-color:var(--green)}.step.CURRENT{border-color:var(--cyan)}.step.PENDING{border-color:#39495a}.step-title{font-weight:700}.small{font-size:12px;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#071019;border:1px solid var(--line);border-radius:8px;padding:9px;max-height:460px;overflow:auto;margin:0}.events{height:600px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#071019}.event{padding:5px 9px;border-bottom:1px solid #132131}.READ{color:var(--blue)}.EDIT,.WARN,.POLICY{color:var(--yellow)}.CREATE,.PASS,.COMPLETE,.READY{color:var(--green)}.DELETE,.FAIL,.ERROR,.ENV{color:var(--red)}.BLOCKED,.STEER,.GATE-HUMAN{color:var(--magenta)}.RUN,.CMD,.COMMAND,.GATE,.VALIDATE,.CHECKPOINT,.USAGE{color:var(--cyan)}button{font:inherit;background:#172535;color:var(--text);border:1px solid #395069;border-radius:7px;padding:8px 11px;cursor:pointer;min-height:38px}button:hover{border-color:var(--cyan)}button.danger{border-color:#7a3138;color:#ff9ba1}button.good{border-color:#2d7350;color:#8bf0b7}input,textarea{width:100%;font:inherit;background:#071019;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px}textarea{min-height:90px}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.form{display:grid;gap:7px}.notice{padding:9px;border-left:3px solid var(--cyan);background:#09141e;margin:8px 0}.gate{border-left-color:var(--magenta)}.errorbox{border-left-color:var(--red)}.file{color:var(--blue)}.criteria{margin:6px 0 0 20px;padding:0}.criteria li{margin:3px 0}.action-result{margin-top:10px;padding:9px;background:#08131d;border:1px solid var(--line);border-radius:8px}.action-result:empty{display:none}.action-result .action-title{font-weight:800;color:var(--green);margin-bottom:5px}.pretty-object{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:3px 10px}.pretty-object>div:nth-child(odd){color:var(--muted)}.footer{margin:12px 0;color:var(--muted);font-size:12px}
+@media(max-width:1150px){.span3{grid-column:span 6}.span4,.span5,.span6,.span7,.span8,.span9{grid-column:span 12}.usage-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.usage-row{grid-template-columns:100px 80px 150px minmax(0,1fr)}}
+@media(max-width:720px){body{font-size:13px}.wrap{padding:8px}.top{grid-template-columns:1fr;gap:7px}.top>div:last-child{text-align:left}.brand{font-size:20px}.grid{gap:8px}.card,.span3,.span4,.span5,.span6,.span7,.span8,.span9,.span12{grid-column:span 12;padding:10px}.usage-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.usage-row{grid-template-columns:1fr 1fr;gap:3px}.usage-row>span:first-child{grid-column:1/-1}.plan-comment{grid-column:1/-1}.events{height:340px}pre{max-height:300px}button{min-height:44px;flex:1 1 auto}input,textarea{font-size:16px}.metric{font-size:23px}.kv{grid-template-columns:110px minmax(0,1fr)}.footer{padding-bottom:max(8px,env(safe-area-inset-bottom))}}
 </style></head><body><div class="wrap">
 <div class="top"><div><div class="brand">RALPH-Lite <span id="version" class="info"></span></div><div class="sub">Operator console · CLI/TUI remains authoritative</div></div><div><span id="refresh" class="badge">connecting</span><span id="job" class="badge">job -</span><button onclick="logout()">Logout</button></div></div>
 <div id="error"></div><div class="grid">
@@ -648,12 +680,12 @@ PAGE = r'''<!doctype html>
 <section class="card span3"><h2>Quota / Efficiency</h2><div id="quota" class="metric">-</div><div id="eff" class="kv"></div></section>
 <section class="card span3"><h2>Git</h2><div id="branch" class="metric">-</div><div id="git" class="kv"></div></section>
 <section class="card span12"><h2>Usage / Token Economy</h2><div id="usageSummary" class="usage-grid"></div><div id="usageWindows" class="usage-windows"></div><h3>Consumption by plan</h3><div id="planUsage" class="plan-usage"></div></section>
-<section class="card span8"><h2>Plan Progress</h2><div id="goal" class="notice"></div><div id="steps" class="steps"></div></section>
-<section class="card span4"><h2>Human Control</h2><div id="gate"></div><div id="controls"></div><div id="actionResult" class="action-result"></div></section>
+<section class="card span12"><h2>Human Control</h2><div id="gate"></div><div id="controls"></div><div id="actionResult" class="action-result"></div></section>
+<section class="card span12"><h2>Plan Progress</h2><div id="goal" class="notice"></div><div id="steps" class="steps"></div></section>
 <section class="card span9"><h2>Live Activity</h2><div id="events" class="events"></div></section>
 <section class="card span3"><h2>Plan Files</h2><div id="files"></div></section>
-<section class="card span6"><h2>Completion Report</h2><pre id="report">No completion report yet.</pre></section>
-<section class="card span6"><h2>Controller Output</h2><pre id="log">No output yet.</pre></section>
+<section class="card span12"><h2>Completion Report</h2><pre id="report">No completion report yet.</pre></section>
+<section class="card span12"><h2>Controller Output</h2><pre id="log">No output yet.</pre></section>
 </div><div class="footer">Private-LAN mode uses username/password + HttpOnly session + CSRF + exact Host validation · no force-push or policy bypass is exposed</div></div>
 <script>
 const CSRF='__CSRF__';
@@ -662,7 +694,7 @@ function kv(obj){return Object.entries(obj).map(([k,v])=>`<div>${esc(k)}</div><d
 function num(v){return Number(v||0).toLocaleString();}
 function when(epoch){if(!epoch)return 'unknown';return new Date(Number(epoch)*1000).toLocaleString();}
 function stripAnsi(s){return String(s||'').replace(/\x1b\[[0-9;]*m/g,'');}
-const renderedValues=new WeakMap(),pendingTargetUpdates=new Map();let renderedControlsIdentity=null,latestSnapshot=null,refreshGeneration=0,actionFeedback=null;
+const renderedValues=new WeakMap(),pendingTargetUpdates=new Map();let renderedControlsIdentity=null,latestSnapshot=null,refreshGeneration=0,actionFeedback=null,localActionState=null;
 function selectionIntersectsTarget(target){const selection=window.getSelection();if(!target||!selection||selection.isCollapsed||!selection.rangeCount)return false;for(let i=0;i<selection.rangeCount;i++){try{if(selection.getRangeAt(i).intersectsNode(target))return true;}catch(_e){}}return false;}
 function valuesFor(target){let values=renderedValues.get(target);if(!values){values=new Map();renderedValues.set(target,values);}return values;}
 function pendingFor(target){let updates=pendingTargetUpdates.get(target);if(!updates){updates=new Map();pendingTargetUpdates.set(target,updates);}return updates;}
@@ -681,15 +713,17 @@ function renderActionFailure(action,message){actionFeedback={action,error:messag
 function renderSelfHostingReview(){const context=document.getElementById('selfHostingContext');if(context&&!context.dataset.reviewed){context.dataset.reviewed='true';context.insertAdjacentHTML('beforebegin','<div class="small">You are granting authority over named RALPH tooling paths. Review every displayed candidate before submission.</div>');}}
 async function post(payload){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json','X-RALPH-CSRF':CSRF},body:JSON.stringify(payload)});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||j.stderr||'action failed');return j;}
 function controlButton(label,action,extra={},cls=''){return `<button class="${cls}" onclick='act(${JSON.stringify(action)},${JSON.stringify(extra)})'>${esc(label)}</button>`;}
-async function act(action,extra={}){try{let p={action,...extra};if(['reject','resume','resolve_gate','retire'].includes(action)){const reason=prompt('Reason / evidence:');if(!reason)return;p.reason=reason;}if(action==='retire'){if(prompt('Type RETIRE to confirm')!=='RETIRE')return;p.confirm='RETIRE';}if(action==='finalize_commit'){if(prompt('Type COMMIT to confirm')!=='COMMIT')return;p.confirm='COMMIT';}if(action==='finalize_push'){if(prompt('Type PUSH to confirm')!=='PUSH')return;p.confirm='PUSH';}const j=await post(p);renderActionResult(action,j);await refresh();}catch(e){renderActionFailure(action,e.message);}}
-async function submitGoal(){const goal=document.getElementById('goalInput').value.trim();if(!goal)return;try{await post({action:'propose',goal});await refresh();}catch(e){showError(e.message);}}
+function actionState(action){return ({propose:'PLANNING',approve:'APPROVING',reject:'REJECTING',run:'RUNNING',steer:'STEERING',resume:'RESUMING',resolve_gate:'RESOLVING',retire:'RETIRING',authorize_self_hosting:'AUTHORIZING',requalify:'QUALIFYING',finalize_review:'REVIEWING',finalize_commit:'COMMITTING',finalize_push:'PUSHING'})[action]||'WORKING';}
+function showActionState(action){localActionState=actionState(action);renderText('status',localActionState);renderClass('job','badge info');renderText('job',localActionState.toLowerCase());}
+async function act(action,extra={}){try{let p={action,...extra};if(['reject','resume','resolve_gate','retire'].includes(action)){const reason=prompt('Reason / evidence:');if(!reason)return;p.reason=reason;}if(action==='retire'){if(prompt('Type RETIRE to confirm')!=='RETIRE')return;p.confirm='RETIRE';}if(action==='finalize_commit'){if(prompt('Type COMMIT to confirm')!=='COMMIT')return;p.confirm='COMMIT';}if(action==='finalize_push'){if(prompt('Type PUSH to confirm')!=='PUSH')return;p.confirm='PUSH';}showActionState(action);const j=await post(p);renderActionResult(action,j);await refresh();}catch(e){renderActionFailure(action,e.message);}finally{localActionState=null;}}
+async function submitGoal(){const goal=document.getElementById('goalInput').value.trim();if(!goal)return;try{showActionState('propose');await post({action:'propose',goal});await refresh();}catch(e){renderActionFailure('propose',e.message);}finally{localActionState=null;}}
 async function submitSteer(){const direction=document.getElementById('steerInput').value.trim();const gate=document.getElementById('gateId').textContent.trim();if(!direction)return;try{await post({action:'steer',gate,direction});await refresh();}catch(e){showError(e.message);}}
 async function submitSelfHosting(){const authority=latestSnapshot?.gate?.authority_block;const context=authority?{gate:String(authority.gate_id||''),paths:[...(authority.paths||[])]}:null;const reason=document.getElementById('selfHostingReason')?.value.trim()||'';const button=document.getElementById('selfHostingButton');const allowed=new Set(context?.paths||[]);const paths=[...document.querySelectorAll('input[data-self-host-path]:checked')].map(x=>x.value).filter(path=>allowed.has(path));if(!context){renderActionFailure('authorize_self_hosting','The controller self-hosting candidate is no longer available.');return;}if(!reason){renderActionFailure('authorize_self_hosting','Operator reason is required.');return;}if(paths.length!==context.paths.length){renderActionFailure('authorize_self_hosting','Select every controller candidate path before authorizing this exact grant.');return;}if(button)button.disabled=true;try{const j=await post({action:'authorize_self_hosting',gate:context.gate,paths,reason});renderActionResult('authorize_self_hosting',j,context.paths);await refresh();}catch(e){renderActionFailure('authorize_self_hosting',e.message);}finally{if(button)button.disabled=false;}}
 async function logout(){try{await fetch('/api/logout',{method:'POST',headers:{'X-RALPH-CSRF':CSRF}});}finally{location.reload();}}
 function showError(msg){renderHTML('error',`<div class="notice errorbox">${esc(msg)}</div>`);}
-function renderControls(s){const c=s.controller,g=s.gate;let out='';const st=c.status;const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);if(identity===renderedControlsIdentity)return;renderedControlsIdentity=identity;if(['IDLE','PLAN_COMPLETE','PUSHED'].includes(st)){out=`<div class="form"><textarea id="goalInput" placeholder="Describe the bounded engineering goal..."></textarea><button class="good" onclick="submitGoal()">Propose plan</button></div>`;}else if(st==='AWAITING_APPROVAL'){out=`<div class="notice"><b>Approval review</b><br><span class="small">Read every proposed step, objective, acceptance criterion and test-change policy before granting execution authority.</span></div><div class="actions">${controlButton('Approve plan','approve',{},'good')}${controlButton('Reject','reject',{},'danger')}</div>`;}else if(['APPROVED','RUNNING','PAUSED_USAGE_LIMIT'].includes(st)){out=`<div class="actions">${controlButton('Run approved plan','run',{max_loops:40},'good')}</div>`;}else if(st==='BLOCKED_HUMAN'){const authority=g?.authority_block;if(authority){const pathRows=(authority.paths||[]).map(path=>`<label><input type="checkbox" data-self-host-path value="${esc(path)}" checked> <span class="file">${esc(path)}</span></label>`).join('');const reviewText=`Controller self-hosting authority block\nPlan hash: ${authority.plan_hash}\nStep: ${authority.step}\nGate: ${authority.gate_id}\nCandidate paths:\n${(authority.paths||[]).join('\n')}`;out=`<div class="notice gate"><b>Supervised self-hosting authority</b><br><span class="small">Controller-reported context only; the controller decides eligibility and grant validity.</span></div><div class="form"><textarea id="selfHostingContext" readonly aria-label="Controller self-hosting authority block">${esc(reviewText)}</textarea>${pathRows}<textarea id="selfHostingReason" placeholder="Operator reason for this exact self-hosting grant..."></textarea><button id="selfHostingButton" class="good" onclick="submitSelfHosting()">Authorize Self-Hosting</button><div class="actions">${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}else{out=`<div class="form"><textarea id="steerInput" placeholder="Bounded human direction for this exact gate..."></textarea><button onclick="submitSteer()">Steer & retry</button><div class="actions">${controlButton('Resume retry','resume')}${controlButton('Resolve delegated gate','resolve_gate',{gate:g?.id||''},'good')}${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}}else if(st==='READY_TO_COMMIT'){out=`<div class="actions">${controlButton('Requalify delta','requalify')}${controlButton('Finalization review','finalize_review')}${controlButton('Commit qualified delta','finalize_commit',{},'good')}</div>`;}else if(st==='COMMITTED'){out=`<div class="actions">${controlButton('Push to configured upstream','finalize_push',{},'good')}</div>`;}else{out=`<div class="small">No web action for state ${esc(st)}. Use the CLI for exceptional recovery.</div>`;}const controls=document.getElementById('controls');renderedValues.delete(controls);renderHTML('controls',out);}
-function renderUsage(u){const p=u.current_plan||{};const ratio=p.input_tokens?((Number(p.cached_input_tokens||0)/Number(p.input_tokens))*100):0;renderHTML('usageSummary',`<div class="usage-box"><div class="small">Plan input</div><div class="usage-value">${num(p.input_tokens)}</div><div class="small">non-cached ${num(p.noncached_input_tokens)}</div></div><div class="usage-box"><div class="small">Plan output</div><div class="usage-value">${num(p.output_tokens)}</div><div class="small">reasoning ${num(p.reasoning_output_tokens)}</div></div><div class="usage-box"><div class="small">Cached input</div><div class="usage-value">${num(p.cached_input_tokens)}</div><div class="small">cache ${ratio.toFixed(1)}%</div></div><div class="usage-box"><div class="small">Observed turns</div><div class="usage-value">${num(p.turns)}</div><div class="small">${esc(u.model||'-')} · ${esc(u.plan_type||'-')}</div></div>`);const wins=u.windows||[];renderHTML('usageWindows',wins.map(w=>{const t=w.observed_tokens||{};return `<div class="usage-row"><span>${esc(w.name||w.slot||'window')}</span><span>${Number(w.remaining_percent??0).toFixed(1)}% left</span><span>in ${num(t.input_tokens)} · out ${num(t.output_tokens)}</span><span>reset ${esc(when(w.resets_at))}</span></div>`;}).join('')||'<div class="small">Live quota windows are refreshing…</div>');renderHTML('planUsage',(u.plans||[]).slice(0,8).map(x=>`<div class="usage-row"><span>${esc((x.plan_hash||'unassigned').slice(0,8))}</span><span>${num(x.turns)} turns</span><span>in ${num(x.input_tokens)} · out ${num(x.output_tokens)}</span><span>${esc((x.goal||'').slice(0,80))}</span></div>`).join('')||'<div class="small">No v0.3.2 usage-ledger history yet.</div>');}
-function render(s){const c=s.controller,p=s.plan,g=s.git,j=s.job,u=s.usage||{};renderText('version','v'+s.version);renderText('status',c.status);renderHTML('controller',kv({plan:(c.plan_hash||'-').slice(0,16),step:`${c.current_step}/${c.step_count||'-'}`,loops:c.loop_count,recovery:c.recovery_checkpoint||'-'}));renderText('planMetric',`${Math.min(c.current_step,c.step_count||0)}/${c.step_count||'-'}`);renderHTML('planMeta',kv({steering:c.steering_count,commit:(c.commit_sha||'-').slice(0,12),upstream:c.push_upstream||'-'}));renderText('quota',c.quota_remaining_percent==null?'-':c.quota_remaining_percent.toFixed(1)+'%');renderHTML('eff',kv({efficiency:c.efficiency,job:j.active?`RUNNING pid ${j.pid}`:'idle',limits:u.captured_at||'refreshing'}));renderText('branch',g.branch);renderHTML('git',kv({upstream:g.upstream||'-',dirty:g.dirty?`${g.dirty_count} files`:'clean',head:(g.head||'-').slice(0,12)}));renderUsage(u);renderText('goal',p.goal||'No active plan.');renderHTML('steps',p.steps.map(x=>`<div class="step ${esc(x.state)}"><div class="step-title">${x.id}. ${esc(x.title)} <span class="badge">${esc(x.state)}</span></div><div>${esc(x.objective)}</div><div class="small">Test changes: ${esc(x.test_change_policy)}</div>${(x.acceptance||[]).length?`<div class="small"><b>Acceptance criteria</b></div><ul class="criteria">${x.acceptance.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>`:''}</div>`).join('')||'<div class="small">No plan steps.</div>');renderHTML('gate',s.gate?`<div class="notice gate"><div><b id="gateId">${esc(s.gate.id)}</b> · Step ${s.gate.step}</div><div class="step-title">${esc(s.gate.title||'Human review')}</div><div class="small">${s.gate.policy_review?'POLICY / AUTHORITY REVIEW':'OPERATOR EVIDENCE REVIEW'} · tests=${esc(s.gate.test_change_policy)}</div><h3>Why Ralph stopped</h3>${prettyOutput(s.gate.block_reason)}${(s.gate.acceptance||[]).length?`<h3>Acceptance criteria</h3><ul class="criteria">${s.gate.acceptance.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>`:''}${s.gate.authority_block?`<h3>Controller self-hosting authority block</h3><div>${(s.gate.authority_block.paths||[]).map(path=>`<div class="file">${esc(path)}</div>`).join('')}</div><div class="small">Plan ${esc(s.gate.authority_block.plan_hash||'')} · step ${esc(s.gate.authority_block.step)} · gate ${esc(s.gate.authority_block.gate_id||'')}</div>`:''}<h3>Recommended action</h3><div>${esc(s.gate.recommendation||'Review the evidence and choose a bounded operator action.')}</div></div>`:'<div class="small">No open human gate.</div>');renderControls(s);const events=s.events.map(e=>`<div class="event ${esc(e.category||'')}"><b>${esc(e.category||'EVENT')}</b> ${esc(e.message||'')}</div>`).join('');if(renderHTML('events',events))document.getElementById('events').scrollTop=document.getElementById('events').scrollHeight;renderHTML('files',(c.plan_changed_files||[]).map(x=>`<div class="file">${esc(x)}</div>`).join('')||'<div class="small">No recorded plan files yet.</div>');renderText('report',s.report?.preview||'No completion report yet.');renderText('log',(s.live_log||[]).join('\n')||'No output yet.');renderText('job',j.active?`job RUNNING ${j.pid}`:'job idle');renderClass('job','badge '+(j.active?'info':''));renderText('refresh','live');renderClass('refresh','badge ok');}
+function renderControls(s){const c=s.controller,g=s.gate;let out='';const st=c.status;const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);if(identity===renderedControlsIdentity)return;renderedControlsIdentity=identity;if(['PLANNING','APPROVING','REJECTING','STEERING','RESUMING','RESOLVING','RETIRING','AUTHORIZING','QUALIFYING','REVIEWING','COMMITTING','PUSHING','RECONCILING','REPORTING','WORKING'].includes(st)){out=`<div class="notice"><b>${esc(st)}</b><br><span class="small">Controller action in progress. Controls will return when the authoritative operation completes.</span></div>`;}else if(['IDLE','PLAN_COMPLETE','PUSHED'].includes(st)){out=`<div class="form"><textarea id="goalInput" placeholder="Describe the bounded engineering goal..."></textarea><button class="good" onclick="submitGoal()">Propose plan</button></div>`;}else if(st==='AWAITING_APPROVAL'){out=`<div class="notice"><b>Approval review</b><br><span class="small">Read every proposed step, objective, acceptance criterion and test-change policy before granting execution authority.</span></div><div class="actions">${controlButton('Approve plan','approve',{},'good')}${controlButton('Reject','reject',{},'danger')}</div>`;}else if(['APPROVED','RUNNING','PAUSED_USAGE_LIMIT'].includes(st)){out=`<div class="actions">${controlButton('Run approved plan','run',{max_loops:40},'good')}</div>`;}else if(st==='BLOCKED_HUMAN'){const authority=g?.authority_block;if(authority){const pathRows=(authority.paths||[]).map(path=>`<label><input type="checkbox" data-self-host-path value="${esc(path)}" checked> <span class="file">${esc(path)}</span></label>`).join('');const reviewText=`Controller self-hosting authority block\nPlan hash: ${authority.plan_hash}\nStep: ${authority.step}\nGate: ${authority.gate_id}\nCandidate paths:\n${(authority.paths||[]).join('\n')}`;out=`<div class="notice gate"><b>Supervised self-hosting authority</b><br><span class="small">Controller-reported context only; the controller decides eligibility and grant validity.</span></div><div class="form"><textarea id="selfHostingContext" readonly aria-label="Controller self-hosting authority block">${esc(reviewText)}</textarea>${pathRows}<textarea id="selfHostingReason" placeholder="Operator reason for this exact self-hosting grant..."></textarea><button id="selfHostingButton" class="good" onclick="submitSelfHosting()">Authorize Self-Hosting</button><div class="actions">${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}else{out=`<div class="form"><textarea id="steerInput" placeholder="Bounded human direction for this exact gate..."></textarea><button onclick="submitSteer()">Steer & retry</button><div class="actions">${controlButton('Resume retry','resume')}${controlButton('Resolve delegated gate','resolve_gate',{gate:g?.id||''},'good')}${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}}else if(st==='READY_TO_COMMIT'){out=`<div class="actions">${controlButton('Requalify delta','requalify')}${controlButton('Finalization review','finalize_review')}${controlButton('Commit qualified delta','finalize_commit',{},'good')}</div>`;}else if(st==='COMMITTED'){out=`<div class="actions">${controlButton('Push to configured upstream','finalize_push',{},'good')}</div>`;}else{out=`<div class="small">No web action for state ${esc(st)}. Use the CLI for exceptional recovery.</div>`;}const controls=document.getElementById('controls');renderedValues.delete(controls);renderHTML('controls',out);}
+function renderUsage(u){const p=u.current_plan||{};const ratio=p.input_tokens?((Number(p.cached_input_tokens||0)/Number(p.input_tokens))*100):0;const wins=u.windows||[];const metrics=[`<div class="usage-box"><div class="small">Plan input</div><div class="usage-value">${num(p.input_tokens)}</div><div class="small">non-cached ${num(p.noncached_input_tokens)}</div></div>`,`<div class="usage-box"><div class="small">Plan output</div><div class="usage-value">${num(p.output_tokens)}</div><div class="small">reasoning ${num(p.reasoning_output_tokens)}</div></div>`,`<div class="usage-box"><div class="small">Cached input</div><div class="usage-value">${num(p.cached_input_tokens)}</div><div class="small">cache ${ratio.toFixed(1)}%</div></div>`,`<div class="usage-box"><div class="small">Observed turns</div><div class="usage-value">${num(p.turns)}</div><div class="small">${esc(u.model||'-')} · ${esc(u.plan_type||'-')}</div></div>`];for(const w of wins.slice(0,2)){const t=w.observed_tokens||{};metrics.push(`<div class="usage-box usage-window"><div class="small">${esc(w.name||w.slot||'window')}</div><div class="usage-value">${Number(w.remaining_percent??0).toFixed(1)}% left</div><div class="small">reset ${esc(when(w.resets_at))}</div><div class="small">in ${num(t.input_tokens)} · out ${num(t.output_tokens)}</div></div>`);}renderHTML('usageSummary',metrics.join(''));renderHTML('usageWindows','');renderHTML('planUsage',(u.plans||[]).slice(0,8).map(x=>{const goal=String(x.goal||'No plan comment recorded.');const shortGoal=goal.length>72?goal.slice(0,69)+'…':goal;return `<div class="usage-row"><span>${esc((x.plan_hash||'unassigned').slice(0,8))}</span><span>${num(x.turns)} turns</span><span>in ${num(x.input_tokens)} · out ${num(x.output_tokens)}</span><details class="plan-comment"><summary title="${esc(goal)}">${esc(shortGoal)}</summary><div class="plan-comment-body">${esc(goal)}</div></details></div>`;}).join('')||'<div class="small">No v0.3.2 usage-ledger history yet.</div>');}
+function render(s){const c=s.controller,p=s.plan,g=s.git,j=s.job,u=s.usage||{};renderText('version','v'+s.version);renderText('status',localActionState||c.status);renderHTML('controller',kv({plan:(c.plan_hash||'-').slice(0,16),step:`${c.current_step}/${c.step_count||'-'}`,loops:c.loop_count,recovery:c.recovery_checkpoint||'-'}));renderText('planMetric',`${Math.min(c.current_step,c.step_count||0)}/${c.step_count||'-'}`);renderHTML('planMeta',kv({steering:c.steering_count,commit:(c.commit_sha||'-').slice(0,12),upstream:c.push_upstream||'-'}));renderText('quota',c.quota_remaining_percent==null?'-':c.quota_remaining_percent.toFixed(1)+'%');renderHTML('eff',kv({efficiency:c.efficiency,job:j.active?`${j.activity||'RUNNING'} pid ${j.pid}`:'idle',limits:u.captured_at||'refreshing'}));renderText('branch',g.branch);renderHTML('git',kv({upstream:g.upstream||'-',dirty:g.dirty?`${g.dirty_count} files`:'clean',head:(g.head||'-').slice(0,12)}));renderUsage(u);renderText('goal',p.goal||'No active plan.');renderHTML('steps',p.steps.map(x=>`<div class="step ${esc(x.state)}"><div class="step-title">${x.id}. ${esc(x.title)} <span class="badge">${esc(x.state)}</span></div><div>${esc(x.objective)}</div><div class="small">Test changes: ${esc(x.test_change_policy)}</div>${(x.acceptance||[]).length?`<div class="small"><b>Acceptance criteria</b></div><ul class="criteria">${x.acceptance.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>`:''}</div>`).join('')||'<div class="small">No plan steps.</div>');renderHTML('gate',s.gate?`<div class="notice gate"><div><b id="gateId">${esc(s.gate.id)}</b> · Step ${s.gate.step}</div><div class="step-title">${esc(s.gate.title||'Human review')}</div><div class="small">${s.gate.policy_review?'POLICY / AUTHORITY REVIEW':'OPERATOR EVIDENCE REVIEW'} · tests=${esc(s.gate.test_change_policy)}</div><h3>Why Ralph stopped</h3>${prettyOutput(s.gate.block_reason)}${(s.gate.acceptance||[]).length?`<h3>Acceptance criteria</h3><ul class="criteria">${s.gate.acceptance.map(a=>`<li>${esc(a)}</li>`).join('')}</ul>`:''}${s.gate.authority_block?`<h3>Controller self-hosting authority block</h3><div>${(s.gate.authority_block.paths||[]).map(path=>`<div class="file">${esc(path)}</div>`).join('')}</div><div class="small">Plan ${esc(s.gate.authority_block.plan_hash||'')} · step ${esc(s.gate.authority_block.step)} · gate ${esc(s.gate.authority_block.gate_id||'')}</div>`:''}<h3>Recommended action</h3><div>${esc(s.gate.recommendation||'Review the evidence and choose a bounded operator action.')}</div></div>`:'<div class="small">No open human gate.</div>');renderControls(s);const events=s.events.map(e=>`<div class="event ${esc(e.category||'')}"><b>${esc(e.category||'EVENT')}</b> ${esc(e.message||'')}</div>`).join('');if(renderHTML('events',events))document.getElementById('events').scrollTop=document.getElementById('events').scrollHeight;renderHTML('files',(c.plan_changed_files||[]).map(x=>`<div class="file">${esc(x)}</div>`).join('')||'<div class="small">No recorded plan files yet.</div>');renderText('report',s.report?.preview||'No completion report yet.');renderText('log',(s.live_log||[]).join('\n')||'No output yet.');renderText('job',localActionState?localActionState.toLowerCase():(j.active?`${String(j.activity||'RUNNING').toLowerCase()} pid ${j.pid}`:'job idle'));renderClass('job','badge '+(j.active?'info':''));renderText('refresh','live');renderClass('refresh','badge ok');}
 async function refresh(){const generation=++refreshGeneration;try{const r=await fetch('/api/snapshot',{cache:'no-store'});if(r.status===401){location.reload();return;}if(!r.ok)throw new Error('snapshot '+r.status);const s=await r.json();if(generation!==refreshGeneration)return;latestSnapshot=s;render(latestSnapshot);renderSelfHostingReview();renderActionFeedback();renderHTML('error','');}catch(e){if(generation!==refreshGeneration)return;renderText('refresh','offline');renderClass('refresh','badge bad');showError(e.message);}}
 refresh();setInterval(refresh,1500);
 </script></body></html>'''
