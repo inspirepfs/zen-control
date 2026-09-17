@@ -76,6 +76,7 @@ TOOLING_PATHS = {
     "tests/test_ralph_lite.py",
     "tests/test_ralph_gate.py",
     "tests/test_ralph_lifecycle.py",
+    "tests/test_ralph_retry_hardening.py",
     "docs/RALPH-LITE.md",
 }
 
@@ -110,7 +111,7 @@ RESULT_SCHEMA = {
         "ideas": {"type": "array", "items": {"type": "string"}},
         "blockers": {"type": "array", "items": {"type": "string"}},
         "needs_human": {"type": "boolean"},
-        "blocker_class": {"type": "string", "enum": ["none", "validation-only", "human-decision", "policy"]},
+        "blocker_class": {"type": "string", "enum": ["none", "validation-only", "continuation", "human-decision", "policy"]},
         "validation_notes": {"type": "array", "items": {"type": "string"}},
         "context": {
             "type": "object",
@@ -1719,13 +1720,104 @@ def codex_requires_human_before_gates(result: dict, step: dict | None = None) ->
     if declared and _step_explicitly_delegates_human_gate(step):
         return True, declared
 
-    if blocker_class == "validation-only":
+    if blocker_class in {"validation-only", "continuation"}:
         return False, ""
     if blocker_class in {"human-decision", "policy"} or result.get("needs_human"):
         return True, "; ".join(blockers or [declared or "Codex requested human review"])
     if blockers:
         return True, "; ".join(blockers)
     return False, ""
+
+
+def codex_requests_continuation(result: dict, step: dict | None = None) -> tuple[bool, str]:
+    """Recognise ordinary bounded continuation without manufacturing a human gate.
+
+    A model turn may exhaust its per-turn command/inspection budget while staying
+    entirely inside the approved step. That is controller scheduling, not new
+    human authority. The explicit continuation class is preferred; a narrow text
+    fallback covers the false-human-gate wording observed in live use.
+    """
+    blocker_class = str(result.get("blocker_class") or "none")
+    blockers = [str(item).strip() for item in (result.get("blockers") or []) if str(item).strip()]
+    summary = str(result.get("summary") or "").strip()
+    text = " ".join([summary, *blockers]).lower()
+
+    if _declared_human_block(result) and _step_explicitly_delegates_human_gate(step):
+        return False, ""
+
+    if blocker_class == "continuation":
+        reason = "; ".join(blockers) or summary or "approved step requires another bounded implementation turn"
+        return True, reason
+
+    continuation_markers = (
+        "another shell execution",
+        "further shell execution",
+        "additional shell execution",
+        "another model turn",
+        "additional model turn",
+        "another implementation turn",
+        "additional implementation turn",
+        "new loop/retry",
+        "another loop/retry",
+        "command budget",
+    )
+    authority_markers = (
+        "policy violation",
+        "protected path",
+        "protected-path",
+        "secret",
+        "credential",
+        "operator evidence",
+        "runtime evidence",
+        "human judgement",
+        "human judgment",
+        "operator decision",
+        "choose between",
+    )
+    if any(marker in text for marker in continuation_markers) and not any(
+        marker in text for marker in authority_markers
+    ):
+        reason = "; ".join(blockers) or summary or "approved step requires another bounded implementation turn"
+        return True, reason
+    return False, ""
+
+
+def reset_failure_epoch_after_human_steer(state: dict) -> dict | None:
+    """Start a fresh bounded repair epoch only after genuine retry exhaustion."""
+    active = str(state.get("active_failure") or "").strip()
+    reason = str(state.get("block_reason") or "").lower()
+    if not active or active.lower() not in reason:
+        return None
+    if "repair attempt" not in reason and "persisted through" not in reason and "exceeded" not in reason:
+        return None
+    attempts = state.setdefault("failure_attempts", {})
+    previous = int(attempts.get(active, 0))
+    attempts[active] = 0
+    return {"fingerprint": active, "previous_attempts": previous, "new_attempts": 0}
+
+
+def repair_failure_evidence(state: dict, repair_fp: str | None) -> str:
+    """Return bounded authoritative failure evidence for the next repair turn."""
+    if not repair_fp:
+        return ""
+    failure = state.get("last_failure") if isinstance(state.get("last_failure"), dict) else {}
+    if str(failure.get("fingerprint") or "") != str(repair_fp):
+        return ""
+    gates = [str(item) for item in (failure.get("gates") or []) if str(item).strip()]
+    output = normalize_failure(str(failure.get("output") or ""))
+    parts = [
+        "Authoritative controller failure evidence for this repair:",
+        f"- fingerprint: {repair_fp}",
+    ]
+    if gates:
+        parts.append("- gates: " + "; ".join(gates))
+    if output:
+        parts.append("- normalized failure:\n" + output[-3000:])
+    parts.append(
+        "Repair the failing evidence above first. Do not churn already-green "
+        "subsystems merely because they are related to the approved step."
+    )
+    return "\n".join(parts)
 
 
 def is_recoverable_validation_block(reason: str) -> bool:
@@ -1788,7 +1880,11 @@ Do not execute or edit anything. Respect .ralph/policy.md. Put discovered nice-t
 def step_prompt(state: dict, step: dict, repair_fp: str | None, repair_no: int) -> str:
     repair_text = ""
     if repair_fp:
-        repair_text = f"\nThis is repair attempt {repair_no} for failure fingerprint {repair_fp}. Fix the failure without weakening qualification."
+        repair_text = (
+            f"\nThis is repair attempt {repair_no} for failure fingerprint {repair_fp}. "
+            "Fix the failure without weakening qualification.\n"
+            + repair_failure_evidence(state, repair_fp)
+        )
     prior = context_handoff(state)
     return f"""Execute exactly ONE approved RALPH-Lite plan step in ZEN Control.
 Approved plan hash: {state['plan_hash']}
@@ -1806,7 +1902,7 @@ Compact handoff from the previous successful loop:
 
 CONTEXT-EFFICIENCY RULES:
 - Start from the handoff's relevant_files and accepted_findings; do not rediscover accepted facts unless this step directly invalidates them.
-- HARD BUDGET: use at most {PROMPT_COMMAND_BUDGET} shell command executions for this implementation turn. If safe completion genuinely needs more, return needs_human=true with a blocker instead of continuing exploration.
+- HARD BUDGET: use at most {PROMPT_COMMAND_BUDGET} shell command executions for this implementation turn. If safe completion genuinely needs another normal implementation/shell turn while remaining inside this approved step, return blocker_class="continuation", needs_human=false, explain the next bounded action in blockers, and stop this turn. The controller will schedule another loop without creating a human gate.
 - Batch related reads into one discovery command. Prefer rg -n plus narrow sed/range reads or targeted symbols; do not repeatedly read whole large files.
 - Aim for one discovery bundle, one implementation/edit bundle, and no more than two focused validation commands. The external controller runs the full authoritative gates.
 - Python command contract: use `python3` (or the repository's explicit interpreter), never bare `python`.
@@ -1818,7 +1914,7 @@ CONTEXT-EFFICIENCY RULES:
 
 Read .ralph/policy.md and obey it. Do not edit any file under .ralph. Do not interact with live RouterOS, secrets, credentials, or external production systems. Stay inside the repository. Do not disable, skip, delete, or weaken qualification to obtain a pass. Make only changes necessary for this step. You may run focused local tests while working, but the external controller will run authoritative gates afterwards.
 If you discover useful out-of-scope work, return it in ideas and continue the approved step rather than implementing it.
-Use blocker_class="human-decision" only when genuine human judgement is required and blocker_class="policy" only when safe completion would break policy. In those cases return needs_human=true with blockers. If the APPROVED acceptance explicitly says missing operator/runtime evidence must stop at BLOCKED_HUMAN, treat absent required evidence as blocker_class="human-decision", needs_human=true, and put the exact evidence/action in blockers; never classify that condition as validation-only. Otherwise use blocker_class="none" (or "validation-only" as described above).
+Use blocker_class="continuation", needs_human=false only for ordinary additional work inside the already-approved step when the current bounded turn is exhausted. Use blocker_class="human-decision" only when genuine human judgement is required and blocker_class="policy" only when safe completion would break policy. In those cases return needs_human=true with blockers. If the APPROVED acceptance explicitly says missing operator/runtime evidence must stop at BLOCKED_HUMAN, treat absent required evidence as blocker_class="human-decision", needs_human=true, and put the exact evidence/action in blockers; never classify that condition as validation-only or continuation. Otherwise use blocker_class="none" (or "validation-only" as described above).
 If safe completion requires breaking policy or human judgement, make no speculative workaround: return needs_human=true with blockers.
 """
 
@@ -2720,6 +2816,9 @@ def cmd_steer(args: argparse.Namespace) -> int:
         "original_block": original_block[:1200],
         "recorded_at": utc_now(),
     }
+    failure_epoch_reset = reset_failure_epoch_after_human_steer(state)
+    if failure_epoch_reset:
+        record["failure_epoch_reset"] = failure_epoch_reset
     history = state.get("human_steering") if isinstance(state.get("human_steering"), list) else []
     state["human_steering"] = [*history[-49:], record]
     grants = state.get("steering_allowed_new_tests") if isinstance(state.get("steering_allowed_new_tests"), list) else []
@@ -3017,6 +3116,26 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
 
         append_ideas(loop_no, result.get("ideas", []))
+        continuation, continuation_reason = codex_requests_continuation(result, step)
+        if continuation:
+            stats = loop_stats(loop_started, result, repair=repair_no)
+            state["last_result"] = "CONTINUE"
+            state["block_reason"] = None
+            append_journal(
+                loop_no, step["id"], phase, "CONTINUE",
+                summary=continuation_reason, files=files, repair=repair_no,
+                ideas=result.get("ideas", []),
+                next_action="continue same approved step in next bounded loop",
+                change_class=change_class, stats=stats,
+            )
+            save_state(state)
+            live_write(
+                f"loop={loop_no:04d} step={step['id']} ordinary continuation requested; "
+                "another bounded loop remains inside approved authority",
+                "CONTINUE",
+            )
+            continue
+
         requires_human, reason = codex_requires_human_before_gates(result, step)
         if requires_human:
             append_journal(loop_no, step["id"], phase, "BLOCKED", summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []), next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
