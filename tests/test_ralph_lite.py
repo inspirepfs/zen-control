@@ -283,6 +283,12 @@ class ContextTests(unittest.TestCase):
 
 
 class EfficiencyBudgetTests(unittest.TestCase):
+    def setUp(self):
+        # Baseline threshold tests must never inherit the operator's live
+        # .ralph/efficiency-policy.json. Live-policy behaviour is covered by
+        # dedicated tests that inject the policy explicitly.
+        self.default_policy = ralph.efficiency_policy.normalize_policy(None)
+
     def test_healthy_loop_is_within_efficiency_budget(self):
         stats = {
             "commands_executed": 5,
@@ -290,7 +296,7 @@ class EfficiencyBudgetTests(unittest.TestCase):
             "input_tokens": 300000,
             "cached_input_tokens": 250000,
         }
-        self.assertEqual(ralph.efficiency_findings(stats), [])
+        self.assertEqual(ralph.efficiency_findings(stats, policy=self.default_policy), [])
 
     def test_expensive_loop_reports_each_exceeded_budget(self):
         stats = {
@@ -299,7 +305,7 @@ class EfficiencyBudgetTests(unittest.TestCase):
             "input_tokens": 931164,
             "cached_input_tokens": 798464,
         }
-        findings = ralph.efficiency_findings(stats)
+        findings = ralph.efficiency_findings(stats, policy=self.default_policy)
         self.assertIn("commands 12>8", findings)
         self.assertIn("reported-files 10>8", findings)
         self.assertIn("cumulative-input 931164>600000", findings)
@@ -312,7 +318,7 @@ class EfficiencyBudgetTests(unittest.TestCase):
             "input_tokens": 700000,
             "cached_input_tokens": 590000,
         }
-        findings = ralph.efficiency_findings(stats)
+        findings = ralph.efficiency_findings(stats, policy=self.default_policy)
         self.assertIn("cumulative-input 700000>600000", findings)
         self.assertIn("non-cached-input 110000>100000", findings)
 
@@ -324,7 +330,7 @@ class EfficiencyBudgetTests(unittest.TestCase):
             "input_tokens": 900000,
             "cached_input_tokens": 780000,
         }
-        self.assertEqual(ralph.efficiency_findings(stats, mode="RELAXED"), [])
+        self.assertEqual(ralph.efficiency_findings(stats, mode="RELAXED", policy=self.default_policy), [])
 
     def test_off_disables_policy_findings_but_not_runaway_guard(self):
         stats = {
@@ -333,12 +339,26 @@ class EfficiencyBudgetTests(unittest.TestCase):
             "input_tokens": 3500000,
             "cached_input_tokens": 2900000,
         }
-        self.assertEqual(ralph.efficiency_findings(stats, mode="OFF"), [])
-        self.assertTrue(ralph.runaway_findings(stats))
+        self.assertEqual(ralph.efficiency_findings(stats, mode="OFF", policy=self.default_policy), [])
+        self.assertTrue(ralph.runaway_findings(stats, policy=self.default_policy))
 
     def test_documentation_goal_recommends_relaxed_without_selecting_it(self):
         self.assertEqual(ralph.recommended_efficiency_mode("Review and update all documentation"), "RELAXED")
         self.assertEqual(ralph.recommended_efficiency_mode("Fix one classifier bug"), "NORMAL")
+
+    def test_explicit_policy_isolated_from_operator_live_policy(self):
+        stats = {
+            "commands_executed": 12,
+            "files_inspected": 10,
+            "input_tokens": 931164,
+            "cached_input_tokens": 798464,
+        }
+        live_policy = ralph.efficiency_policy.normalize_policy({"mode": "OFF"})
+        with mock.patch.object(ralph.efficiency_policy, "load_policy", return_value=live_policy) as load_policy:
+            findings = ralph.efficiency_findings(stats, policy={})
+        load_policy.assert_not_called()
+        self.assertIn("commands 12>8", findings)
+        self.assertIn("cumulative-input 931164>600000", findings)
 
     def test_live_policy_can_raise_normal_thresholds(self):
         policy = ralph.efficiency_policy.normalize_policy({
@@ -354,7 +374,7 @@ class EfficiencyBudgetTests(unittest.TestCase):
         self.assertEqual(ralph.efficiency_findings(stats, mode="NORMAL", policy=policy), [])
 
     def test_prompt_command_budget_is_loaded_from_live_policy(self):
-        policy = ralph.efficiency_policy.normalize_policy({"prompt_command_budget": 11})
+        policy = ralph.efficiency_policy.normalize_policy({"normal_prompt_command_budget": 11})
         state = {"plan_hash": "abc", "human_steering": []}
         step = {"id": 1, "title": "One", "objective": "Do one thing", "acceptance": ["done"], "test_change_policy": "none"}
         with mock.patch.object(ralph.efficiency_policy, "load_policy", return_value=policy), mock.patch.object(ralph, "context_handoff", return_value={}):
@@ -450,6 +470,28 @@ class CodexUsageGuardTests(unittest.TestCase):
         self.assertNotIn("account_id", snapshot)
         self.assertNotIn("must-not-be-retained", str(snapshot))
 
+    def test_normalise_codex_usage_exposes_banked_reset_metadata_without_account_data(self):
+        raw = self.sample_usage()
+        raw["rateLimitResetCredits"] = {
+            "availableCount": 2,
+            "credits": [
+                {
+                    "id": "credit-later", "status": "available", "resetType": "full",
+                    "grantedAt": 100, "expiresAt": 400, "title": "Later", "description": "later reset",
+                },
+                {
+                    "id": "credit-sooner", "status": "available", "resetType": "full",
+                    "grantedAt": 90, "expiresAt": 300, "title": "Sooner", "description": "earlier reset",
+                },
+            ],
+            "privateAccount": "must-not-leak",
+        }
+        snapshot = ralph.normalise_codex_usage(raw, "gpt-5.6-terra")
+        self.assertEqual(snapshot["available_reset_credits"], 2)
+        self.assertEqual([item["id"] for item in snapshot["reset_credits"]], ["credit-sooner", "credit-later"])
+        self.assertEqual(snapshot["reset_credits"][0]["title"], "Sooner")
+        self.assertNotIn("must-not-leak", str(snapshot))
+
     def test_guard_pauses_at_exactly_five_percent_remaining(self):
         snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=95), "gpt-5.6-terra")
         status, findings = ralph.codex_usage_guard(snapshot)
@@ -526,8 +568,40 @@ class CodexUsageGuardTests(unittest.TestCase):
                 self.assertEqual(report["current_plan"]["output_tokens"], 120)
                 self.assertEqual(report["windows"][0]["observed_tokens"]["input_tokens"], 1500)
                 self.assertEqual({p["plan_hash"] for p in report["plans"]}, {"plan-a", "plan-b"})
+                plan_a = next(item for item in report["plans"] if item["plan_hash"] == "plan-a")
+                self.assertEqual(plan_a["total_tokens"], 1120)
+                self.assertEqual(plan_a["avg_input_tokens"], 1000)
+                self.assertEqual(plan_a["scopes"][0]["name"], "implementation")
+                self.assertEqual(plan_a["phases"][0]["name"], "implement")
+                self.assertEqual(plan_a["steps"][0]["name"], "1")
+                self.assertGreaterEqual(plan_a["cache_ratio_percent"], 79.9)
             finally:
                 ralph.RALPH, ralph.USAGE_LEDGER = old_ralph, old_ledger
+
+    def test_reset_usage_statistics_moves_local_baseline_without_deleting_ledger(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_ralph, old_ledger, old_reset = ralph.RALPH, ralph.USAGE_LEDGER, ralph.USAGE_STATS_RESET
+            try:
+                ralph.RALPH = Path(td)
+                ralph.USAGE_LEDGER = Path(td) / "usage-ledger.jsonl"
+                ralph.USAGE_STATS_RESET = Path(td) / "usage-stats-reset.json"
+                old_epoch = int(ralph.dt.datetime.now(ralph.dt.timezone.utc).timestamp()) - 10
+                row = {
+                    "schema": "zen_ralph_usage_turn_v1", "epoch": old_epoch, "plan_hash": "p",
+                    "input_tokens": 100, "cached_input_tokens": 20, "cache_write_input_tokens": 0,
+                    "output_tokens": 10, "reasoning_output_tokens": 0,
+                }
+                ralph.USAGE_LEDGER.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                marker = ralph.reset_usage_statistics()
+                self.assertTrue(ralph.USAGE_LEDGER.exists())
+                self.assertEqual(len(ralph.usage_ledger_rows(include_before_reset=True)), 1)
+                self.assertEqual(ralph.usage_ledger_rows(), [])
+                report = ralph.usage_ledger_report({"plan_hash": "p", "step_results": [{"stats": {"input_tokens": 999}}]}, {})
+                self.assertEqual(report["current_plan_source"], "reset-baseline")
+                self.assertEqual(report["current_plan"]["input_tokens"], 0)
+                self.assertEqual(report["stats_reset"]["reset_at"], marker["reset_at"])
+            finally:
+                ralph.RALPH, ralph.USAGE_LEDGER, ralph.USAGE_STATS_RESET = old_ralph, old_ledger, old_reset
 
     def test_usage_window_counter_excludes_turns_before_window_start(self):
         with tempfile.TemporaryDirectory() as td:

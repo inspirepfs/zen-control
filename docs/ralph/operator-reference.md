@@ -51,6 +51,10 @@ the safe recovery; in all cases start by checking `python3 scripts/ralph.py stat
 | `reconcile-commit <PLAN_HASH> --commit <COMMIT_SHA> --reason "..."` **Git** | Exact hash/reason and manually made commit strictly proved qualified delta. | Records verified SHA, reconciliation reason/time, `COMMITTED`, journal, report. | Unqualified/unexpected commit: correct it or return to human publication review; never assert state manually. | `python3 scripts/ralph.py reconcile-commit <PLAN_HASH> --commit <COMMIT_SHA> --reason "Manual commit reviewed"` |
 | `reconcile-push <PLAN_HASH>` **Git** | Exact hash, `COMMITTED`/`PUSHED`, recorded SHA, upstream/fetch/proof SHA is upstream ancestor. | Records reconciled `PUSHED`; does not push. | Missing SHA/upstream/proof: establish safe upstream or use guarded push; do not claim publication. | `python3 scripts/ralph.py reconcile-push <PLAN_HASH>` |
 | `usage [--details] [--json] [--no-save]` | Local state; live usage backend optional; `--no-save` is read-only refresh support. | Reads ledger/context, queries limits; successful normal query caches state; details/json alter output. | Neither live nor cached limits returns 2. Retry/inspect cache; unavailable usage is not quota permission. | `python3 scripts/ralph.py usage --details` |
+| `models [--json]` **Codex** | Authenticated Codex app-server available. | Reads the current model catalog plus configured/project-selected model; no selection is changed. | Catalog failure is read-only; restore Codex access and retry. | `python3 scripts/ralph.py models --json` |
+| `model-policy show|set|reset` **Codex for set validation** | Project-local policy; `set` requires a model present in the authenticated current catalog. | Atomically stores only RALPH's project override in `.ralph/model-policy.json`; `reset` returns to the user Codex default. A live change affects the next model process/turn, never an already-running turn. | Unknown model or catalog failure leaves prior selection intact. | `python3 scripts/ralph.py model-policy set --model <MODEL_ID>` |
+| `redeem-reset [--credit-id ID] --confirm REDEEM [--json]` **Codex account action** | A banked reset is available and the operator explicitly confirmed redemption. | Calls the supported authenticated reset-credit consume operation with a fresh idempotency key; never auto-redeems. | `noCredit`, `nothingToReset`, and `alreadyRedeemed` are reported without inventing quota. Re-read usage before further work. | `python3 scripts/ralph.py redeem-reset --confirm REDEEM --json` |
+| `usage-reset-stats --confirm RESET [--json]` | Local usage ledger may exist. | Moves the local reporting baseline forward; preserves the ledger and does **not** reset/redeem provider quota. | Missing/corrupt marker is local reporting state only; live provider limits remain authoritative. | `python3 scripts/ralph.py usage-reset-stats --confirm RESET` |
 | `serve [--host ADDR] [--port N] [--allow-lan] [--username NAME] [--password-file FILE] [--session-hours N] [--usage-refresh-seconds N]` | Local operator use; loopback default. LAN needs explicit private bind/auth; refresh >=15, session >0. | Starts local web UI; actions call guarded CLI and write job/log evidence. | Unsafe bind/missing LAN auth/invalid limits: use CLI status/recovery, never edit web files; keep passwords out of history. | `python3 scripts/ralph.py serve --host 127.0.0.1 --port 8765` |
 | `status` | Any state. | Prints plan/status/step/loop/gate/block/efficiency/quota; normal use is read-only, though first use may bootstrap missing runtime files. | Corrupt state: preserve it and obtain human recovery; never invent fields. | `python3 scripts/ralph.py status` |
 
@@ -67,6 +71,8 @@ before human-directed recovery.
 | `policy.md` | Tracked policy; every CLI initialization/workers read it. | Source-controlled authority contract; must exist. | Never edit/delete during approved work; restore only reviewed source control. |
 | `state.json` | `ralph.py` atomic writer; CLI/TUI/gate/web/reports read. | Ignored authoritative state; `init` creates default only if absent. | Do not hand-edit/delete/promote `.tmp`; preserve copy and seek human recovery. |
 | `efficiency-policy.json` | `ralph.py efficiency-policy` atomic writer; active controller and web console read live. | Ignored live resource-policy state, deliberately separate from `state.json`; `init` creates safe defaults. | Do not hand-edit while active. Use web controls or `efficiency-policy` CLI; invalid values are rejected and writes are atomic. |
+| `model-policy.json` | `ralph.py model-policy` atomic writer; model launcher/web read before new model processes. | Ignored project-local model override only; absence/`null` means use the user's Codex configured default. | Do not hand-edit during active work; use model picker/CLI. Reset is non-destructive to global Codex config. |
+| `usage-stats-reset.json` | `usage-reset-stats` atomic writer; usage reports read as a cutoff. | Ignored local display baseline; does not delete `usage-ledger.jsonl` or change provider quota/reset credits. | Safe to preserve for audit. Removing it intentionally re-exposes earlier local ledger history. |
 | `plan.md` | `propose` writes; approve/run/humans read exact bytes. | Ignored canonical plan, replaced only by new proposal. | Do not reformat/delete active file; preserve and regenerate after review. |
 | `context.json` | Controller saves handoff; prompts/`usage` read. | Ignored schema-tagged atomic cache; init creates default. | Invalid data falls back in memory. Do not hand-fix; delete only inactive, accepting lost handoff. |
 | `journal.md` | Controller appends loops/gates/retirement/reconciliation; humans inspect. | Ignored append-only audit; init heading; not fully regenerable. | Preserve damage; never rewrite active audit. Missing history needs human review. |
@@ -117,53 +123,67 @@ After a terminal/browser interruption, start with `status`, then use
 checkpoint, journal, and qualification fingerprint determine restart authority;
 terminal output and web-job metadata do not.
 
-## Efficiency governor and configurable start reserve
+## Efficiency governor, model selection, quota actions, and token reporting
 
-RALPH separates **efficiency policy** from **usage admission**. The default 5% Codex reserve is a configurable start gate for new work, not an in-flight kill switch. When a new proposal begins above the configured reserve in every relevant Codex window, RALPH admits that work and, once the proposal has an identity, persists a plan-bound `usage_admission` record. That exact plan may continue through later model turns, qualification, bounded repair, review, and completion even if a window subsequently falls below the reserve. Backend `ordinaryUsageAllowed=false` still stops execution. A different plan does not inherit the admission.
+RALPH separates **efficiency policy** from **usage admission**. The default 5% Codex reserve is a configurable start gate for new work, not an in-flight kill switch. When new work begins above the configured reserve in every relevant Codex window, RALPH admits it and binds that admission to the resulting plan identity. That exact plan may continue through model turns, qualification, bounded repair, review, and completion even if remaining allowance later falls below the reserve. Backend denial remains authoritative. A different/new plan does not inherit admission.
 
-Example: with the default 5% reserve, a plan admitted with 15% remaining may legitimately finish at 1%. At 1%, another plan is not admitted until usage recovers above the configured reserve. Raising the reserve while that plan is running does not revoke the existing plan-bound admission; the new value governs future, not-yet-admitted work.
+Example: a plan admitted with 15% remaining may legitimately finish at 1%. At 1%, another plan is blocked until allowance recovers above the configured reserve. Changing the reserve during execution affects future admissions only.
 
-The live efficiency/resource policy is stored atomically in `.ralph/efficiency-policy.json`, separately from `state.json`. This separation is deliberate: the web console can update policy while an active RALPH process is writing controller state without creating a lost-update race. RALPH re-reads the policy before each model turn and after each qualified step.
+The live policy is stored atomically in `.ralph/efficiency-policy.json`, independently of `state.json`. The web console can therefore change policy while an active RALPH process is persisting controller state. RALPH reloads it at model-turn and post-step decision boundaries.
 
-The operator can select the efficiency governor:
+### Per-mode limits
 
-| Mode | Default behaviour | Typical use |
-|---|---|---|
-| `STRICT` | 0.75x the normal per-turn thresholds. | Small, highly bounded fixes. |
-| `NORMAL` | 1.00x configured normal thresholds. | Default implementation work. |
-| `RELAXED` | 4.00x configured normal thresholds. | Documentation review, architecture review, migrations, extraction and broad repository analysis. |
-| `OFF` | Ordinary efficiency-policy pauses are disabled. | Intentionally high-context work where the operator accepts the cost. |
+Each enabled mode owns a complete independent limit set rather than deriving limits from multipliers:
 
-Emergency runaway ceilings remain active in **all** modes, including `OFF`. The mode controls ordinary efficiency policy; it never disables controller safety, authority, validation, repair budgets, or backend usage denial.
+| Mode | Default prompt commands | Commands | Files inspected | Cumulative input | Non-cached input | Intent |
+|---|---:|---:|---:|---:|---:|---|
+| `STRICT` | 4 | 6 | 6 | 450,000 | 75,000 | Small, tightly bounded work. |
+| `NORMAL` | 6 | 8 | 8 | 600,000 | 100,000 | Baseline/default engineering work. |
+| `RELAXED` | 12 | 32 | 32 | 2,400,000 | 400,000 | Documentation, architecture, extraction, migration and broad analysis. |
+| `OFF` | n/a | n/a | n/a | n/a | n/a | Ordinary efficiency pauses disabled. |
 
-The web console exposes the full policy in **Efficiency / Resource Controls** and allows staged edits followed by one atomic **Apply changes** action. Every field that differs from its default displays a small reset icon. **Restore defaults** stages the complete default policy, while **Discard staged changes** reloads the last applied values. Web refresh does not overwrite unsent edits.
+When `OFF` is selected, ordinary mode-limit fields are disabled in the web UI so the operator cannot mistake inactive thresholds for enforced controls. The configurable new-work reserve and emergency runaway ceilings remain active because they are separate safety/resource controls. Runaway ceilings are always enforced and must remain at least as high as every enabled mode limit.
 
-The live web controls include:
+The web panel is deliberately compact: mode and reserve are always visible; only the currently selected mode's five limits are shown; emergency ceilings are under an expandable section. Hover/ⓘ help explains each control, and every value shows its baseline. A small reset icon appears beside values that differ from baseline. Changes are staged and applied atomically with **Apply changes**; browser refresh does not overwrite staged edits. **Restore baselines** stages all defaults and **Discard staged** restores the last applied policy.
 
-- efficiency mode;
-- new-work reserve percentage;
-- implementation-turn prompt command budget;
-- NORMAL command, reported-file, cumulative-input and non-cached-input thresholds;
-- STRICT and RELAXED multipliers;
-- emergency runaway command, file, cumulative-input and non-cached-input ceilings.
-
-The emergency ceilings are validated so they cannot be configured below the effective RELAXED thresholds. This prevents an operator from accidentally making RELAXED less permissive than the always-on runaway boundary.
-
-Equivalent CLI control remains available for recovery/automation:
+Equivalent CLI control remains available:
 
 ```bash
 python3 scripts/ralph.py efficiency-policy show --json
-python3 scripts/ralph.py efficiency-policy set --mode relaxed --reserve-percent 7.5
+python3 scripts/ralph.py efficiency-policy set --mode relaxed --reserve-percent 7.5 \
+  --relaxed-max-commands 36 --relaxed-max-reported-files 36
 python3 scripts/ralph.py efficiency-policy reset-mode
 python3 scripts/ralph.py efficiency-policy reset
 ```
 
-`python3 scripts/ralph.py run --efficiency-mode relaxed` remains supported for compatibility; supplying it updates the live policy mode before execution. A normal web `Run approved plan` action does not resend or overwrite the current live policy.
+`run --efficiency-mode ...` remains a compatibility/operator shortcut that changes the live selected mode. The planner may recommend `RELAXED` for inherently broad goals but never changes the mode silently.
 
-RALPH records a conservative planner recommendation (`NORMAL` or `RELAXED`) from the goal text, but the recommendation never silently weakens the active mode.
+Expected resource stops remain distinct:
 
-Expected stop reasons are deliberately distinct:
+- `PAUSED_EFFICIENCY_POLICY` — the selected enabled mode threshold was exceeded after a qualified step;
+- `PAUSED_RUNAWAY` — always-on emergency ceiling exceeded;
+- `BLOCKED_INSUFFICIENT_START_RESERVE` — new work without matching plan admission attempted to start at/below reserve.
 
-- `PAUSED_EFFICIENCY_POLICY` — selected efficiency mode threshold exceeded after a qualified step;
-- `PAUSED_RUNAWAY` — emergency ceiling exceeded;
-- `BLOCKED_INSUFFICIENT_START_RESERVE` — work without an existing plan-bound admission attempted to start at or below the configured reserve.
+### Live model picker
+
+The Usage / Token Economy toolbar exposes the authenticated Codex model catalog. Selection is stored only in `.ralph/model-policy.json`; RALPH does not rewrite `~/.codex/config.toml`. Selecting a model while RALPH is active changes the **next** Codex process/model turn, not an already-running process. The adjacent reset icon removes the project override and returns to the configured Codex default.
+
+### Banked reset redemption
+
+When the Codex rate-limit surface reports one or more available reset credits, the web toolbar displays an animated **Redeem** button. If detailed credits are available, the earliest-expiring available credit is presented first. Clicking **Redeem** opens a confirmation dialog describing the account action; redemption occurs only after explicit confirmation. The CLI independently requires `--confirm REDEEM`, and the consume request uses a fresh idempotency key. RALPH never redeems a banked reset automatically.
+
+After a successful redemption action, the web usage monitor refreshes immediately so provider quota/reset-credit state does not remain visually stale until the periodic refresh.
+
+### Consumption by plan and local statistics reset
+
+`usage-ledger.jsonl` remains the durable local source for observed model-turn counters. **Consumption by plan** keeps each plan to one compact row showing plan identity, turns, total tokens, cache ratio and goal. Expanding a row exposes:
+
+- input and non-cached input;
+- cached and cache-write input;
+- output and reasoning output;
+- average input/output per observed turn;
+- first/last observed timestamps;
+- model(s) used;
+- compact consumption breakdowns by scope, phase and step.
+
+The red **Reset token stats** control requires confirmation. It writes only `.ralph/usage-stats-reset.json`, moving the local reporting baseline forward. It does **not** delete the ledger, redeem/reset provider quota, modify banked reset credits, or create new work authority. Earlier rows remain available for audit/recovery with explicit pre-reset reads; ordinary web/CLI reports show only post-baseline activity. The monitor refreshes immediately after reset.

@@ -65,9 +65,23 @@ APPROVED / PROPOSED WORK
     +-- remaining <= configured reserve and no matching admission --> BLOCKED_INSUFFICIENT_START_RESERVE
 ```
 
-Changing the reserve while a plan is running affects future admission decisions only. It does not revoke the current plan's existing admission. The same live-policy file also carries mode, prompt command budget, normal thresholds, mode multipliers, and emergency runaway ceilings. These settings are re-read at model-turn and post-step decision boundaries, so a web-console change can take effect during an active run without rewriting controller state.
+Changing the reserve while a plan is running affects future admission decisions only. It does not revoke the current plan's existing admission. The live-policy file also carries an explicit five-limit profile for each of `STRICT`, `NORMAL`, and `RELAXED`, plus emergency runaway ceilings. The previous multiplier-based policy is migrated on read. Settings are re-read at model-turn and post-step decision boundaries, so an atomic web-console change can take effect during an active run without rewriting controller state.
 
 Admission is not transferrable authority. A new proposal receives a new plan identity and no usage admission. Backend denial remains authoritative at all times.
 
-Efficiency policy is orthogonal to admission. `STRICT`, `NORMAL`, `RELAXED`, and `OFF` determine the post-step efficiency threshold from the live policy; the emergency runaway guard remains enabled in every mode, including `OFF`.
+Efficiency policy is orthogonal to admission. `STRICT`, `NORMAL`, and `RELAXED` enforce their own configured thresholds. `OFF` disables ordinary efficiency threshold enforcement and the web UI makes those inactive mode limits non-editable, but the emergency runaway guard and new-work reserve remain active.
+
+## Live operator controls during execution
+
+The web console deliberately keeps three live-control stores separate from controller authority:
+
+- `.ralph/efficiency-policy.json` — atomically applied resource policy; reread between model turns/decision boundaries;
+- `.ralph/model-policy.json` — optional project-local model override; changes affect the next Codex process, never the in-flight one;
+- `.ralph/usage-stats-reset.json` — local token-report cutoff only; it does not alter provider quota or the append-only usage ledger.
+
+A model selection, efficiency-policy update, or local token-stat reset is allowed while the controller job is active without replacing `web-job.json` or mutating the plan lifecycle state. The usage monitor refreshes immediately after model/reset-account/stat actions so the operator sees the resulting state without waiting for the periodic monitor interval.
+
+Banked reset credits are provider/account capability, not plan authority. The web UI renders **Redeem** only when the live supported rate-limit surface reports available credits. The action always requires an operator confirmation dialog; the CLI independently requires `--confirm REDEEM` and the consume call is idempotency-keyed. No controller transition auto-redeems a credit.
+
+The red **Reset token stats** action is intentionally different: it moves only the local reporting baseline. Existing ledger records remain intact and no provider reset/credit operation is invoked.
 

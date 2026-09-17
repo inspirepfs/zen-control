@@ -246,8 +246,9 @@ class ActionAuthorityTests(unittest.TestCase):
                 "settings": {
                     "mode": "RELAXED",
                     "reserve_percent": 7.5,
-                    "prompt_command_budget": 9,
+                    "relaxed_prompt_command_budget": 14,
                     "normal_max_commands": 12,
+                    "relaxed_max_commands": 36,
                     "runaway_max_commands": 60,
                 },
             },
@@ -260,7 +261,8 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertEqual(request.argv[:2], ["efficiency-policy", "set"])
         self.assertEqual(request.argv[request.argv.index("--mode") + 1], "relaxed")
         self.assertEqual(request.argv[request.argv.index("--reserve-percent") + 1], "7.5")
-        self.assertEqual(request.argv[request.argv.index("--prompt-command-budget") + 1], "9")
+        self.assertEqual(request.argv[request.argv.index("--relaxed-prompt-command-budget") + 1], "14")
+        self.assertEqual(request.argv[request.argv.index("--relaxed-max-commands") + 1], "36")
 
     def test_efficiency_reset_actions_do_not_require_plan_identity(self):
         self.assertEqual(
@@ -271,6 +273,34 @@ class ActionAuthorityTests(unittest.TestCase):
             web.command_for_action({"action": "efficiency_reset_all"}, {"status": "IDLE"}).argv,
             ["efficiency-policy", "reset"],
         )
+
+    def test_model_picker_actions_are_live_and_do_not_require_plan_identity(self):
+        request = web.command_for_action({"action": "model_update", "model": "gpt-5.6-terra"}, {"status": "IDLE"})
+        self.assertEqual(request.argv, ["model-policy", "set", "--model", "gpt-5.6-terra"])
+        self.assertTrue(request.allow_while_active)
+        self.assertFalse(request.track_job)
+        reset = web.command_for_action({"action": "model_reset"}, {"status": "IDLE"})
+        self.assertEqual(reset.argv, ["model-policy", "reset"])
+        self.assertTrue(reset.allow_while_active)
+
+    def test_banked_reset_requires_explicit_confirmation(self):
+        with self.assertRaisesRegex(web.WebConsoleError, "confirm=REDEEM"):
+            web.command_for_action({"action": "redeem_reset", "credit_id": "credit-a"}, {"status": "IDLE"})
+        request = web.command_for_action(
+            {"action": "redeem_reset", "credit_id": "credit-a", "confirm": "REDEEM"},
+            {"status": "IDLE"},
+        )
+        self.assertEqual(request.argv, ["redeem-reset", "--confirm", "REDEEM", "--json", "--credit-id", "credit-a"])
+        self.assertTrue(request.allow_while_active)
+        self.assertFalse(request.track_job)
+
+    def test_token_stats_reset_requires_explicit_confirmation(self):
+        with self.assertRaisesRegex(web.WebConsoleError, "confirm=RESET"):
+            web.command_for_action({"action": "usage_reset_stats"}, {"status": "IDLE"})
+        request = web.command_for_action({"action": "usage_reset_stats", "confirm": "RESET"}, {"status": "IDLE"})
+        self.assertEqual(request.argv, ["usage-reset-stats", "--confirm", "RESET", "--json"])
+        self.assertTrue(request.allow_while_active)
+        self.assertFalse(request.track_job)
 
     def test_actions_expose_immediate_operational_state(self):
         cases = [
@@ -402,7 +432,7 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertIn("Requalify delta", web.PAGE)
         self.assertIn("Efficiency / Resource Controls", web.PAGE)
         self.assertIn("Apply changes", web.PAGE)
-        self.assertIn("Restore defaults", web.PAGE)
+        self.assertIn("Restore baselines", web.PAGE)
         self.assertIn("data-eff-reset", web.PAGE)
         self.assertIn("New-work reserve %", web.PAGE)
         self.assertIn("Emergency runaway ceiling", web.PAGE)
@@ -446,16 +476,24 @@ class AuthenticationTests(unittest.TestCase):
 
 
 class UsageMonitorTests(unittest.TestCase):
-    def test_monitor_uses_read_only_usage_refresh(self):
-        payload = {"codex_limits": {"plan_type": "plus", "windows": []}, "ledger": {"current_plan": {"input_tokens": 42}}}
-        completed = mock.Mock(stdout=json.dumps(payload), returncode=0)
+    def test_monitor_uses_read_only_usage_refresh_and_loads_model_catalog(self):
+        payload = {
+            "codex_limits": {"plan_type": "plus", "windows": [], "available_reset_credits": 1},
+            "ledger": {"current_plan": {"input_tokens": 42}},
+        }
+        models = {"selected": "gpt-5.6-terra", "configured_default": "gpt-5.6-terra", "models": [{"id": "gpt-5.6-terra"}]}
+        completed_usage = mock.Mock(stdout=json.dumps(payload), returncode=0, stderr="")
+        completed_models = mock.Mock(stdout=json.dumps(models), returncode=0, stderr="")
         monitor = web.UsageMonitor(60)
-        with mock.patch.object(web.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(web.subprocess, "run", side_effect=[completed_usage, completed_models]) as run:
             report = monitor.refresh()
         self.assertEqual(report["ledger"]["current_plan"]["input_tokens"], 42)
-        argv = run.call_args.args[0]
-        self.assertEqual(argv[-3:], ["usage", "--json", "--no-save"])
-        self.assertIn("--no-save", argv)
+        self.assertEqual(report["model_catalog"]["selected"], "gpt-5.6-terra")
+        usage_argv = run.call_args_list[0].args[0]
+        model_argv = run.call_args_list[1].args[0]
+        self.assertEqual(usage_argv[-4:], ["usage", "--json", "--no-save", "--include-reset-details"])
+        self.assertEqual(model_argv[-2:], ["models", "--json"])
+        self.assertIn("--no-save", usage_argv)
 
 
 class HttpSurfaceTests(unittest.TestCase):
@@ -605,11 +643,23 @@ class HttpSurfaceTests(unittest.TestCase):
         self.assertLess(files, report)
         self.assertLess(report, output)
         self.assertIn('grid-template-columns:repeat(6,minmax(0,1fr))', page)
-        self.assertIn('class="plan-comment"', page)
-        self.assertIn('class="plan-comment-body"', page)
-        self.assertIn('class="usage-tokens"', page)
-        self.assertIn("-webkit-line-clamp:2", page)
-        self.assertIn("minmax(230px,280px)", page)
+        self.assertIn('id="usageToolbar"', page)
+        self.assertIn('class="plan-usage-detail"', page)
+        self.assertIn('class="plan-usage-summary"', page)
+        self.assertIn('class="plan-breakdown"', page)
+        self.assertIn('function redeemBankedReset', page)
+        self.assertIn('function resetTokenStats', page)
+        self.assertIn('function selectModel', page)
+        self.assertIn('class="sparkle"', page)
+        self.assertIn('Reset token stats', page)
+        self.assertIn('Efficiency / Resource Controls', page)
+        self.assertIn('baseline', page)
+        self.assertIn('Emergency runaway ceiling', page)
+        self.assertIn('data-mode-panel="${name}"', page)
+        self.assertIn("modePanel('STRICT')", page)
+        self.assertIn("modePanel('NORMAL')", page)
+        self.assertIn("modePanel('RELAXED')", page)
+        self.assertIn('ordinary efficiency thresholds are disabled', page)
         self.assertIn('id="reportRenderedButton"', page)
         self.assertIn('id="reportMarkdownButton"', page)
         self.assertIn("function renderMarkdown(text)", page)
@@ -645,6 +695,22 @@ class BackgroundJobTests(unittest.TestCase):
                 result = web.run_command(request)
             self.assertTrue(result["ok"])
             self.assertEqual(json.loads(web.WEB_JOB.read_text(encoding="utf-8")), active)
+
+    def test_model_and_usage_controls_can_run_during_active_job_without_clobbering_metadata(self):
+        with WebHarness() as h:
+            h.state()
+            active = {"active": True, "pid": 1234, "activity": "RUNNING", "mode": "background"}
+            web.WEB_JOB.write_text(json.dumps(active), encoding="utf-8")
+            completed = mock.Mock(returncode=0, stdout="{}", stderr="")
+            requests = [
+                web.command_for_action({"action": "model_update", "model": "gpt-5.6-terra"}, {"status": "APPROVED"}),
+                web.command_for_action({"action": "usage_reset_stats", "confirm": "RESET"}, {"status": "APPROVED"}),
+                web.command_for_action({"action": "redeem_reset", "confirm": "REDEEM"}, {"status": "APPROVED"}),
+            ]
+            with mock.patch.object(web, "_process_alive", return_value=True), mock.patch.object(web.subprocess, "run", return_value=completed):
+                for request in requests:
+                    self.assertTrue(web.run_command(request)["ok"])
+                    self.assertEqual(json.loads(web.WEB_JOB.read_text(encoding="utf-8")), active)
 
 
 if __name__ == "__main__":

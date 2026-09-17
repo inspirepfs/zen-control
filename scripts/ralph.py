@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Iterable
 
@@ -29,6 +30,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 import ralph_tui as tui
 import ralph_efficiency as efficiency_policy
+import ralph_model as model_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 RALPH = ROOT / ".ralph"
@@ -43,6 +45,7 @@ EVENTS = RALPH / "events.jsonl"
 RECOVERY = RALPH / "recovery"
 REPORTS = RALPH / "reports"
 USAGE_LEDGER = RALPH / "usage-ledger.jsonl"
+USAGE_STATS_RESET = RALPH / "usage-stats-reset.json"
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
@@ -52,17 +55,12 @@ DEFAULT_MAX_LOOPS = 40
 # Backward-compatible constant aliases. Runtime decisions reload the live policy
 # from .ralph/efficiency-policy.json before each model turn / efficiency decision.
 _DEFAULT_EFFICIENCY = efficiency_policy.DEFAULT_POLICY
-PROMPT_COMMAND_BUDGET = int(_DEFAULT_EFFICIENCY["prompt_command_budget"])
+PROMPT_COMMAND_BUDGET = int(_DEFAULT_EFFICIENCY["normal_prompt_command_budget"])
 EFFICIENCY_MAX_COMMANDS = int(_DEFAULT_EFFICIENCY["normal_max_commands"])
 EFFICIENCY_MAX_CUMULATIVE_INPUT = int(_DEFAULT_EFFICIENCY["normal_max_cumulative_input"])
 EFFICIENCY_MAX_NONCACHED_INPUT = int(_DEFAULT_EFFICIENCY["normal_max_noncached_input"])
 EFFICIENCY_MAX_REPORTED_FILES = int(_DEFAULT_EFFICIENCY["normal_max_reported_files"])
 EFFICIENCY_MODES = efficiency_policy.MODES
-EFFICIENCY_MULTIPLIERS = {
-    "STRICT": float(_DEFAULT_EFFICIENCY["strict_multiplier"]),
-    "NORMAL": 1.0,
-    "RELAXED": float(_DEFAULT_EFFICIENCY["relaxed_multiplier"]),
-}
 # Emergency ceilings remain active even when the ordinary efficiency governor is OFF.
 RUNAWAY_MAX_COMMANDS = int(_DEFAULT_EFFICIENCY["runaway_max_commands"])
 RUNAWAY_MAX_CUMULATIVE_INPUT = int(_DEFAULT_EFFICIENCY["runaway_max_cumulative_input"])
@@ -86,11 +84,13 @@ TOOLING_PATHS = {
     ".ralph/policy.md",
     "scripts/ralph.py",
     "scripts/ralph_efficiency.py",
+    "scripts/ralph_model.py",
     "scripts/ralph_gate.py",
     "scripts/ralph_tui.py",
     "scripts/ralph_web.py",
     "tests/test_ralph_lite.py",
     "tests/test_ralph_efficiency.py",
+    "tests/test_ralph_model.py",
     "tests/test_ralph_gate.py",
     "tests/test_ralph_lifecycle.py",
     "tests/test_ralph_retry_hardening.py",
@@ -1817,15 +1817,19 @@ def codex_command_prefix() -> list[str]:
 
 def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex") -> dict:
     prefix = codex_command_prefix()
+    selected_model = selected_codex_model()
     with tempfile.TemporaryDirectory(prefix="ralph-lite-") as temp_dir:
         schema_path = Path(temp_dir) / "schema.json"
         output_path = Path(temp_dir) / "result.json"
         schema_path.write_text(json.dumps(schema), encoding="utf-8")
-        command = [
-            *prefix, "exec", "--ephemeral", "--json", "--sandbox", sandbox,
+        command = [*prefix, "exec"]
+        if selected_model:
+            command += ["--model", selected_model]
+        command += [
+            "--ephemeral", "--json", "--sandbox", sandbox,
             "--output-schema", str(schema_path), "-o", str(output_path), prompt,
         ]
-        live_write(f"{context} · sandbox={sandbox} backend=default", "CODEX")
+        live_write(f"{context} · model={selected_model or 'codex-default'} · sandbox={sandbox} backend=default", "CODEX")
         started = time.monotonic()
         returncode, output, metrics = stream_codex_process(command)
         metrics["codex_seconds"] = time.monotonic() - started
@@ -1899,7 +1903,8 @@ def _efficiency_mode(value: str | None) -> str:
 
 def efficiency_findings(stats: dict | None, mode: str | None = None, policy: dict | None = None) -> list[str]:
     """Return live policy-level efficiency findings; OFF disables ordinary policy only."""
-    policy = efficiency_policy.normalize_policy(policy or efficiency_policy.load_policy(ROOT))
+    policy_source = efficiency_policy.load_policy(ROOT) if policy is None else policy
+    policy = efficiency_policy.normalize_policy(policy_source)
     mode = _efficiency_mode(mode or str(policy.get("mode") or "NORMAL"))
     if mode == "OFF":
         return []
@@ -1924,7 +1929,8 @@ def efficiency_findings(stats: dict | None, mode: str | None = None, policy: dic
 
 def runaway_findings(stats: dict | None, policy: dict | None = None) -> list[str]:
     """Return emergency findings from live policy; these remain active in every mode."""
-    policy = efficiency_policy.normalize_policy(policy or efficiency_policy.load_policy(ROOT))
+    policy_source = efficiency_policy.load_policy(ROOT) if policy is None else policy
+    policy = efficiency_policy.normalize_policy(policy_source)
     limits = efficiency_policy.runaway_limits(policy)
     stats = dict(stats or {})
     commands = int(stats.get("commands_executed") or 0)
@@ -2157,7 +2163,8 @@ Do not execute or edit anything. Respect .ralph/policy.md. Put discovered nice-t
 
 def step_prompt(state: dict, step: dict, repair_fp: str | None, repair_no: int) -> str:
     policy = efficiency_policy.load_policy(ROOT)
-    command_budget = int(policy["prompt_command_budget"])
+    mode = _efficiency_mode(str(policy.get("mode") or "NORMAL"))
+    command_budget = int(efficiency_policy.limits(policy, mode)["prompt_commands"])
     repair_text = ""
     if repair_fp:
         repair_text = (
@@ -2212,6 +2219,12 @@ def configured_codex_model() -> str | None:
     return str(model).strip() if isinstance(model, str) and model.strip() else None
 
 
+def selected_codex_model() -> str | None:
+    """Return RALPH's project-local override, otherwise the user's Codex default."""
+    selected = model_policy.load_policy(ROOT).get("model")
+    return str(selected).strip() if selected else configured_codex_model()
+
+
 def _app_server_send(handle, payload: dict) -> None:
     handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
     handle.flush()
@@ -2255,7 +2268,7 @@ def _app_server_read_response(proc: subprocess.Popen, request_id: int, timeout: 
     raise RuntimeError(f"timed out waiting for Codex app-server rate limits{': ' + stderr if stderr else ''}")
 
 
-def query_codex_rate_limits(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS) -> dict:
+def query_codex_rate_limits(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS, include_reset_credit_details: bool = False) -> dict:
     """Read live ChatGPT/Codex account limits through the supported app-server surface.
 
     This performs no model turn and deliberately discards account identifiers from the
@@ -2278,7 +2291,7 @@ def query_codex_rate_limits(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS
         _app_server_send(proc.stdin, {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "clientInfo": {"name": "ralph-lite", "title": "RALPH-Lite", "version": "0.3.2"},
+                "clientInfo": {"name": "ralph-lite", "title": "RALPH-Lite", "version": "0.4.0"},
                 "capabilities": {"experimentalApi": True},
             },
         })
@@ -2286,10 +2299,115 @@ def query_codex_rate_limits(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS
         _app_server_send(proc.stdin, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
         _app_server_send(proc.stdin, {
             "jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read",
-            "params": {"supportsLunaReserve": False, "excludeResetCreditDetails": True},
+            "params": {"supportsLunaReserve": False, "excludeResetCreditDetails": not include_reset_credit_details},
         })
         raw = _app_server_read_response(proc, 2, timeout)
-        return normalise_codex_usage(raw, configured_codex_model())
+        return normalise_codex_usage(raw, selected_codex_model())
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def query_codex_models(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS) -> dict:
+    """Read the authenticated Codex model picker catalog through app-server model/list."""
+    codex = shutil.which("codex")
+    if not codex:
+        raise RuntimeError("codex not found")
+    proc = subprocess.Popen(
+        [codex, "app-server", "--stdio"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, bufsize=1,
+    )
+    try:
+        assert proc.stdin is not None
+        _app_server_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "ralph-lite", "title": "RALPH-Lite", "version": "0.4.0"},
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        _app_server_read_response(proc, 1, timeout)
+        _app_server_send(proc.stdin, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        _app_server_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 2, "method": "model/list",
+            "params": {"limit": 100, "cursor": None, "includeHidden": False},
+        })
+        raw = _app_server_read_response(proc, 2, timeout)
+        data = raw.get("data") if isinstance(raw.get("data"), list) else []
+        models: list[dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("model") or item.get("id") or "").strip()
+            if not model_id:
+                continue
+            efforts = []
+            for option in item.get("supportedReasoningEfforts") or []:
+                if isinstance(option, dict) and option.get("reasoningEffort"):
+                    efforts.append(str(option.get("reasoningEffort")))
+            models.append({
+                "id": model_id,
+                "display_name": str(item.get("displayName") or model_id),
+                "description": str(item.get("description") or ""),
+                "is_default": bool(item.get("isDefault")),
+                "reasoning_efforts": efforts,
+            })
+        selected = selected_codex_model()
+        return {
+            "selected": selected,
+            "configured_default": configured_codex_model(),
+            "models": models,
+            "captured_at": utc_now(),
+        }
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def consume_codex_reset_credit(credit_id: str | None = None, *, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS) -> dict:
+    """Redeem one explicitly confirmed banked reset through the supported app-server API."""
+    codex = shutil.which("codex")
+    if not codex:
+        raise RuntimeError("codex not found")
+    proc = subprocess.Popen(
+        [codex, "app-server", "--stdio"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, bufsize=1,
+    )
+    idempotency_key = str(uuid.uuid4())
+    try:
+        assert proc.stdin is not None
+        _app_server_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "ralph-lite", "title": "RALPH-Lite", "version": "0.4.0"},
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        _app_server_read_response(proc, 1, timeout)
+        _app_server_send(proc.stdin, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        params: dict[str, str] = {"idempotencyKey": idempotency_key}
+        if credit_id:
+            params["creditId"] = str(credit_id)
+        _app_server_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 2, "method": "account/rateLimitResetCredit/consume", "params": params,
+        })
+        result = _app_server_read_response(proc, 2, timeout)
+        outcome = str(result.get("outcome") or "unknown")
+        if outcome not in {"reset", "nothingToReset", "noCredit", "alreadyRedeemed"}:
+            raise RuntimeError(f"unexpected banked-reset outcome: {outcome}")
+        return {"outcome": outcome}
     finally:
         try:
             proc.terminate()
@@ -2364,6 +2482,33 @@ def normalise_codex_usage(raw: dict, model: str | None = None) -> dict:
         available_resets = int(available_resets) if available_resets is not None else None
     except (TypeError, ValueError):
         available_resets = None
+    reset_credits: list[dict] = []
+    for item in reset_summary.get("credits") or []:
+        if not isinstance(item, dict):
+            continue
+        credit_id = str(item.get("id") or "").strip()
+        if not credit_id:
+            continue
+        granted = item.get("grantedAt")
+        expires = item.get("expiresAt")
+        try:
+            granted = int(granted) if granted is not None else None
+        except (TypeError, ValueError):
+            granted = None
+        try:
+            expires = int(expires) if expires is not None else None
+        except (TypeError, ValueError):
+            expires = None
+        reset_credits.append({
+            "id": credit_id,
+            "status": str(item.get("status") or "unknown"),
+            "reset_type": str(item.get("resetType") or "unknown"),
+            "granted_at": granted,
+            "expires_at": expires,
+            "title": str(item.get("title") or "Banked reset"),
+            "description": str(item.get("description") or ""),
+        })
+    reset_credits.sort(key=lambda item: (item.get("expires_at") is None, int(item.get("expires_at") or 2**62)))
     return {
         "captured_at": utc_now(),
         "model": model,
@@ -2371,6 +2516,7 @@ def normalise_codex_usage(raw: dict, model: str | None = None) -> dict:
         "ordinary_usage_allowed": raw.get("ordinaryUsageAllowed") if isinstance(raw.get("ordinaryUsageAllowed"), bool) else None,
         "windows": windows,
         "available_reset_credits": available_resets,
+        "reset_credits": reset_credits,
     }
 
 
@@ -2580,6 +2726,7 @@ def append_usage_ledger(
         "loop": int(loop) if loop is not None else None,
         "step": int(step) if step is not None else None,
         "phase": str(phase or "")[:40],
+        "model": selected_codex_model(),
         **usage,
     }
     with USAGE_LEDGER.open("a", encoding="utf-8") as handle:
@@ -2594,17 +2741,51 @@ def append_usage_ledger(
         pass
 
 
-def usage_ledger_rows(limit: int = USAGE_LEDGER_MAX_ROWS) -> list[dict]:
+def usage_stats_reset_info() -> dict:
+    try:
+        raw = json.loads(USAGE_STATS_RESET.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) and raw.get("schema") == "zen_ralph_usage_stats_reset_v1" else {}
+
+
+def usage_stats_reset_epoch() -> int:
+    try:
+        return max(0, int(usage_stats_reset_info().get("epoch") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def reset_usage_statistics() -> dict:
+    """Reset local token-stat views without touching provider quota or deleting the ledger."""
+    RALPH.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.now(dt.timezone.utc)
+    marker = {
+        "schema": "zen_ralph_usage_stats_reset_v1",
+        "epoch": int(now.timestamp()),
+        "reset_at": now.isoformat(),
+    }
+    tmp = USAGE_STATS_RESET.with_suffix(".tmp")
+    tmp.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, USAGE_STATS_RESET)
+    return marker
+
+
+def usage_ledger_rows(limit: int = USAGE_LEDGER_MAX_ROWS, *, include_before_reset: bool = False) -> list[dict]:
     if not USAGE_LEDGER.exists():
         return []
+    cutoff = 0 if include_before_reset else usage_stats_reset_epoch()
     rows: list[dict] = []
     for raw in USAGE_LEDGER.read_text(encoding="utf-8", errors="replace").splitlines()[-max(1, int(limit)):]:
         try:
             item = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if isinstance(item, dict) and item.get("schema") == "zen_ralph_usage_turn_v1":
-            rows.append(item)
+        if not isinstance(item, dict) or item.get("schema") != "zen_ralph_usage_turn_v1":
+            continue
+        if cutoff and int(item.get("epoch") or 0) <= cutoff:
+            continue
+        rows.append(item)
     return rows
 
 
@@ -2633,16 +2814,57 @@ def _fallback_current_plan_usage(state: dict) -> dict[str, int]:
     return _sum_usage_rows(rows)
 
 
+def _usage_breakdown(rows: list[dict], key: str) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        name = str(row.get(key) or "unknown")
+        grouped.setdefault(name, []).append(row)
+    output: list[dict] = []
+    for name, items in grouped.items():
+        totals = _sum_usage_rows(items)
+        output.append({"name": name, **totals})
+    output.sort(key=lambda item: int(item.get("input_tokens") or 0), reverse=True)
+    return output
+
+
+def _plan_usage_summary(key: str, rows: list[dict], goal: str, current_hash: str) -> dict:
+    totals = _sum_usage_rows(rows)
+    first_epoch = min((int(row.get("epoch") or 0) for row in rows), default=0) or None
+    last_epoch = max((int(row.get("epoch") or 0) for row in rows), default=0) or None
+    turns = max(1, int(totals.get("turns") or 0))
+    models = sorted({str(row.get("model") or "").strip() for row in rows if str(row.get("model") or "").strip()})
+    return {
+        "plan_hash": None if key == "unassigned" else key,
+        "current": bool(current_hash and key == current_hash),
+        "goal": goal,
+        "first_epoch": first_epoch,
+        "last_epoch": last_epoch,
+        "models": models,
+        "total_tokens": int(totals.get("input_tokens") or 0) + int(totals.get("output_tokens") or 0),
+        "cache_ratio_percent": (float(totals.get("cached_input_tokens") or 0) / float(totals.get("input_tokens") or 1) * 100.0) if totals.get("input_tokens") else 0.0,
+        "avg_input_tokens": int(int(totals.get("input_tokens") or 0) / turns),
+        "avg_noncached_input_tokens": int(int(totals.get("noncached_input_tokens") or 0) / turns),
+        "avg_output_tokens": int(int(totals.get("output_tokens") or 0) / turns),
+        "scopes": _usage_breakdown(rows, "scope"),
+        "phases": _usage_breakdown(rows, "phase"),
+        "steps": _usage_breakdown(rows, "step"),
+        **totals,
+    }
+
+
 def usage_ledger_report(state: dict, snapshot: dict | None = None) -> dict:
-    """Return reset-aligned token tickers and bounded per-plan consumption."""
+    """Return reset-aligned token tickers and detailed bounded per-plan consumption."""
     rows = usage_ledger_rows()
+    reset_info = usage_stats_reset_info()
     current_hash = str(state.get("plan_hash") or "")
     current_rows = [row for row in rows if str(row.get("plan_hash") or "") == current_hash] if current_hash else []
     current = _sum_usage_rows(current_rows)
     source = "ledger"
-    if current_hash and not current_rows:
+    if current_hash and not current_rows and not reset_info:
         current = _fallback_current_plan_usage(state)
         source = "step-results-fallback" if current.get("turns") else "ledger"
+    elif current_hash and not current_rows and reset_info:
+        source = "reset-baseline"
 
     grouped: dict[str, dict] = {}
     for row in rows:
@@ -2654,14 +2876,8 @@ def usage_ledger_report(state: dict, snapshot: dict | None = None) -> dict:
         group["last_epoch"] = max(int(group.get("last_epoch") or 0), int(row.get("epoch") or 0))
     plans: list[dict] = []
     for key, group in grouped.items():
-        totals = _sum_usage_rows(group["rows"])
-        plans.append({
-            "plan_hash": None if key == "unassigned" else key,
-            "goal": group.get("goal") or "",
-            "last_epoch": int(group.get("last_epoch") or 0),
-            **totals,
-        })
-    plans.sort(key=lambda item: int(item.get("last_epoch") or 0), reverse=True)
+        plans.append(_plan_usage_summary(key, list(group["rows"]), str(group.get("goal") or ""), current_hash))
+    plans.sort(key=lambda item: (not bool(item.get("current")), -int(item.get("last_epoch") or 0)))
 
     windows: list[dict] = []
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
@@ -2686,6 +2902,7 @@ def usage_ledger_report(state: dict, snapshot: dict | None = None) -> dict:
         "windows": windows,
         "ledger_rows": len(rows),
         "last_event_at": max((int(row.get("epoch") or 0) for row in rows), default=None),
+        "stats_reset": reset_info or None,
     }
 
 
@@ -2800,7 +3017,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
     snapshot = None
     error = None
     try:
-        snapshot = query_codex_rate_limits()
+        snapshot = query_codex_rate_limits(include_reset_credit_details=bool(getattr(args, "include_reset_details", False)))
         if not getattr(args, "no_save", False):
             state["codex_usage"] = snapshot
             save_state(state)
@@ -3418,6 +3635,73 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ))
 
 
+def cmd_models(args: argparse.Namespace) -> int:
+    catalog = query_codex_models()
+    if getattr(args, "json", False):
+        print(json.dumps(catalog, indent=2, sort_keys=True))
+    else:
+        selected = catalog.get("selected") or catalog.get("configured_default") or "codex-default"
+        print(f"selected={selected}")
+        for item in catalog.get("models") or []:
+            marker = "*" if str(item.get("id")) == str(selected) else " "
+            print(f"{marker} {item.get('id')} — {item.get('display_name')}")
+    return 0
+
+
+def cmd_model_policy(args: argparse.Namespace) -> int:
+    operation = str(getattr(args, "model_action", "show") or "show")
+    if operation == "show":
+        policy = model_policy.load_policy(ROOT)
+    elif operation == "set":
+        requested = str(getattr(args, "model", "") or "").strip()
+        if not requested:
+            raise RuntimeError("model-policy set requires --model")
+        catalog = query_codex_models()
+        available = {str(item.get("id") or "") for item in catalog.get("models") or []}
+        if requested not in available:
+            raise RuntimeError(f"model {requested!r} is not in the current authenticated Codex model catalog")
+        policy = model_policy.save_policy(ROOT, requested)
+        live_write(f"model policy updated revision={policy['revision']} model={requested}", "MODEL")
+    elif operation == "reset":
+        policy = model_policy.save_policy(ROOT, None)
+        live_write(f"model policy reset to Codex configured default revision={policy['revision']}", "MODEL")
+    else:
+        raise RuntimeError(f"unsupported model-policy action {operation}")
+    effective = policy.get("model") or configured_codex_model()
+    payload = {**policy, "effective_model": effective}
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"model={policy.get('model') or 'codex-default'} effective={effective or '-'} revision={policy['revision']}")
+    return 0
+
+
+def cmd_redeem_reset(args: argparse.Namespace) -> int:
+    if str(getattr(args, "confirm", "") or "") != "REDEEM":
+        raise RuntimeError("redeem-reset requires --confirm REDEEM")
+    credit_id = str(getattr(args, "credit_id", "") or "").strip() or None
+    result = consume_codex_reset_credit(credit_id)
+    outcome = str(result.get("outcome") or "unknown")
+    live_write(f"banked reset redemption outcome={outcome}", "USAGE")
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"BANKED_RESET outcome={outcome}")
+    return 0 if outcome in {"reset", "alreadyRedeemed", "nothingToReset", "noCredit"} else 2
+
+
+def cmd_usage_reset_stats(args: argparse.Namespace) -> int:
+    if str(getattr(args, "confirm", "") or "") != "RESET":
+        raise RuntimeError("usage-reset-stats requires --confirm RESET")
+    marker = reset_usage_statistics()
+    live_write(f"local token statistics baseline reset at {marker['reset_at']}; provider quota untouched", "USAGE")
+    if getattr(args, "json", False):
+        print(json.dumps(marker, indent=2, sort_keys=True))
+    else:
+        print(f"USAGE_STATS_RESET at={marker['reset_at']} provider_quota=UNCHANGED")
+    return 0
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     init_files()
     state = load_state()
@@ -3439,13 +3723,21 @@ def _policy_arg_updates(args: argparse.Namespace) -> dict:
     mapping = {
         "mode": "mode",
         "reserve_percent": "reserve_percent",
-        "prompt_command_budget": "prompt_command_budget",
+        "strict_prompt_command_budget": "strict_prompt_command_budget",
+        "strict_max_commands": "strict_max_commands",
+        "strict_max_reported_files": "strict_max_reported_files",
+        "strict_max_cumulative_input": "strict_max_cumulative_input",
+        "strict_max_noncached_input": "strict_max_noncached_input",
+        "normal_prompt_command_budget": "normal_prompt_command_budget",
         "normal_max_commands": "normal_max_commands",
         "normal_max_reported_files": "normal_max_reported_files",
         "normal_max_cumulative_input": "normal_max_cumulative_input",
         "normal_max_noncached_input": "normal_max_noncached_input",
-        "strict_multiplier": "strict_multiplier",
-        "relaxed_multiplier": "relaxed_multiplier",
+        "relaxed_prompt_command_budget": "relaxed_prompt_command_budget",
+        "relaxed_max_commands": "relaxed_max_commands",
+        "relaxed_max_reported_files": "relaxed_max_reported_files",
+        "relaxed_max_cumulative_input": "relaxed_max_cumulative_input",
+        "relaxed_max_noncached_input": "relaxed_max_noncached_input",
         "runaway_max_commands": "runaway_max_commands",
         "runaway_max_reported_files": "runaway_max_reported_files",
         "runaway_max_cumulative_input": "runaway_max_cumulative_input",
@@ -3929,13 +4221,12 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency_set = efficiency_sub.add_parser("set", help="atomically update live efficiency settings")
     efficiency_set.add_argument("--mode", choices=tuple(mode.lower() for mode in EFFICIENCY_MODES))
     efficiency_set.add_argument("--reserve-percent", type=float)
-    efficiency_set.add_argument("--prompt-command-budget", type=int)
-    efficiency_set.add_argument("--normal-max-commands", type=int)
-    efficiency_set.add_argument("--normal-max-reported-files", type=int)
-    efficiency_set.add_argument("--normal-max-cumulative-input", type=int)
-    efficiency_set.add_argument("--normal-max-noncached-input", type=int)
-    efficiency_set.add_argument("--strict-multiplier", type=float)
-    efficiency_set.add_argument("--relaxed-multiplier", type=float)
+    for prefix in ("strict", "normal", "relaxed"):
+        efficiency_set.add_argument(f"--{prefix}-prompt-command-budget", type=int)
+        efficiency_set.add_argument(f"--{prefix}-max-commands", type=int)
+        efficiency_set.add_argument(f"--{prefix}-max-reported-files", type=int)
+        efficiency_set.add_argument(f"--{prefix}-max-cumulative-input", type=int)
+        efficiency_set.add_argument(f"--{prefix}-max-noncached-input", type=int)
     efficiency_set.add_argument("--runaway-max-commands", type=int)
     efficiency_set.add_argument("--runaway-max-reported-files", type=int)
     efficiency_set.add_argument("--runaway-max-cumulative-input", type=int)
@@ -3948,6 +4239,30 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency_reset_mode = efficiency_sub.add_parser("reset-mode", help="reset only the efficiency mode to NORMAL")
     efficiency_reset_mode.add_argument("--json", action="store_true")
     efficiency_reset_mode.set_defaults(func=cmd_efficiency_policy)
+    model = sub.add_parser("model-policy", help="show or update RALPH's project-local Codex model selection")
+    model_sub = model.add_subparsers(dest="model_action", required=True)
+    model_show = model_sub.add_parser("show", help="show the selected/effective model")
+    model_show.add_argument("--json", action="store_true")
+    model_show.set_defaults(func=cmd_model_policy)
+    model_set = model_sub.add_parser("set", help="select one model from the current authenticated Codex catalog")
+    model_set.add_argument("--model", required=True)
+    model_set.add_argument("--json", action="store_true")
+    model_set.set_defaults(func=cmd_model_policy)
+    model_reset = model_sub.add_parser("reset", help="return to the user's configured Codex default model")
+    model_reset.add_argument("--json", action="store_true")
+    model_reset.set_defaults(func=cmd_model_policy)
+    models = sub.add_parser("models", help="show the current authenticated Codex model catalog")
+    models.add_argument("--json", action="store_true")
+    models.set_defaults(func=cmd_models)
+    redeem = sub.add_parser("redeem-reset", help="redeem one explicitly confirmed banked Codex reset")
+    redeem.add_argument("--credit-id", default=None, help="opaque credit ID from the live app-server snapshot; omit to let Codex select")
+    redeem.add_argument("--confirm", required=True, help="must be REDEEM")
+    redeem.add_argument("--json", action="store_true")
+    redeem.set_defaults(func=cmd_redeem_reset)
+    usage_reset = sub.add_parser("usage-reset-stats", help="reset RALPH local token-stat display baseline only")
+    usage_reset.add_argument("--confirm", required=True, help="must be RESET")
+    usage_reset.add_argument("--json", action="store_true")
+    usage_reset.set_defaults(func=cmd_usage_reset_stats)
     steer = sub.add_parser("steer", help="record bounded human direction for the current blocked step and retry it")
     steer.add_argument("plan_hash")
     steer.add_argument("--gate", required=True, help="exact current human-gate ID")
@@ -4004,6 +4319,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--details", action="store_true", help="include per-loop token usage")
     usage.add_argument("--json", action="store_true", help="emit machine-readable report")
     usage.add_argument("--no-save", action="store_true", help=argparse.SUPPRESS)
+    usage.add_argument("--include-reset-details", action="store_true", help=argparse.SUPPRESS)
     usage.set_defaults(func=cmd_usage)
     serve = sub.add_parser("serve", help="run the local operator web console")
     serve.add_argument("--host", default="127.0.0.1", help="bind address; default 127.0.0.1")

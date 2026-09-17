@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "zen_ralph_efficiency_policy_v1"
+SCHEMA = "zen_ralph_efficiency_policy_v2"
 MODES = ("STRICT", "NORMAL", "RELAXED", "OFF")
 FILENAME = "efficiency-policy.json"
 
@@ -21,13 +21,21 @@ DEFAULT_POLICY: dict[str, Any] = {
     "schema": SCHEMA,
     "mode": "NORMAL",
     "reserve_percent": 5.0,
-    "prompt_command_budget": 6,
+    "strict_prompt_command_budget": 4,
+    "strict_max_commands": 6,
+    "strict_max_reported_files": 6,
+    "strict_max_cumulative_input": 450_000,
+    "strict_max_noncached_input": 75_000,
+    "normal_prompt_command_budget": 6,
     "normal_max_commands": 8,
     "normal_max_reported_files": 8,
     "normal_max_cumulative_input": 600_000,
     "normal_max_noncached_input": 100_000,
-    "strict_multiplier": 0.75,
-    "relaxed_multiplier": 4.0,
+    "relaxed_prompt_command_budget": 12,
+    "relaxed_max_commands": 32,
+    "relaxed_max_reported_files": 32,
+    "relaxed_max_cumulative_input": 2_400_000,
+    "relaxed_max_noncached_input": 400_000,
     "runaway_max_commands": 40,
     "runaway_max_reported_files": 64,
     "runaway_max_cumulative_input": 3_000_000,
@@ -36,16 +44,17 @@ DEFAULT_POLICY: dict[str, Any] = {
     "updated_at": None,
 }
 
+_LIMIT_SUFFIXES = (
+    "prompt_command_budget",
+    "max_commands",
+    "max_reported_files",
+    "max_cumulative_input",
+    "max_noncached_input",
+)
 _EDITABLE = {
     "mode",
     "reserve_percent",
-    "prompt_command_budget",
-    "normal_max_commands",
-    "normal_max_reported_files",
-    "normal_max_cumulative_input",
-    "normal_max_noncached_input",
-    "strict_multiplier",
-    "relaxed_multiplier",
+    *(f"{prefix}_{suffix}" for prefix in ("strict", "normal", "relaxed") for suffix in _LIMIT_SUFFIXES),
     "runaway_max_commands",
     "runaway_max_reported_files",
     "runaway_max_cumulative_input",
@@ -79,8 +88,42 @@ def _number(value: Any, name: str, *, minimum: float, maximum: float, integer: b
     return float(number)
 
 
+def _migrate_v1(source: dict[str, Any]) -> dict[str, Any]:
+    """Translate the previous normal+multiplier layout into explicit per-mode limits."""
+    migrated = dict(source)
+    if not any(key.startswith("strict_") and key != "strict_multiplier" for key in source):
+        try:
+            strict = float(source.get("strict_multiplier", 0.75))
+        except (TypeError, ValueError):
+            strict = 0.75
+        for suffix in _LIMIT_SUFFIXES:
+            legacy_key = "prompt_command_budget" if suffix == "prompt_command_budget" else f"normal_{suffix}"
+            base = source.get(legacy_key, DEFAULT_POLICY[f"normal_{suffix}"])
+            try:
+                value = float(base) * strict
+            except (TypeError, ValueError):
+                value = float(DEFAULT_POLICY[f"strict_{suffix}"])
+            migrated[f"strict_{suffix}"] = max(1, int(value))
+    if not any(key.startswith("relaxed_") and key != "relaxed_multiplier" for key in source):
+        try:
+            relaxed = float(source.get("relaxed_multiplier", 4.0))
+        except (TypeError, ValueError):
+            relaxed = 4.0
+        for suffix in _LIMIT_SUFFIXES:
+            legacy_key = "prompt_command_budget" if suffix == "prompt_command_budget" else f"normal_{suffix}"
+            base = source.get(legacy_key, DEFAULT_POLICY[f"normal_{suffix}"])
+            try:
+                value = float(base) * relaxed
+            except (TypeError, ValueError):
+                value = float(DEFAULT_POLICY[f"relaxed_{suffix}"])
+            migrated[f"relaxed_{suffix}"] = max(1, int(value))
+    if "normal_prompt_command_budget" not in migrated and "prompt_command_budget" in source:
+        migrated["normal_prompt_command_budget"] = source["prompt_command_budget"]
+    return migrated
+
+
 def normalize_policy(raw: dict[str, Any] | None) -> dict[str, Any]:
-    source = dict(raw or {})
+    source = _migrate_v1(dict(raw or {}))
     merged = defaults()
     merged.update({key: source[key] for key in _EDITABLE if key in source})
 
@@ -89,28 +132,38 @@ def normalize_policy(raw: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError(f"mode must be one of {', '.join(MODES)}")
     merged["mode"] = mode
     merged["reserve_percent"] = _number(merged["reserve_percent"], "reserve_percent", minimum=0.0, maximum=50.0)
-    merged["prompt_command_budget"] = _number(merged["prompt_command_budget"], "prompt_command_budget", minimum=1, maximum=100, integer=True)
-    merged["normal_max_commands"] = _number(merged["normal_max_commands"], "normal_max_commands", minimum=1, maximum=200, integer=True)
-    merged["normal_max_reported_files"] = _number(merged["normal_max_reported_files"], "normal_max_reported_files", minimum=1, maximum=500, integer=True)
-    merged["normal_max_cumulative_input"] = _number(merged["normal_max_cumulative_input"], "normal_max_cumulative_input", minimum=1_000, maximum=50_000_000, integer=True)
-    merged["normal_max_noncached_input"] = _number(merged["normal_max_noncached_input"], "normal_max_noncached_input", minimum=1_000, maximum=25_000_000, integer=True)
-    merged["strict_multiplier"] = _number(merged["strict_multiplier"], "strict_multiplier", minimum=0.1, maximum=1.0)
-    merged["relaxed_multiplier"] = _number(merged["relaxed_multiplier"], "relaxed_multiplier", minimum=1.0, maximum=20.0)
+
+    for prefix in ("strict", "normal", "relaxed"):
+        merged[f"{prefix}_prompt_command_budget"] = _number(
+            merged[f"{prefix}_prompt_command_budget"], f"{prefix}_prompt_command_budget", minimum=1, maximum=100, integer=True
+        )
+        merged[f"{prefix}_max_commands"] = _number(
+            merged[f"{prefix}_max_commands"], f"{prefix}_max_commands", minimum=1, maximum=200, integer=True
+        )
+        merged[f"{prefix}_max_reported_files"] = _number(
+            merged[f"{prefix}_max_reported_files"], f"{prefix}_max_reported_files", minimum=1, maximum=500, integer=True
+        )
+        merged[f"{prefix}_max_cumulative_input"] = _number(
+            merged[f"{prefix}_max_cumulative_input"], f"{prefix}_max_cumulative_input", minimum=1_000, maximum=50_000_000, integer=True
+        )
+        merged[f"{prefix}_max_noncached_input"] = _number(
+            merged[f"{prefix}_max_noncached_input"], f"{prefix}_max_noncached_input", minimum=1_000, maximum=25_000_000, integer=True
+        )
+
     merged["runaway_max_commands"] = _number(merged["runaway_max_commands"], "runaway_max_commands", minimum=1, maximum=2_000, integer=True)
     merged["runaway_max_reported_files"] = _number(merged["runaway_max_reported_files"], "runaway_max_reported_files", minimum=1, maximum=5_000, integer=True)
     merged["runaway_max_cumulative_input"] = _number(merged["runaway_max_cumulative_input"], "runaway_max_cumulative_input", minimum=1_000, maximum=250_000_000, integer=True)
     merged["runaway_max_noncached_input"] = _number(merged["runaway_max_noncached_input"], "runaway_max_noncached_input", minimum=1_000, maximum=100_000_000, integer=True)
 
-    relaxed = float(merged["relaxed_multiplier"])
     required = {
-        "runaway_max_commands": int(float(merged["normal_max_commands"]) * relaxed),
-        "runaway_max_reported_files": int(float(merged["normal_max_reported_files"]) * relaxed),
-        "runaway_max_cumulative_input": int(float(merged["normal_max_cumulative_input"]) * relaxed),
-        "runaway_max_noncached_input": int(float(merged["normal_max_noncached_input"]) * relaxed),
+        "runaway_max_commands": max(int(merged[f"{prefix}_max_commands"]) for prefix in ("strict", "normal", "relaxed")),
+        "runaway_max_reported_files": max(int(merged[f"{prefix}_max_reported_files"]) for prefix in ("strict", "normal", "relaxed")),
+        "runaway_max_cumulative_input": max(int(merged[f"{prefix}_max_cumulative_input"]) for prefix in ("strict", "normal", "relaxed")),
+        "runaway_max_noncached_input": max(int(merged[f"{prefix}_max_noncached_input"]) for prefix in ("strict", "normal", "relaxed")),
     }
     for name, floor in required.items():
         if int(merged[name]) < floor:
-            raise ValueError(f"{name} must be >= {floor} so the emergency ceiling does not undercut RELAXED policy")
+            raise ValueError(f"{name} must be >= {floor} so the emergency ceiling does not undercut an enabled efficiency mode")
 
     merged["schema"] = SCHEMA
     try:
@@ -166,16 +219,13 @@ def limits(policy: dict[str, Any], mode: str | None = None) -> dict[str, int]:
     selected = str(mode or policy["mode"]).upper()
     if selected not in MODES:
         raise ValueError(f"mode must be one of {', '.join(MODES)}")
-    multiplier = 1.0
-    if selected == "STRICT":
-        multiplier = float(policy["strict_multiplier"])
-    elif selected == "RELAXED":
-        multiplier = float(policy["relaxed_multiplier"])
+    prefix = "normal" if selected == "OFF" else selected.lower()
     return {
-        "commands": max(1, int(int(policy["normal_max_commands"]) * multiplier)),
-        "files": max(1, int(int(policy["normal_max_reported_files"]) * multiplier)),
-        "cumulative": max(1, int(int(policy["normal_max_cumulative_input"]) * multiplier)),
-        "noncached": max(1, int(int(policy["normal_max_noncached_input"]) * multiplier)),
+        "prompt_commands": int(policy[f"{prefix}_prompt_command_budget"]),
+        "commands": int(policy[f"{prefix}_max_commands"]),
+        "files": int(policy[f"{prefix}_max_reported_files"]),
+        "cumulative": int(policy[f"{prefix}_max_cumulative_input"]),
+        "noncached": int(policy[f"{prefix}_max_noncached_input"]),
     }
 
 
