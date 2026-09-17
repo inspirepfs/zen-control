@@ -115,3 +115,35 @@ After a terminal/browser interruption, start with `status`, then use
 `checkpoints`, `checkpoint-info`, and `report`. Persisted state, canonical plan,
 checkpoint, journal, and qualification fingerprint determine restart authority;
 terminal output and web-job metadata do not.
+
+## Efficiency governor and 5% start reserve
+
+RALPH separates **efficiency policy** from **usage admission**. The 5% Codex reserve is a start gate for new plan execution, not an in-flight kill switch. When a new proposal begins with more than 5% remaining in every relevant Codex window, RALPH admits that work and, once the proposal has an identity, persists a plan-bound `usage_admission` record. That exact plan may continue through later model turns, qualification, bounded repair, review, and completion even if a window subsequently falls below 5%. Backend `ordinaryUsageAllowed=false` still stops execution. A different plan does not inherit the admission.
+
+Example: a plan admitted with 15% remaining may legitimately finish at 1%. At 1%, another plan is not admitted until usage recovers above the reserve. This avoids wasting budget already invested in an in-flight job while retaining a hard boundary against starting additional work.
+
+The operator can select the efficiency governor per plan:
+
+| Mode | Behaviour | Typical use |
+|---|---|---|
+| `STRICT` | 75% of the normal per-turn efficiency thresholds. | Small, highly bounded fixes. |
+| `NORMAL` | Existing baseline thresholds. | Default implementation work. |
+| `RELAXED` | 4x normal thresholds. | Documentation review, architecture review, migrations, extraction and broad repository analysis. |
+| `OFF` | Ordinary efficiency-policy pauses are disabled. | Intentionally high-context work where the operator accepts the cost. |
+
+Emergency runaway ceilings remain active in **all** modes, including `OFF`. The mode controls ordinary efficiency policy; it never disables controller safety, authority, validation, repair budgets, or backend usage denial.
+
+CLI example:
+
+```bash
+python3 scripts/ralph.py run --efficiency-mode relaxed
+```
+
+The local web console exposes the same four-position selector before starting an approved plan. RALPH also records a conservative planner recommendation (`NORMAL` or `RELAXED`) from the goal text, but the recommendation never silently weakens the active mode.
+
+Expected stop reasons are deliberately distinct:
+
+- `PAUSED_EFFICIENCY_POLICY` — selected efficiency mode threshold exceeded after a qualified step;
+- `PAUSED_RUNAWAY` — emergency ceiling exceeded;
+- `BLOCKED_INSUFFICIENT_START_RESERVE` — a plan without an existing admission attempted to start at or below the 5% reserve.
+

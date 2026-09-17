@@ -225,7 +225,16 @@ class ActionAuthorityTests(unittest.TestCase):
     def test_run_is_background_and_bounded(self):
         request = web.command_for_action({"action": "run", "max_loops": 999}, self.base_state())
         self.assertTrue(request.background)
-        self.assertEqual(request.argv[-1], "40")
+        self.assertIn("--max-loops", request.argv)
+        self.assertEqual(request.argv[request.argv.index("--max-loops") + 1], "40")
+        self.assertEqual(request.argv[request.argv.index("--efficiency-mode") + 1], "normal")
+
+    def test_run_accepts_explicit_efficiency_dial(self):
+        request = web.command_for_action(
+            {"action": "run", "max_loops": 10, "efficiency_mode": "off"},
+            self.base_state(),
+        )
+        self.assertEqual(request.argv[request.argv.index("--efficiency-mode") + 1], "off")
 
     def test_actions_expose_immediate_operational_state(self):
         cases = [

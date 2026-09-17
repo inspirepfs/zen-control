@@ -316,6 +316,30 @@ class EfficiencyBudgetTests(unittest.TestCase):
         self.assertIn("non-cached-input 110000>100000", findings)
 
 
+    def test_relaxed_mode_allows_broad_documentation_turn(self):
+        stats = {
+            "commands_executed": 12,
+            "files_inspected": 16,
+            "input_tokens": 900000,
+            "cached_input_tokens": 780000,
+        }
+        self.assertEqual(ralph.efficiency_findings(stats, mode="RELAXED"), [])
+
+    def test_off_disables_policy_findings_but_not_runaway_guard(self):
+        stats = {
+            "commands_executed": 45,
+            "files_inspected": 70,
+            "input_tokens": 3500000,
+            "cached_input_tokens": 2900000,
+        }
+        self.assertEqual(ralph.efficiency_findings(stats, mode="OFF"), [])
+        self.assertTrue(ralph.runaway_findings(stats))
+
+    def test_documentation_goal_recommends_relaxed_without_selecting_it(self):
+        self.assertEqual(ralph.recommended_efficiency_mode("Review and update all documentation"), "RELAXED")
+        self.assertEqual(ralph.recommended_efficiency_mode("Fix one classifier bug"), "NORMAL")
+
+
 class ControllerQualificationAuthorityTests(unittest.TestCase):
     def test_validation_only_blocker_defers_to_controller_gates(self):
         result = {
@@ -423,6 +447,34 @@ class CodexUsageGuardTests(unittest.TestCase):
     def test_backend_disallow_pauses_even_when_percentages_have_headroom(self):
         snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=10, allowed=False), "gpt-5.6-terra")
         status, _ = ralph.codex_usage_guard(snapshot)
+        self.assertEqual(status, "PAUSE")
+
+    def test_admitted_plan_can_continue_below_five_percent(self):
+        snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=99, used_secondary=40), "gpt-5.6-terra")
+        status, findings = ralph.codex_usage_guard(snapshot, admitted=True)
+        self.assertEqual(status, "ADMITTED")
+        self.assertIn("1.0% <= 5.0% reserve", findings[0])
+
+    def test_admission_is_bound_to_exact_plan_identity(self):
+        state = {
+            "plan_hash": "plan-b",
+            "usage_admission": {"admitted": True, "plan_hash": "plan-a"},
+        }
+        self.assertFalse(ralph.usage_admission_valid(state))
+        state["plan_hash"] = "plan-a"
+        self.assertTrue(ralph.usage_admission_valid(state))
+
+    def test_plan_admitted_at_fifteen_percent_can_finish_at_one_percent(self):
+        state = {"plan_hash": "abc", "usage_admission": None}
+        start = ralph.normalise_codex_usage(self.sample_usage(used_primary=85, used_secondary=40), "gpt-5.6-terra")
+        self.assertTrue(ralph.admit_usage_for_plan(state, start))
+        self.assertEqual(state["usage_admission"]["remaining_percent_at_admission"], 15.0)
+        finish = ralph.normalise_codex_usage(self.sample_usage(used_primary=99, used_secondary=40), "gpt-5.6-terra")
+        status, _ = ralph.codex_usage_guard(finish, admitted=ralph.usage_admission_valid(state))
+        self.assertEqual(status, "ADMITTED")
+        new_plan = {"plan_hash": "def", "usage_admission": state["usage_admission"]}
+        self.assertFalse(ralph.usage_admission_valid(new_plan))
+        status, _ = ralph.codex_usage_guard(finish, admitted=False)
         self.assertEqual(status, "PAUSE")
 
     def test_usage_ledger_tracks_per_plan_and_reset_window_tokens(self):

@@ -53,6 +53,13 @@ EFFICIENCY_MAX_COMMANDS = 8
 EFFICIENCY_MAX_CUMULATIVE_INPUT = 600_000
 EFFICIENCY_MAX_NONCACHED_INPUT = 100_000
 EFFICIENCY_MAX_REPORTED_FILES = 8
+EFFICIENCY_MODES = ("STRICT", "NORMAL", "RELAXED", "OFF")
+EFFICIENCY_MULTIPLIERS = {"STRICT": 0.75, "NORMAL": 1.0, "RELAXED": 4.0}
+# Emergency ceilings remain active even when the ordinary efficiency governor is OFF.
+RUNAWAY_MAX_COMMANDS = 40
+RUNAWAY_MAX_CUMULATIVE_INPUT = 3_000_000
+RUNAWAY_MAX_NONCACHED_INPUT = 500_000
+RUNAWAY_MAX_REPORTED_FILES = 64
 USAGE_RESERVE_PERCENT = 5.0
 USAGE_APP_SERVER_TIMEOUT_SECONDS = 15
 USAGE_POLL_SECONDS = 300
@@ -202,6 +209,9 @@ def default_state() -> dict:
         "push_upstream": None,
         "push_reconciled": False,
         "completion_changes": None,
+        "efficiency_mode": "NORMAL",
+        "efficiency_recommendation": None,
+        "usage_admission": None,
         "updated_at": utc_now(),
     }
 
@@ -1869,8 +1879,45 @@ def loop_stats(loop_started: float, result: dict | None = None, *, gate_duration
     return metrics
 
 
-def efficiency_findings(stats: dict | None) -> list[str]:
-    """Return stable post-loop efficiency findings without interrupting a live edit."""
+def _efficiency_mode(value: str | None) -> str:
+    mode = str(value or "NORMAL").upper()
+    if mode not in EFFICIENCY_MODES:
+        raise ValueError(f"invalid efficiency mode {value!r}; expected one of {', '.join(EFFICIENCY_MODES)}")
+    return mode
+
+
+def efficiency_findings(stats: dict | None, mode: str = "NORMAL") -> list[str]:
+    """Return policy-level efficiency findings for STRICT/NORMAL/RELAXED; OFF disables them."""
+    mode = _efficiency_mode(mode)
+    if mode == "OFF":
+        return []
+    stats = dict(stats or {})
+    commands = int(stats.get("commands_executed") or 0)
+    files = int(stats.get("files_inspected") or 0)
+    cumulative = int(stats.get("input_tokens") or 0)
+    cached = int(stats.get("cached_input_tokens") or 0)
+    noncached = max(0, cumulative - cached)
+    multiplier = EFFICIENCY_MULTIPLIERS[mode]
+    limits = {
+        "commands": max(1, int(EFFICIENCY_MAX_COMMANDS * multiplier)),
+        "files": max(1, int(EFFICIENCY_MAX_REPORTED_FILES * multiplier)),
+        "cumulative": max(1, int(EFFICIENCY_MAX_CUMULATIVE_INPUT * multiplier)),
+        "noncached": max(1, int(EFFICIENCY_MAX_NONCACHED_INPUT * multiplier)),
+    }
+    findings: list[str] = []
+    if commands > limits["commands"]:
+        findings.append(f"commands {commands}>{limits['commands']}")
+    if files > limits["files"]:
+        findings.append(f"reported-files {files}>{limits['files']}")
+    if cumulative > limits["cumulative"]:
+        findings.append(f"cumulative-input {cumulative}>{limits['cumulative']}")
+    if noncached > limits["noncached"]:
+        findings.append(f"non-cached-input {noncached}>{limits['noncached']}")
+    return findings
+
+
+def runaway_findings(stats: dict | None) -> list[str]:
+    """Return emergency single-turn findings that remain active in every efficiency mode."""
     stats = dict(stats or {})
     commands = int(stats.get("commands_executed") or 0)
     files = int(stats.get("files_inspected") or 0)
@@ -1878,15 +1925,25 @@ def efficiency_findings(stats: dict | None) -> list[str]:
     cached = int(stats.get("cached_input_tokens") or 0)
     noncached = max(0, cumulative - cached)
     findings: list[str] = []
-    if commands > EFFICIENCY_MAX_COMMANDS:
-        findings.append(f"commands {commands}>{EFFICIENCY_MAX_COMMANDS}")
-    if files > EFFICIENCY_MAX_REPORTED_FILES:
-        findings.append(f"reported-files {files}>{EFFICIENCY_MAX_REPORTED_FILES}")
-    if cumulative > EFFICIENCY_MAX_CUMULATIVE_INPUT:
-        findings.append(f"cumulative-input {cumulative}>{EFFICIENCY_MAX_CUMULATIVE_INPUT}")
-    if noncached > EFFICIENCY_MAX_NONCACHED_INPUT:
-        findings.append(f"non-cached-input {noncached}>{EFFICIENCY_MAX_NONCACHED_INPUT}")
+    if commands > RUNAWAY_MAX_COMMANDS:
+        findings.append(f"commands {commands}>{RUNAWAY_MAX_COMMANDS}")
+    if files > RUNAWAY_MAX_REPORTED_FILES:
+        findings.append(f"reported-files {files}>{RUNAWAY_MAX_REPORTED_FILES}")
+    if cumulative > RUNAWAY_MAX_CUMULATIVE_INPUT:
+        findings.append(f"cumulative-input {cumulative}>{RUNAWAY_MAX_CUMULATIVE_INPUT}")
+    if noncached > RUNAWAY_MAX_NONCACHED_INPUT:
+        findings.append(f"non-cached-input {noncached}>{RUNAWAY_MAX_NONCACHED_INPUT}")
     return findings
+
+
+def recommended_efficiency_mode(goal: str) -> str:
+    """Recommend, but never silently select, a mode for broad/high-context plans."""
+    text = str(goal or "").lower()
+    broad = (
+        "documentation", "docs", "repository-wide", "repository wide", "architecture review",
+        "migration", "extraction", "audit", "deep review", "full review", "inventory",
+    )
+    return "RELAXED" if any(marker in text for marker in broad) else "NORMAL"
 
 
 def _step_explicitly_delegates_human_gate(step: dict | None) -> bool:
@@ -2307,8 +2364,41 @@ def normalise_codex_usage(raw: dict, model: str | None = None) -> dict:
     }
 
 
-def codex_usage_guard(snapshot: dict, reserve_percent: float = USAGE_RESERVE_PERCENT) -> tuple[str, list[str]]:
-    """Return SAFE, PAUSE, or UNKNOWN using backend authority plus visible windows."""
+def usage_admission_valid(state: dict) -> bool:
+    admission = state.get("usage_admission") if isinstance(state.get("usage_admission"), dict) else {}
+    return bool(
+        admission
+        and admission.get("plan_hash")
+        and admission.get("plan_hash") == state.get("plan_hash")
+        and admission.get("admitted") is True
+    )
+
+
+def _minimum_remaining(snapshot: dict) -> float | None:
+    windows = snapshot.get("windows") if isinstance(snapshot.get("windows"), list) else []
+    values = [float(w.get("remaining_percent", 100.0)) for w in windows if isinstance(w, dict)]
+    return min(values) if values else None
+
+
+def admit_usage_for_plan(state: dict, snapshot: dict, reserve_percent: float = USAGE_RESERVE_PERCENT) -> bool:
+    """Latch start authority to one plan when it has headroom above the reserve."""
+    if usage_admission_valid(state):
+        return True
+    guard, _ = codex_usage_guard(snapshot, reserve_percent=reserve_percent, admitted=False)
+    if guard != "SAFE":
+        return False
+    state["usage_admission"] = {
+        "admitted": True,
+        "plan_hash": state.get("plan_hash"),
+        "admitted_at": utc_now(),
+        "reserve_percent": reserve_percent,
+        "remaining_percent_at_admission": _minimum_remaining(snapshot),
+    }
+    return True
+
+
+def codex_usage_guard(snapshot: dict, reserve_percent: float = USAGE_RESERVE_PERCENT, *, admitted: bool = False) -> tuple[str, list[str]]:
+    """Return SAFE, ADMITTED, PAUSE, or UNKNOWN using backend authority and start-reserve semantics."""
     ordinary = snapshot.get("ordinary_usage_allowed")
     windows = snapshot.get("windows") if isinstance(snapshot.get("windows"), list) else []
     if ordinary is False:
@@ -2319,7 +2409,10 @@ def codex_usage_guard(snapshot: dict, reserve_percent: float = USAGE_RESERVE_PER
         return "UNKNOWN", ["no relevant Codex rate-limit windows were returned"]
     low = [w for w in windows if float(w.get("remaining_percent", 100.0)) <= reserve_percent]
     if low:
-        return "PAUSE", [f"{w.get('name', 'usage')} remaining {float(w.get('remaining_percent', 0.0)):.1f}% <= {reserve_percent:.1f}% reserve" for w in low]
+        findings = [f"{w.get('name', 'usage')} remaining {float(w.get('remaining_percent', 0.0)):.1f}% <= {reserve_percent:.1f}% reserve" for w in low]
+        if admitted:
+            return "ADMITTED", findings
+        return "PAUSE", findings
     return "SAFE", []
 
 
@@ -2368,17 +2461,29 @@ def record_usage_pause(state: dict, snapshot: dict, findings: list[str]) -> None
 
 
 def ensure_codex_usage_capacity(state: dict, *, wait: bool = True, poll_seconds: int = USAGE_POLL_SECONDS) -> bool:
-    """Guard every model turn; optionally wait and automatically resume after reset."""
+    """Admit a plan above reserve, then allow that same plan to finish below reserve.
+
+    Backend denial always wins. The 5% reserve is a *new-plan admission gate*, not
+    an in-flight kill switch. Admission is plan-bound and persisted across reruns.
+    """
     was_paused = state.get("status") == "PAUSED_USAGE_LIMIT"
     while True:
         try:
             snapshot = query_codex_rate_limits()
-            guard, findings = codex_usage_guard(snapshot)
+            admitted = usage_admission_valid(state)
+            guard, findings = codex_usage_guard(snapshot, admitted=admitted)
         except Exception as exc:
             snapshot = {"captured_at": utc_now(), "model": configured_codex_model(), "plan_type": None, "ordinary_usage_allowed": None, "windows": [], "available_reset_credits": None}
             guard, findings = "UNKNOWN", [f"rate-limit read failed: {exc}"]
         state["codex_usage"] = snapshot
+
         if guard == "SAFE":
+            if not usage_admission_valid(state):
+                admit_usage_for_plan(state, snapshot)
+                live_write(
+                    f"plan admitted above {USAGE_RESERVE_PERCENT:.1f}% start reserve · {usage_snapshot_line(snapshot)}",
+                    "USAGE",
+                )
             state["usage_pause"] = None
             state["block_reason"] = None
             if state.get("status") == "PAUSED_USAGE_LIMIT":
@@ -2388,13 +2493,30 @@ def ensure_codex_usage_capacity(state: dict, *, wait: bool = True, poll_seconds:
                     handle.write(f"## Usage resumed — {utc_now()}\n\n- Snapshot: {usage_snapshot_line(snapshot)}\n- Next action: continue approved plan\n\n")
             save_state(state)
             return True
+
+        if guard == "ADMITTED":
+            # The plan entered execution with >reserve headroom. Continue the exact
+            # admitted plan even below reserve so already-spent budget is not wasted.
+            state["usage_pause"] = None
+            state["block_reason"] = None
+            if state.get("status") == "PAUSED_USAGE_LIMIT":
+                state["status"] = "APPROVED"
+            state["usage_admission"]["last_below_reserve_at"] = utc_now()
+            state["usage_admission"]["last_remaining_percent"] = _minimum_remaining(snapshot)
+            save_state(state)
+            live_write(
+                f"below start reserve but admitted plan may finish · {usage_snapshot_line(snapshot)}",
+                "USAGE",
+            )
+            return True
+
         if not was_paused or state.get("status") != "PAUSED_USAGE_LIMIT":
             record_usage_pause(state, snapshot, findings)
             was_paused = True
         detail = "; ".join(findings)
         live_write(f"Codex usage guard={guard}: {detail} · {usage_snapshot_line(snapshot)}", "USAGE")
         if not wait:
-            print(f"PAUSED_USAGE plan={state.get('plan_hash') or '-'} step={state.get('current_step')} reason={detail}")
+            print(f"BLOCKED_INSUFFICIENT_START_RESERVE plan={state.get('plan_hash') or '-'} step={state.get('current_step')} reason={detail}")
             return False
         delay = usage_poll_delay(snapshot, poll_seconds)
         live_write(f"waiting {delay}s before zero-model rate-limit recheck; Ctrl-C is safe because state is recorded", "WAIT")
@@ -2788,6 +2910,14 @@ def cmd_propose(args: argparse.Namespace) -> int:
     state = load_state()
     if state.get("status") not in {"IDLE", "PLAN_COMPLETE", "PUSHED"}:
         raise RuntimeError(f"cannot propose while status={state.get('status')}; finish or resolve the current plan first")
+    try:
+        proposal_usage = query_codex_rate_limits()
+        proposal_guard, proposal_findings = codex_usage_guard(proposal_usage, admitted=False)
+    except Exception as exc:
+        raise RuntimeError(f"cannot verify new-work start reserve: {exc}") from exc
+    if proposal_guard != "SAFE":
+        detail = "; ".join(proposal_findings) or proposal_guard
+        raise RuntimeError(f"BLOCKED_INSUFFICIENT_START_RESERVE: {detail}")
     plan = run_codex(plan_prompt(args.goal), PLAN_SCHEMA, "read-only", context="PLAN PROPOSAL")
     validate_plan(plan)
     digest = plan_hash(plan)
@@ -2797,10 +2927,11 @@ def cmd_propose(args: argparse.Namespace) -> int:
     )
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "self_hosting_candidate": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None})
+    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "self_hosting_candidate": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None, "usage_admission": {"admitted": True, "plan_hash": digest, "admitted_at": utc_now(), "reserve_percent": USAGE_RESERVE_PERCENT, "remaining_percent_at_admission": _minimum_remaining(proposal_usage), "scope": "proposal-and-plan"}, "codex_usage": proposal_usage, "efficiency_mode": "NORMAL", "efficiency_recommendation": recommended_efficiency_mode(args.goal)})
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
+    print(f"Efficiency recommendation: {state['efficiency_recommendation']} (operator may select STRICT/NORMAL/RELAXED/OFF when running)")
     return 0
 
 
@@ -3287,6 +3418,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     tui.configure(getattr(args, "color", "auto"))
     init_files()
     state = load_state()
+    requested_mode = getattr(args, "efficiency_mode", None)
+    if requested_mode is not None:
+        state["efficiency_mode"] = _efficiency_mode(requested_mode)
+        save_state(state)
+    else:
+        state["efficiency_mode"] = _efficiency_mode(state.get("efficiency_mode") or "NORMAL")
     if state.get("status") not in {"APPROVED", "RUNNING", "PAUSED_USAGE_LIMIT"}:
         raise RuntimeError(f"run requires APPROVED/RUNNING/PAUSED_USAGE_LIMIT status, found {state.get('status')}")
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
@@ -3486,14 +3623,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         passed, gates, fp, gate_output, gate_durations = run_gates()
         stats = loop_stats(loop_started, result, gate_durations=gate_durations, repair=repair_no)
         if passed:
-            efficiency = efficiency_findings(stats)
-            next_action = "pause for efficiency review" if efficiency else "next approved step"
+            mode = _efficiency_mode(state.get("efficiency_mode") or "NORMAL")
+            runaway = runaway_findings(stats)
+            efficiency = efficiency_findings(stats, mode=mode)
+            next_action = "pause for runaway review" if runaway else ("pause for efficiency-policy review" if efficiency else "next approved step")
             live_write(f"loop={loop_no:04d} step={step['id']} PASS · class={change_class}", "PASS")
             append_journal(loop_no, step["id"], phase, "PASS", summary=result.get("summary", ""), files=files, gates=gates, repair=repair_no, ideas=result.get("ideas", []), next_action=next_action, change_class=change_class, stats=stats)
             state["last_result"] = "PASS"
             state["last_failure"] = None
             state["active_failure"] = None
-            state["last_efficiency"] = {"status": "WARN" if efficiency else "PASS", "findings": efficiency}
+            state["last_efficiency"] = {
+                "status": "RUNAWAY" if runaway else ("WARN" if efficiency else "PASS"),
+                "mode": mode,
+                "findings": runaway or efficiency,
+            }
             update_context_after_pass(state, step, result, files)
             record_step_result(state, step, "PASS", summary=result.get("summary", ""), files=files, gates=gates, stats=stats)
             entry_stats = change_entries(files, base_ref=loop_git_base)
@@ -3511,10 +3654,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             state["current_step"] += 1
             state["status"] = "APPROVED"
             save_state(state)
+            if runaway:
+                detail = "; ".join(runaway)
+                live_write(f"qualified step completed but emergency runaway ceiling exceeded: {detail}; pausing before next model turn", "EFFICIENCY")
+                print(f"PAUSED_RUNAWAY plan={state['plan_hash']} step={state['current_step']} loops={state['loop_count']} findings={detail}")
+                return 0
             if efficiency:
                 detail = "; ".join(efficiency)
-                live_write(f"qualified step completed but efficiency budget exceeded: {detail}; pausing before next model turn", "EFFICIENCY")
-                print(f"PAUSED_EFFICIENCY plan={state['plan_hash']} step={state['current_step']} loops={state['loop_count']} findings={detail}")
+                live_write(f"qualified step completed but {mode} efficiency policy exceeded: {detail}; pausing before next model turn", "EFFICIENCY")
+                print(f"PAUSED_EFFICIENCY_POLICY mode={mode} plan={state['plan_hash']} step={state['current_step']} loops={state['loop_count']} findings={detail}")
                 return 0
             continue
 
@@ -3690,6 +3838,7 @@ def build_parser() -> argparse.ArgumentParser:
     retire.set_defaults(func=cmd_retire_plan)
     run = sub.add_parser("run")
     run.add_argument("--max-loops", type=int, default=DEFAULT_MAX_LOOPS)
+    run.add_argument("--efficiency-mode", choices=tuple(mode.lower() for mode in EFFICIENCY_MODES), default=None, help="efficiency governor for this plan: strict, normal, relaxed, or off; persisted for resumed runs")
     run.add_argument("--wait-for-limits", action=argparse.BooleanOptionalAction, default=True, help="wait and automatically resume after Codex usage limits recover")
     run.add_argument("--usage-poll-seconds", type=int, default=USAGE_POLL_SECONDS, help="maximum zero-model usage recheck interval while paused")
     run.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="terminal colour mode")

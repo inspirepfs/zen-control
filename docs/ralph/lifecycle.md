@@ -50,3 +50,22 @@ stateDiagram-v2
 Repair stays in `RUNNING`, is bound to the same failure fingerprint and current step, and blocks after three repair attempts. Audited human steering can reset the failure epoch but cannot accept the implementation.
 
 Final qualification runs after the last step and writes evidence before transition: PASS → `READY_TO_COMMIT`; FAIL → `BLOCKED_HUMAN`. There is no `FINAL_QUALIFICATION` status. `resolve-gate` can record `HUMAN_CONFIRMED` only for operator/runtime evidence explicitly delegated by the approved step, never policy violations, active implementation failures, repair exhaustion, or ordinary judgement.
+
+## Resource admission boundary
+
+Execution has a plan-scoped resource admission boundary. Before the new proposal model turn, RALPH reads the supported Codex rate-limit surface. More than 5% remaining admits the work; once the proposal is generated, that admission is bound to the resulting plan hash. The admission persists across process restarts so an interrupted, already-admitted plan is not stranded merely because its remaining allowance later falls below the reserve.
+
+```text
+APPROVED PLAN
+    |
+    +-- remaining > 5% --> ADMITTED(plan_hash) --> execute/validate/repair/review --> completion
+    |                                           |
+    |                                           +-- remaining falls <= 5% --> continue same plan
+    |
+    +-- remaining <= 5% and no matching admission --> BLOCKED_INSUFFICIENT_START_RESERVE
+```
+
+Admission is not transferrable authority. A new proposal receives a new plan identity and no usage admission. Backend denial remains authoritative at all times.
+
+Efficiency policy is orthogonal to admission. `STRICT`, `NORMAL`, `RELAXED`, and `OFF` determine the post-step efficiency threshold; the emergency runaway ceiling is invariant and cannot be disabled by the dial.
+
