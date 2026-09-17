@@ -144,7 +144,7 @@ Each enabled mode owns a complete independent limit set rather than deriving lim
 
 When `OFF` is selected, ordinary mode-limit fields are disabled in the web UI so the operator cannot mistake inactive thresholds for enforced controls. The configurable new-work reserve and emergency runaway ceilings remain active because they are separate safety/resource controls. Runaway ceilings are always enforced and must remain at least as high as every enabled mode limit.
 
-The web panel is deliberately compact: mode and reserve are always visible; only the currently selected mode's five limits are shown; emergency ceilings are under an expandable section. Hover/ⓘ help explains each control, and every value shows its baseline. A small reset icon appears beside values that differ from baseline. Changes are staged and applied atomically with **Apply changes**; browser refresh does not overwrite staged edits. **Restore baselines** stages all defaults and **Discard staged** restores the last applied policy.
+The web panel is deliberately compact: the section header contains **Efficiency mode**, **New-work reserve %**, the current policy revision and the live/pending state in one line. Only the currently selected mode's five limits are shown below; emergency ceilings remain under an expandable section. Hover/ⓘ help explains each control, and limit values show their baseline. A small reset icon appears beside values that differ from baseline. Changes are staged and applied atomically with **Apply changes**; browser refresh does not overwrite staged edits. **Restore baselines** stages all defaults and **Discard staged** restores the last applied policy. The planner recommendation is not repeated in the panel because NORMAL is the default and recommendation does not change policy authority.
 
 Equivalent CLI control remains available:
 
@@ -166,7 +166,7 @@ Expected resource stops remain distinct:
 
 ### Live model picker
 
-The Usage / Token Economy toolbar exposes the authenticated Codex model catalog. Selection is stored only in `.ralph/model-policy.json`; RALPH does not rewrite `~/.codex/config.toml`. Selecting a model while RALPH is active changes the **next** Codex process/model turn, not an already-running process. The adjacent reset icon removes the project override and returns to the configured Codex default.
+The authenticated Codex model picker is exposed in the console's **top utility bar**, alongside live/job state, token-stat reset and logout, so model selection remains available without scrolling. Selection is stored only in `.ralph/model-policy.json`; RALPH does not rewrite `~/.codex/config.toml`. Selecting a model while RALPH is active changes the **next** Codex process/model turn, not an already-running process. The adjacent reset icon removes the project override and returns to the configured Codex default.
 
 ### Banked reset redemption
 
@@ -176,7 +176,7 @@ After a successful redemption action, the web usage monitor refreshes immediatel
 
 ### Consumption by plan and local statistics reset
 
-`usage-ledger.jsonl` remains the durable local source for observed model-turn counters. **Consumption by plan** keeps each plan to one compact row showing plan identity, turns, total tokens, cache ratio and goal. Expanding a row exposes:
+`usage-ledger.jsonl` remains the durable local source for observed model-turn counters. **Consumption by plan** uses an aligned compact table-like summary with plan identity, turns, total tokens, cache ratio and a single-line goal. The expand chevron is positioned independently from the data grid so long goals cannot collapse into a narrow column. Expanding a row exposes:
 
 - input and non-cached input;
 - cached and cache-write input;
@@ -186,4 +186,4 @@ After a successful redemption action, the web usage monitor refreshes immediatel
 - model(s) used;
 - compact consumption breakdowns by scope, phase and step.
 
-The red **Reset token stats** control requires confirmation. It writes only `.ralph/usage-stats-reset.json`, moving the local reporting baseline forward. It does **not** delete the ledger, redeem/reset provider quota, modify banked reset credits, or create new work authority. Earlier rows remain available for audit/recovery with explicit pre-reset reads; ordinary web/CLI reports show only post-baseline activity. The monitor refreshes immediately after reset.
+The red **Reset token stats** control is also in the top utility bar and requires confirmation. It writes only `.ralph/usage-stats-reset.json`, moving the local reporting baseline forward. It does **not** delete the ledger, redeem/reset provider quota, modify banked reset credits, or create new work authority. Earlier rows remain available for audit/recovery with explicit pre-reset reads; ordinary web/CLI reports show only post-baseline activity. The monitor refreshes immediately after reset.
