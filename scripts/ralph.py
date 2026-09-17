@@ -77,6 +77,8 @@ TOOLING_PATHS = {
     "tests/test_ralph_gate.py",
     "tests/test_ralph_lifecycle.py",
     "tests/test_ralph_retry_hardening.py",
+    "tests/test_ralph_web.py",
+    "tests/test_ralph_self_hosting.py",
     "docs/RALPH-LITE.md",
 }
 
@@ -189,6 +191,8 @@ def default_state() -> dict:
         "plan_owned_files": [],
         "human_steering": [],
         "steering_allowed_new_tests": [],
+        "self_hosting_grant": None,
+        "self_hosting_grant_history": [],
         "step_results": [],
         "final_qualification": None,
         "commit_sha": None,
@@ -1351,13 +1355,57 @@ def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
 
 
 def authority_snapshot() -> dict[Path, bytes | None]:
-    paths = (
-        STATE, PLAN, IDEAS, JOURNAL, POLICY, CONTEXT,
-        ROOT / ".gitignore", ROOT / "scripts" / "ralph.py", ROOT / "scripts" / "ralph_gate.py", ROOT / "scripts" / "ralph_tui.py",
-        ROOT / "tests" / "test_ralph_lite.py", ROOT / "tests" / "test_ralph_gate.py", ROOT / "tests" / "test_ralph_lifecycle.py",
-        ROOT / "docs" / "RALPH-LITE.md",
-    )
+    runtime_paths = {STATE, PLAN, IDEAS, JOURNAL, POLICY, CONTEXT}
+    tooling_paths = {ROOT / rel for rel in TOOLING_PATHS if not rel.startswith(".ralph/")}
+    paths = runtime_paths | tooling_paths
     return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def _normalize_repo_path(value: str) -> str:
+    path = str(value or "").strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def authority_changed_paths(snapshot: dict[Path, bytes | None]) -> list[str]:
+    changed: list[str] = []
+    for path, content in snapshot.items():
+        current = path.read_bytes() if path.exists() else None
+        if current == content:
+            continue
+        try:
+            changed.append(path.relative_to(ROOT).as_posix())
+        except ValueError:
+            changed.append(str(path))
+    return sorted(changed)
+
+
+def self_hosting_grant_allows(state: dict, step_no: int, changed: Iterable[str]) -> tuple[bool, str]:
+    paths = sorted({_normalize_repo_path(str(path)) for path in changed if str(path).strip()})
+    if not paths:
+        return False, "no authority paths changed"
+    grant = state.get("self_hosting_grant") if isinstance(state.get("self_hosting_grant"), dict) else {}
+    if not grant:
+        return False, "no active self-hosting grant"
+    if str(grant.get("plan_hash") or "") != str(state.get("plan_hash") or ""):
+        return False, "self-hosting grant plan hash does not match active plan"
+    if int(grant.get("step") or 0) != int(step_no):
+        return False, "self-hosting grant is not for the current step"
+    allowed = {str(path) for path in grant.get("paths") or []}
+    runtime = [path for path in paths if path == ".ralph" or path.startswith(".ralph/")]
+    if runtime:
+        return False, f"RALPH runtime authority is never self-hosting writable: {runtime}"
+    protected = [path for path in paths if is_protected_path(path)]
+    if protected:
+        return False, f"protected paths are never self-hosting writable: {protected}"
+    non_tooling = [path for path in paths if not is_tooling_path(path)]
+    if non_tooling:
+        return False, f"self-hosting grant applies only to RALPH tooling paths: {non_tooling}"
+    extra = sorted(set(paths) - allowed)
+    if extra:
+        return False, f"authority changes exceed exact self-hosting grant: {extra}"
+    return True, f"exact self-hosting grant permits {paths}"
 
 
 def protected_snapshot() -> dict[Path, bytes]:
@@ -2584,7 +2632,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     )
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None})
+    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None})
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
@@ -2609,6 +2657,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     state["plan_owned_files"] = []
     state["human_steering"] = []
     state["steering_allowed_new_tests"] = []
+    state["self_hosting_grant"] = None
     state["step_results"] = []
     state.pop("proposal_previous_state", None)
     save_state(state)
@@ -2752,6 +2801,7 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
         "last_failure": None,
         "last_result": "RETIRED",
         "block_reason": None,
+        "self_hosting_grant": None,
     })
     state.pop("proposal_previous_state", None)
 
@@ -2793,7 +2843,7 @@ def cmd_steer(args: argparse.Namespace) -> int:
 
     allowed_new_tests: list[str] = []
     for raw in list(args.allow_new_test or []):
-        path = str(raw or "").strip().replace("\\", "/").lstrip("./")
+        path = _normalize_repo_path(str(raw or ""))
         if not path.startswith("tests/") or path == "tests/":
             raise RuntimeError(f"--allow-new-test requires a concrete tests/ path: {path or raw}")
         if path not in blocked_test_paths:
@@ -2867,6 +2917,86 @@ def cmd_steer(args: argparse.Namespace) -> int:
         direction=direction,
         allowed_new_tests=allowed_new_tests,
     ))
+    return 0
+
+
+def cmd_authorize_self_hosting(args: argparse.Namespace) -> int:
+    """Grant exact, one-step RALPH tooling authority after an explicit policy stop."""
+    init_files()
+    state = load_state()
+    if state.get("status") != "BLOCKED_HUMAN":
+        raise RuntimeError("authorize-self-hosting is only valid from BLOCKED_HUMAN")
+    if args.plan_hash != state.get("plan_hash"):
+        raise RuntimeError("authorize-self-hosting hash does not match the approved plan")
+    expected_gate = gate_id_for_state(state)
+    if args.gate != expected_gate:
+        raise RuntimeError(f"authorize-self-hosting gate does not match current gate {expected_gate}")
+    original_block = " ".join(str(state.get("block_reason") or "").split())
+    if original_block != "Codex attempted to change RALPH controller/tooling authority":
+        raise RuntimeError("authorize-self-hosting is valid only for the current RALPH tooling authority block")
+    reason = " ".join(str(args.reason or "").split())
+    if not reason:
+        raise RuntimeError("authorize-self-hosting requires a non-empty operator reason")
+
+    step_no = int(state.get("current_step") or 0)
+    steps = list(((state.get("plan") or {}).get("steps") or []))
+    if not (1 <= step_no <= len(steps)):
+        raise RuntimeError("authorize-self-hosting cannot resolve current approved step")
+
+    requested: list[str] = []
+    for raw in list(args.path or []):
+        path = _normalize_repo_path(str(raw or ""))
+        if not path or path == ".ralph" or path.startswith(".ralph/"):
+            raise RuntimeError(f"self-hosting grant cannot include RALPH runtime state: {path or raw}")
+        if is_protected_path(path):
+            raise RuntimeError(f"self-hosting grant cannot include protected path: {path}")
+        if not is_tooling_path(path):
+            raise RuntimeError(f"self-hosting grant requires an exact registered RALPH tooling path: {path}")
+        if path not in requested:
+            requested.append(path)
+    if not requested:
+        raise RuntimeError("authorize-self-hosting requires at least one exact --path")
+
+    grant = {
+        "plan_hash": state.get("plan_hash"),
+        "step": step_no,
+        "gate_id": expected_gate,
+        "paths": sorted(requested),
+        "reason": reason[:1200],
+        "granted_at": utc_now(),
+    }
+    history = state.get("self_hosting_grant_history") if isinstance(state.get("self_hosting_grant_history"), list) else []
+    state["self_hosting_grant_history"] = [*history[-19:], grant]
+    state["self_hosting_grant"] = grant
+
+    steering = state.get("human_steering") if isinstance(state.get("human_steering"), list) else []
+    steering_record = {
+        "gate_id": expected_gate,
+        "plan_hash": state.get("plan_hash"),
+        "step": step_no,
+        "step_title": str(steps[step_no - 1].get("title") or ""),
+        "direction": f"Operator granted supervised self-hosting authority only for: {', '.join(sorted(requested))}. {reason}"[:1200],
+        "self_hosting_paths": sorted(requested),
+        "original_block": original_block,
+        "recorded_at": grant["granted_at"],
+    }
+    state["human_steering"] = [*steering[-49:], steering_record]
+    state["status"] = "APPROVED"
+    state["block_reason"] = None
+    save_state(state)
+    append_journal(
+        int(state.get("loop_count") or 0), step_no, "self-hosting-authority", "AUTHORIZED",
+        summary=reason, files=sorted(requested),
+        next_action="retry same approved step with exact supervised tooling authority",
+    )
+    live_write(
+        f"gate={expected_gate} step={step_no} supervised self-hosting authority granted · {','.join(sorted(requested))}",
+        "GATE-HUMAN",
+    )
+    print(
+        f"SELF_HOSTING_AUTHORIZED plan={state['plan_hash']} step={step_no} "
+        f"gate={expected_gate} paths={','.join(sorted(requested))}"
+    )
     return 0
 
 
@@ -3062,15 +3192,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         change_class = classify_changes(files)
         tooling_changed = [path for path in files if is_tooling_path(path)]
 
-        if authority_changed(authority):
-            restore_authority(authority)
-            state = load_state()
-            detail = f"tooling paths {tooling_changed}" if tooling_changed else "RALPH runtime authority"
-            reason = f"Codex changed {detail}; original contents restored"
-            live_write(reason, "POLICY")
-            append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
-            block(state, "Codex attempted to change RALPH controller/tooling authority")
-            return 2
+        changed_authority = authority_changed_paths(authority)
+        if changed_authority:
+            granted, grant_reason = self_hosting_grant_allows(state, int(step["id"]), changed_authority)
+            if not granted:
+                restore_authority(authority)
+                state = load_state()
+                detail = f"authority paths {changed_authority}"
+                reason = f"Codex changed {detail}; original contents restored; {grant_reason}"
+                live_write(reason, "POLICY")
+                append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
+                block(state, "Codex attempted to change RALPH controller/tooling authority")
+                return 2
+            live_write(
+                f"step={step['id']} supervised self-hosting authority accepted · {','.join(changed_authority)}",
+                "AUTHORITY",
+            )
 
         protected = [p for p in files if is_protected_path(p)]
         test_violations = test_policy_violation(
@@ -3169,6 +3306,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 tests=gates,
                 tokens=stats,
             ))
+            state["self_hosting_grant"] = None
             state["current_step"] += 1
             state["status"] = "APPROVED"
             save_state(state)
@@ -3360,6 +3498,15 @@ def build_parser() -> argparse.ArgumentParser:
     steer.add_argument("--direction", required=True, help="bounded human direction retained in the audit trail and next prompt")
     steer.add_argument("--allow-new-test", action="append", default=[], metavar="PATH", help="explicitly authorise one exact new tests/ path; never permits editing pre-existing tests")
     steer.set_defaults(func=cmd_steer)
+    self_host = sub.add_parser(
+        "authorize-self-hosting",
+        help="grant exact one-step RALPH tooling authority after an explicit authority block",
+    )
+    self_host.add_argument("plan_hash")
+    self_host.add_argument("--gate", required=True, help="exact current human-gate ID")
+    self_host.add_argument("--path", action="append", required=True, help="exact registered RALPH tooling path; repeat as needed")
+    self_host.add_argument("--reason", required=True, help="operator reason retained with the scoped authority grant")
+    self_host.set_defaults(func=cmd_authorize_self_hosting)
     resume = sub.add_parser("resume", help="retry the same blocked approved step after human input")
     resume.add_argument("plan_hash")
     resume.add_argument("--reason", required=True)
