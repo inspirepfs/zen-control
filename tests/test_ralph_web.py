@@ -123,6 +123,9 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(snap["plan"]["steps"][0]["state"], "PASS")
             self.assertEqual(snap["plan"]["steps"][1]["state"], "CURRENT")
             self.assertEqual(snap["controller"]["quota_remaining_percent"], 68.5)
+            self.assertEqual(snap["efficiency_policy"]["mode"], "NORMAL")
+            self.assertEqual(snap["efficiency_policy"]["reserve_percent"], 5.0)
+            self.assertEqual(snap["efficiency_defaults"]["runaway_max_commands"], 40)
             self.assertEqual(snap["events"][0]["category"], "EDIT")
             self.assertNotIn("proposal_previous_state", json.dumps(snap))
 
@@ -227,7 +230,7 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertTrue(request.background)
         self.assertIn("--max-loops", request.argv)
         self.assertEqual(request.argv[request.argv.index("--max-loops") + 1], "40")
-        self.assertEqual(request.argv[request.argv.index("--efficiency-mode") + 1], "normal")
+        self.assertNotIn("--efficiency-mode", request.argv)
 
     def test_run_accepts_explicit_efficiency_dial(self):
         request = web.command_for_action(
@@ -235,6 +238,39 @@ class ActionAuthorityTests(unittest.TestCase):
             self.base_state(),
         )
         self.assertEqual(request.argv[request.argv.index("--efficiency-mode") + 1], "off")
+
+    def test_efficiency_update_is_available_without_active_plan_and_is_atomic_cli_action(self):
+        request = web.command_for_action(
+            {
+                "action": "efficiency_update",
+                "settings": {
+                    "mode": "RELAXED",
+                    "reserve_percent": 7.5,
+                    "prompt_command_budget": 9,
+                    "normal_max_commands": 12,
+                    "runaway_max_commands": 60,
+                },
+            },
+            {"status": "IDLE", "plan_hash": None},
+        )
+        self.assertFalse(request.background)
+        self.assertEqual(request.activity, "EFFICIENCY_UPDATE")
+        self.assertTrue(request.allow_while_active)
+        self.assertFalse(request.track_job)
+        self.assertEqual(request.argv[:2], ["efficiency-policy", "set"])
+        self.assertEqual(request.argv[request.argv.index("--mode") + 1], "relaxed")
+        self.assertEqual(request.argv[request.argv.index("--reserve-percent") + 1], "7.5")
+        self.assertEqual(request.argv[request.argv.index("--prompt-command-budget") + 1], "9")
+
+    def test_efficiency_reset_actions_do_not_require_plan_identity(self):
+        self.assertEqual(
+            web.command_for_action({"action": "efficiency_reset_mode"}, {"status": "IDLE"}).argv,
+            ["efficiency-policy", "reset-mode"],
+        )
+        self.assertEqual(
+            web.command_for_action({"action": "efficiency_reset_all"}, {"status": "IDLE"}).argv,
+            ["efficiency-policy", "reset"],
+        )
 
     def test_actions_expose_immediate_operational_state(self):
         cases = [
@@ -364,6 +400,12 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertIn("selfHostingContext", web.PAGE)
         self.assertIn("Controller-reported context only", web.PAGE)
         self.assertIn("Requalify delta", web.PAGE)
+        self.assertIn("Efficiency / Resource Controls", web.PAGE)
+        self.assertIn("Apply changes", web.PAGE)
+        self.assertIn("Restore defaults", web.PAGE)
+        self.assertIn("data-eff-reset", web.PAGE)
+        self.assertIn("New-work reserve %", web.PAGE)
+        self.assertIn("Emergency runaway ceiling", web.PAGE)
         self.assertIn("renderActionFailure(action,e.message)", web.PAGE)
 
     def test_self_hosting_submission_uses_current_snapshot_authority_context(self):
@@ -588,6 +630,21 @@ class BackgroundJobTests(unittest.TestCase):
             with mock.patch.object(web, "_process_alive", return_value=True):
                 with self.assertRaisesRegex(web.WebConsoleError, "already active"):
                     web.run_command(web.CommandRequest(["run"], background=True))
+
+    def test_efficiency_update_can_run_during_active_job_without_clobbering_job_metadata(self):
+        with WebHarness() as h:
+            h.state()
+            active = {"active": True, "pid": 1234, "activity": "RUNNING", "mode": "background"}
+            web.WEB_JOB.write_text(json.dumps(active), encoding="utf-8")
+            request = web.CommandRequest(
+                ["efficiency-policy", "set", "--mode", "relaxed"],
+                activity="EFFICIENCY_UPDATE", allow_while_active=True, track_job=False,
+            )
+            completed = mock.Mock(returncode=0, stdout="ok", stderr="")
+            with mock.patch.object(web, "_process_alive", return_value=True), mock.patch.object(web.subprocess, "run", return_value=completed):
+                result = web.run_command(request)
+            self.assertTrue(result["ok"])
+            self.assertEqual(json.loads(web.WEB_JOB.read_text(encoding="utf-8")), active)
 
 
 if __name__ == "__main__":

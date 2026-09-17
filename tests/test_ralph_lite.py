@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "ralph.py"
 spec = importlib.util.spec_from_file_location("ralph_lite", MODULE_PATH)
@@ -339,6 +340,27 @@ class EfficiencyBudgetTests(unittest.TestCase):
         self.assertEqual(ralph.recommended_efficiency_mode("Review and update all documentation"), "RELAXED")
         self.assertEqual(ralph.recommended_efficiency_mode("Fix one classifier bug"), "NORMAL")
 
+    def test_live_policy_can_raise_normal_thresholds(self):
+        policy = ralph.efficiency_policy.normalize_policy({
+            "normal_max_commands": 12,
+            "runaway_max_commands": 60,
+        })
+        stats = {
+            "commands_executed": 10,
+            "files_inspected": 4,
+            "input_tokens": 100000,
+            "cached_input_tokens": 80000,
+        }
+        self.assertEqual(ralph.efficiency_findings(stats, mode="NORMAL", policy=policy), [])
+
+    def test_prompt_command_budget_is_loaded_from_live_policy(self):
+        policy = ralph.efficiency_policy.normalize_policy({"prompt_command_budget": 11})
+        state = {"plan_hash": "abc", "human_steering": []}
+        step = {"id": 1, "title": "One", "objective": "Do one thing", "acceptance": ["done"], "test_change_policy": "none"}
+        with mock.patch.object(ralph.efficiency_policy, "load_policy", return_value=policy), mock.patch.object(ralph, "context_handoff", return_value={}):
+            prompt = ralph.step_prompt(state, step, None, 0)
+        self.assertIn("at most 11 shell command executions", prompt)
+
 
 class ControllerQualificationAuthorityTests(unittest.TestCase):
     def test_validation_only_blocker_defers_to_controller_gates(self):
@@ -433,6 +455,12 @@ class CodexUsageGuardTests(unittest.TestCase):
         status, findings = ralph.codex_usage_guard(snapshot)
         self.assertEqual(status, "PAUSE")
         self.assertIn("5h remaining 5.0% <= 5.0% reserve", findings)
+
+    def test_guard_uses_adjustable_start_reserve(self):
+        snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=90), "gpt-5.6-terra")
+        status, findings = ralph.codex_usage_guard(snapshot, reserve_percent=12.5)
+        self.assertEqual(status, "PAUSE")
+        self.assertIn("10.0% <= 12.5% reserve", findings[0])
 
     def test_guard_is_safe_above_reserve(self):
         snapshot = ralph.normalise_codex_usage(self.sample_usage(used_primary=94, used_secondary=40), "gpt-5.6-terra")

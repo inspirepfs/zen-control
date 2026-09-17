@@ -66,6 +66,7 @@ before human-directed recovery.
 |---|---|---|---|
 | `policy.md` | Tracked policy; every CLI initialization/workers read it. | Source-controlled authority contract; must exist. | Never edit/delete during approved work; restore only reviewed source control. |
 | `state.json` | `ralph.py` atomic writer; CLI/TUI/gate/web/reports read. | Ignored authoritative state; `init` creates default only if absent. | Do not hand-edit/delete/promote `.tmp`; preserve copy and seek human recovery. |
+| `efficiency-policy.json` | `ralph.py efficiency-policy` atomic writer; active controller and web console read live. | Ignored live resource-policy state, deliberately separate from `state.json`; `init` creates safe defaults. | Do not hand-edit while active. Use web controls or `efficiency-policy` CLI; invalid values are rejected and writes are atomic. |
 | `plan.md` | `propose` writes; approve/run/humans read exact bytes. | Ignored canonical plan, replaced only by new proposal. | Do not reformat/delete active file; preserve and regenerate after review. |
 | `context.json` | Controller saves handoff; prompts/`usage` read. | Ignored schema-tagged atomic cache; init creates default. | Invalid data falls back in memory. Do not hand-fix; delete only inactive, accepting lost handoff. |
 | `journal.md` | Controller appends loops/gates/retirement/reconciliation; humans inspect. | Ignored append-only audit; init heading; not fully regenerable. | Preserve damage; never rewrite active audit. Missing history needs human review. |
@@ -116,34 +117,53 @@ After a terminal/browser interruption, start with `status`, then use
 checkpoint, journal, and qualification fingerprint determine restart authority;
 terminal output and web-job metadata do not.
 
-## Efficiency governor and 5% start reserve
+## Efficiency governor and configurable start reserve
 
-RALPH separates **efficiency policy** from **usage admission**. The 5% Codex reserve is a start gate for new plan execution, not an in-flight kill switch. When a new proposal begins with more than 5% remaining in every relevant Codex window, RALPH admits that work and, once the proposal has an identity, persists a plan-bound `usage_admission` record. That exact plan may continue through later model turns, qualification, bounded repair, review, and completion even if a window subsequently falls below 5%. Backend `ordinaryUsageAllowed=false` still stops execution. A different plan does not inherit the admission.
+RALPH separates **efficiency policy** from **usage admission**. The default 5% Codex reserve is a configurable start gate for new work, not an in-flight kill switch. When a new proposal begins above the configured reserve in every relevant Codex window, RALPH admits that work and, once the proposal has an identity, persists a plan-bound `usage_admission` record. That exact plan may continue through later model turns, qualification, bounded repair, review, and completion even if a window subsequently falls below the reserve. Backend `ordinaryUsageAllowed=false` still stops execution. A different plan does not inherit the admission.
 
-Example: a plan admitted with 15% remaining may legitimately finish at 1%. At 1%, another plan is not admitted until usage recovers above the reserve. This avoids wasting budget already invested in an in-flight job while retaining a hard boundary against starting additional work.
+Example: with the default 5% reserve, a plan admitted with 15% remaining may legitimately finish at 1%. At 1%, another plan is not admitted until usage recovers above the configured reserve. Raising the reserve while that plan is running does not revoke the existing plan-bound admission; the new value governs future, not-yet-admitted work.
 
-The operator can select the efficiency governor per plan:
+The live efficiency/resource policy is stored atomically in `.ralph/efficiency-policy.json`, separately from `state.json`. This separation is deliberate: the web console can update policy while an active RALPH process is writing controller state without creating a lost-update race. RALPH re-reads the policy before each model turn and after each qualified step.
 
-| Mode | Behaviour | Typical use |
+The operator can select the efficiency governor:
+
+| Mode | Default behaviour | Typical use |
 |---|---|---|
-| `STRICT` | 75% of the normal per-turn efficiency thresholds. | Small, highly bounded fixes. |
-| `NORMAL` | Existing baseline thresholds. | Default implementation work. |
-| `RELAXED` | 4x normal thresholds. | Documentation review, architecture review, migrations, extraction and broad repository analysis. |
+| `STRICT` | 0.75x the normal per-turn thresholds. | Small, highly bounded fixes. |
+| `NORMAL` | 1.00x configured normal thresholds. | Default implementation work. |
+| `RELAXED` | 4.00x configured normal thresholds. | Documentation review, architecture review, migrations, extraction and broad repository analysis. |
 | `OFF` | Ordinary efficiency-policy pauses are disabled. | Intentionally high-context work where the operator accepts the cost. |
 
 Emergency runaway ceilings remain active in **all** modes, including `OFF`. The mode controls ordinary efficiency policy; it never disables controller safety, authority, validation, repair budgets, or backend usage denial.
 
-CLI example:
+The web console exposes the full policy in **Efficiency / Resource Controls** and allows staged edits followed by one atomic **Apply changes** action. Every field that differs from its default displays a small reset icon. **Restore defaults** stages the complete default policy, while **Discard staged changes** reloads the last applied values. Web refresh does not overwrite unsent edits.
+
+The live web controls include:
+
+- efficiency mode;
+- new-work reserve percentage;
+- implementation-turn prompt command budget;
+- NORMAL command, reported-file, cumulative-input and non-cached-input thresholds;
+- STRICT and RELAXED multipliers;
+- emergency runaway command, file, cumulative-input and non-cached-input ceilings.
+
+The emergency ceilings are validated so they cannot be configured below the effective RELAXED thresholds. This prevents an operator from accidentally making RELAXED less permissive than the always-on runaway boundary.
+
+Equivalent CLI control remains available for recovery/automation:
 
 ```bash
-python3 scripts/ralph.py run --efficiency-mode relaxed
+python3 scripts/ralph.py efficiency-policy show --json
+python3 scripts/ralph.py efficiency-policy set --mode relaxed --reserve-percent 7.5
+python3 scripts/ralph.py efficiency-policy reset-mode
+python3 scripts/ralph.py efficiency-policy reset
 ```
 
-The local web console exposes the same four-position selector before starting an approved plan. RALPH also records a conservative planner recommendation (`NORMAL` or `RELAXED`) from the goal text, but the recommendation never silently weakens the active mode.
+`python3 scripts/ralph.py run --efficiency-mode relaxed` remains supported for compatibility; supplying it updates the live policy mode before execution. A normal web `Run approved plan` action does not resend or overwrite the current live policy.
+
+RALPH records a conservative planner recommendation (`NORMAL` or `RELAXED`) from the goal text, but the recommendation never silently weakens the active mode.
 
 Expected stop reasons are deliberately distinct:
 
 - `PAUSED_EFFICIENCY_POLICY` — selected efficiency mode threshold exceeded after a qualified step;
 - `PAUSED_RUNAWAY` — emergency ceiling exceeded;
-- `BLOCKED_INSUFFICIENT_START_RESERVE` — a plan without an existing admission attempted to start at or below the 5% reserve.
-
+- `BLOCKED_INSUFFICIENT_START_RESERVE` — work without an existing plan-bound admission attempted to start at or below the configured reserve.

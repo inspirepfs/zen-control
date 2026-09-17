@@ -53,19 +53,21 @@ Final qualification runs after the last step and writes evidence before transiti
 
 ## Resource admission boundary
 
-Execution has a plan-scoped resource admission boundary. Before the new proposal model turn, RALPH reads the supported Codex rate-limit surface. More than 5% remaining admits the work; once the proposal is generated, that admission is bound to the resulting plan hash. The admission persists across process restarts so an interrupted, already-admitted plan is not stranded merely because its remaining allowance later falls below the reserve.
+Execution has a plan-scoped resource admission boundary. Before the new proposal model turn, RALPH reads the supported Codex rate-limit surface and the live `.ralph/efficiency-policy.json`. Remaining allowance above the configured reserve (5% by default) admits the work; once the proposal is generated, that admission is bound to the resulting plan hash. The admission persists across process restarts so an interrupted, already-admitted plan is not stranded merely because its remaining allowance later falls below the reserve.
 
 ```text
-APPROVED PLAN
+APPROVED / PROPOSED WORK
     |
-    +-- remaining > 5% --> ADMITTED(plan_hash) --> execute/validate/repair/review --> completion
-    |                                           |
-    |                                           +-- remaining falls <= 5% --> continue same plan
+    +-- remaining > configured reserve --> ADMITTED(plan_hash) --> execute/validate/repair/review --> completion
+    |                                                          |
+    |                                                          +-- remaining later <= reserve --> continue same plan
     |
-    +-- remaining <= 5% and no matching admission --> BLOCKED_INSUFFICIENT_START_RESERVE
+    +-- remaining <= configured reserve and no matching admission --> BLOCKED_INSUFFICIENT_START_RESERVE
 ```
+
+Changing the reserve while a plan is running affects future admission decisions only. It does not revoke the current plan's existing admission. The same live-policy file also carries mode, prompt command budget, normal thresholds, mode multipliers, and emergency runaway ceilings. These settings are re-read at model-turn and post-step decision boundaries, so a web-console change can take effect during an active run without rewriting controller state.
 
 Admission is not transferrable authority. A new proposal receives a new plan identity and no usage admission. Backend denial remains authoritative at all times.
 
-Efficiency policy is orthogonal to admission. `STRICT`, `NORMAL`, `RELAXED`, and `OFF` determine the post-step efficiency threshold; the emergency runaway ceiling is invariant and cannot be disabled by the dial.
+Efficiency policy is orthogonal to admission. `STRICT`, `NORMAL`, `RELAXED`, and `OFF` determine the post-step efficiency threshold from the live policy; the emergency runaway guard remains enabled in every mode, including `OFF`.
 
