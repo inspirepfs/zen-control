@@ -2090,13 +2090,15 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
       <div><span>Unknown domains</span><strong>{% if activity_coverage.dns_available is sameas false %}UNAVAILABLE{% elif activity_coverage.dns_accounting_valid is sameas false %}INCONSISTENT{% elif not activity_coverage.dns_observed %}NO EVIDENCE{% else %}{{activity_coverage.unknown_domains}}{% endif %}</strong></div>
       <div><span>Unclassified traffic</span><strong>{% if activity_coverage.traffic_available is sameas false %}UNAVAILABLE{% elif activity_coverage.traffic_accounting_valid is sameas false %}INCONSISTENT{% elif not activity_coverage.traffic_observed %}NO EVIDENCE{% else %}{{activity_coverage.unclassified_bytes_human}}{% endif %}</strong></div>
     </div>
+    <form method="get" class="analytics-device-filter" aria-label="Descriptive service evidence filters"><input type="hidden" name="view" value="activity"><input type="hidden" name="section" value="services"><label>Capability <select name="capability"><option value="">All</option>{% for value in ['dns','tls','combined','none'] %}<option value="{{value}}" {% if service_matrix_filters.capability == value %}selected{% endif %}>{{value|upper}}</option>{% endfor %}</select></label><label>RouterOS evidence <select name="routeros_state"><option value="">All</option>{% for value in ['healthy','degraded','unverified','not-applicable'] %}<option value="{{value}}" {% if service_matrix_filters.routeros_state == value %}selected{% endif %}>{{value|upper}}</option>{% endfor %}</select></label><label>Managed <select name="managed"><option value="">All</option><option value="managed" {% if service_matrix_filters.managed == 'managed' %}selected{% endif %}>Managed</option><option value="unmanaged" {% if service_matrix_filters.managed == 'unmanaged' %}selected{% endif %}>Unmanaged</option></select></label><label>Evidence health <select name="evidence_health"><option value="">All</option>{% for value in ['fresh','stale','no-evidence','unavailable'] %}<option value="{{value}}" {% if service_matrix_filters.evidence_health == value %}selected{% endif %}>{{value|upper}}</option>{% endfor %}</select></label><button class="button-link compact" type="submit">Apply filters</button><a class="button-link compact secondary" href="/?view=activity&amp;section=services#activity/services">Clear filters</a></form>
+    {% if service_matrix_filters.capability or service_matrix_filters.routeros_state or service_matrix_filters.managed or service_matrix_filters.evidence_health %}<p class="muted small" role="status">Active descriptive filters: capability {{service_matrix_filters.capability or 'all'}}, RouterOS {{service_matrix_filters.routeros_state or 'all'}}, managed {{service_matrix_filters.managed or 'all'}}, evidence health {{service_matrix_filters.evidence_health or 'all'}}. Clear filters restores the unfiltered 24-hour prepared view.</p>{% endif %}
     <div class="activity-page-actions"><a class="button-link" href="/activity/classification">Open classification workbench</a><a class="button-link secondary" href="/?view=policies&amp;section=services#policies/services">Service catalogue</a></div>
     <p class="muted small">The workbench runs its deeper 7/30-day queries only when opened; normal Activity navigation does not pay that cost.</p>
   </section>
 
   <section class="card activity-services-card service-intelligence-activity" data-ux-group="services">
     <div class="card-heading">
-      <div><h2>Service intelligence</h2><p class="muted">Policy definitions, live RouterOS TLS/SNI health and retained DNS/IPFIX evidence in one drillable view.</p></div>
+      <div><h2>Service intelligence</h2><p class="muted">Concrete-service capabilities, TLS contracts, detector addresses and retained DNS/IPFIX evidence in one drillable view. Aggregate policy groups are separately labelled summaries, never individual classifier or RouterOS evidence.</p></div>
       <span class="policy-badge enabled">{{activity_insights.tls_contracts_healthy}}/{{activity_insights.tls_contracts_total}} TLS HEALTHY</span>
     </div>
     <div class="classification-coverage-grid">
@@ -2107,35 +2109,24 @@ example-cdn.net">{{service_prefill_dns}}</textarea><span class="muted small">One
     </div>
     <div class="activity-table-wrap service-activity-table-wrap">
       <table class="activity-table service-activity-table service-intelligence-table">
-        <thead><tr><th>Service</th><th>Classifier</th><th>TLS</th><th>Detector IPs</th><th>Traffic</th><th>Flows</th><th>DNS</th><th>Blocked profiles</th><th></th></tr></thead>
+        <thead><tr><th>Service</th><th>Capability</th><th>RouterOS contract</th><th>Traffic</th><th>Flows</th><th>Devices</th><th>DNS / domains</th><th>Last activity</th><th>Blocked profiles</th><th></th></tr></thead>
         <tbody>
-        {% for s in activity_policy_services %}
+        {% for s in activity_policy_services if (not service_matrix_filters.capability or s.signature_capability == service_matrix_filters.capability) and (not service_matrix_filters.routeros_state or s.routeros_contract_state == service_matrix_filters.routeros_state) and (not service_matrix_filters.managed or (service_matrix_filters.managed == 'managed' and s.routeros_managed) or (service_matrix_filters.managed == 'unmanaged' and not s.routeros_managed)) and (not service_matrix_filters.evidence_health or s.evidence_health == service_matrix_filters.evidence_health) %}
           <tr class="{% if not s.policy_tracked %}activity-untracked-service{% endif %} service-status-{{s.classification_status}}">
             <td><strong>{{s.name}}</strong><span class="muted small"> · {{s.category|upper}}{% if s.kind == 'group' %} · GROUP{% elif s.kind == 'custom' %} · CUSTOM{% endif %}</span></td>
-            <td>
-              {% if s.classification_status == 'healthy' %}<span class="policy-badge enabled">HEALTHY</span>
-              {% elif s.classification_status == 'degraded' %}<span class="policy-badge disabled">DEGRADED</span>
-              {% elif s.classification_status == 'unverified' %}<span class="policy-badge disabled">TLS UNVERIFIED</span>
-              {% elif s.classification_status == 'reporting' %}
-                {% if s.has_tls_signatures and s.has_dns_signatures %}<span class="policy-badge staging">TLS/SNI + DNS</span>
-                {% elif s.has_tls_signatures %}<span class="policy-badge staging">TLS/SNI REPORTING</span>
-                {% elif s.has_dns_signatures %}<span class="policy-badge staging">DNS REPORTING</span>
-                {% else %}<span class="policy-badge staging">REPORTING</span>{% endif %}
-              {% elif s.classification_status == 'aggregate' %}<span class="policy-badge staging">AGGREGATE</span>
-              {% elif s.classification_status == 'unsigned' %}<span class="policy-badge disabled">NO SIGNATURE</span>
-              {% else %}<span class="policy-badge staging">OBSERVED</span>{% endif %}
-            </td>
-            <td>{% if s.tls_patterns %}{{s.tls_patterns|length}} pattern{{'' if s.tls_patterns|length == 1 else 's'}}{% else %}—{% endif %}</td>
-            <td>{{s.detector_addresses or 0}}</td>
+            <td><span class="policy-badge staging">{{s.signature_capability|upper}}</span><span class="muted small"> · TLS {{s.signature_counts.tls}} / DNS {{s.signature_counts.dns}} · {{s.detector_addresses or 0}} detector addresses</span></td>
+            <td><span class="policy-badge {% if s.routeros_contract_state == 'healthy' %}enabled{% elif s.routeros_contract_state == 'not-applicable' %}staging{% else %}disabled{% endif %}">{{s.routeros_contract_state|upper}}</span><span class="muted small"> · managed {{'yes' if s.routeros_managed else 'no'}} · approved {{'yes' if s.enforcement_approved else 'no'}}</span></td>
             <td>{{s.total_bytes_human}}{% if s.percent %}<span class="muted small"> · {{s.percent}}%</span>{% endif %}</td>
             <td>{{s.flows}}</td>
-            <td>{{s.dns_queries or 0}}{% if s.dns_blocked %}<span class="muted small"> · {{s.dns_blocked}} blocked</span>{% endif %}</td>
+            <td>{{s.traffic_devices}} traffic / {{s.dns_devices}} DNS</td>
+            <td>{{s.dns_queries or 0}}{% if s.dns_blocked %}<span class="muted small"> · {{s.dns_blocked}} blocked</span>{% endif %}<span class="muted small"> · {{s.distinct_domains}} domains</span></td>
+            <td>{{s.last_activity or 'No retained evidence'}}<span class="muted small"> · {{s.evidence_freshness|upper}}</span></td>
             <td>{{s.blocked_by_profiles|join(', ') if s.blocked_by_profiles else '—'}}</td>
-            <td>{% if s.key and s.kind != 'group' %}<a class="button-link compact" href="/activity/service/{{s.key}}">Drill in</a>{% endif %}</td>
+            <td>{% if s.key and s.kind != 'group' %}<a class="button-link compact" href="/activity/service/{{s.key}}?hours=24{% if service_matrix_filters.capability %}&amp;capability={{service_matrix_filters.capability|urlencode}}{% endif %}{% if service_matrix_filters.routeros_state %}&amp;routeros_state={{service_matrix_filters.routeros_state|urlencode}}{% endif %}{% if service_matrix_filters.managed %}&amp;managed={{service_matrix_filters.managed|urlencode}}{% endif %}{% if service_matrix_filters.evidence_health %}&amp;evidence_health={{service_matrix_filters.evidence_health|urlencode}}{% endif %}">Drill in</a>{% endif %}</td>
           </tr>
-          {% if s.router_health.error %}<tr class="service-health-error-row"><td colspan="9"><span class="muted small">{{s.router_health.error}}</span></td></tr>{% endif %}
+          {% if s.router_health.error %}<tr class="service-health-error-row"><td colspan="10"><span class="muted small">{{s.router_health.error}}</span></td></tr>{% endif %}
         {% else %}
-          <tr><td colspan="9" class="muted">No service definitions or activity yet.</td></tr>
+          <tr><td colspan="10" class="muted">No service definitions or activity yet.</td></tr>
         {% endfor %}
         </tbody>
       </table>

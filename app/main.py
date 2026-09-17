@@ -1140,7 +1140,7 @@ def _prepare_activity_payload() -> dict:
         row["managed"] = ip in managed_names
         row["display_name"] = managed_names.get(ip, ip)
         row["detail"] = summaries.get(ip, {})
-    observed = activity_store.top_services(24, 100)
+    observed, dns_service_rows = activity_store.service_matrix(24, 100)
     coverage = activity_store.classification_coverage(24)
     return {
         "schema": "zen_prepared_activity_v1",
@@ -1150,7 +1150,7 @@ def _prepare_activity_payload() -> dict:
         "observed_services": observed,
         "domains": activity_store.dns_top_domains(24, 30),
         "device_summaries": summaries,
-        "dns_service_rows": activity_store.dns_top_services(24, 100),
+        "dns_service_rows": dns_service_rows,
         "coverage": coverage,
         "unknown_domains": activity_store.unknown_domains(24, 30),
         "activity_insights": {
@@ -1177,11 +1177,12 @@ def _prepare_services_payload() -> dict:
             "schema": "zen_prepared_services_v1", "telemetry_available": False,
             "traffic": [], "dns": [], "coverage": {}, "unknown_domains": [],
         }
+    traffic, dns = activity_store.service_matrix(24, 100)
     return {
         "schema": "zen_prepared_services_v1",
         "telemetry_available": True,
-        "traffic": activity_store.top_services(24, 100),
-        "dns": activity_store.dns_top_services(24, 100),
+        "traffic": traffic,
+        "dns": dns,
         "coverage": activity_store.classification_coverage(24),
         "unknown_domains": activity_store.unknown_domains(24, 50),
     }
@@ -1226,6 +1227,20 @@ def _prepare_history_payload() -> dict:
         "active_periods": [],
         "timezone_name": timezone_name,
     }
+
+
+def _activity_service_keys_by_name() -> dict[str, str]:
+    return {
+        str(item.get("name") or "").strip().lower(): str(item.get("key") or "")
+        for item in policy_store.list_services()
+    }
+
+
+def _decorate_activity_service_keys(rows: list[dict], keys_by_name: dict[str, str]) -> None:
+    for item in rows:
+        item["service_key"] = keys_by_name.get(
+            str(item.get("service_name") or "").strip().lower(), ""
+        )
 
 
 def _reporting_payload(period: str = "7d", start: str = "", end: str = "") -> dict:
@@ -2601,7 +2616,7 @@ def auth_sessions_revoke_all(
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(request: Request, view: str = "dashboard", section: str = ""):
+def dashboard(request: Request, view: str = "dashboard", section: str = "", capability: str = "", routeros_state: str = "", managed: str = "", evidence_health: str = ""):
 
     user = current_user(request)
     if not user:
@@ -2611,6 +2626,10 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
     if active_view not in ROOT_VIEWS:
         active_view = "dashboard"
     active_section = _section_for_view(active_view, section)
+    try:
+        service_matrix_filters = _activity_drill_filters(capability=capability, routeros_state=routeros_state, managed=managed, evidence_health=evidence_health)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     auth_state = session_auth_state(request, user["username"])
     pending_totp = None
@@ -3070,7 +3089,9 @@ def dashboard(request: Request, view: str = "dashboard", section: str = ""):
                         row["detail"] = activity_device_summaries.get(ip, row.get("detail") or {})
                     activity_policy_services = build_service_intelligence(
                         services, observed_services, dns_service_rows,
-                        service_contract_health, policy_group_catalog, local_profiles
+                        service_contract_health, policy_group_catalog, local_profiles,
+                        (router_observation_evidence.get("service_contract_health") or {}).get("state", "missing"),
+                        (router_observation_evidence.get("service_contract_health") or {}).get("age_seconds"),
                     )
                     activity_insights.update({
                         "policy_services": len(services),
@@ -3448,21 +3469,20 @@ def api_activity_services(
                 dns_rows = activity_store.dns_top_services(hours, 100)
                 coverage = activity_store.classification_coverage(hours)
                 unknown = activity_store.unknown_domains(hours, 50)
-        if int(hours) == 24:
-            health, _health_meta = _advisory_router_payload(
-                "router:service-contract-health", max_age_seconds=180
-            )
-            health = health or {"available": False, "services": []}
-        else:
-            try:
-                health = router.get_service_contract_health()
-            except RouterError:
-                health = {"available": False, "services": []}
+        # Activity navigation consumes only revision-bound advisory RouterOS
+        # evidence, regardless of the retained-analytics window.  Custom
+        # windows change the local telemetry query, never RouterOS authority.
+        health, _health_meta = _advisory_router_payload(
+            "router:service-contract-health", max_age_seconds=180
+        )
+        health = health or {"available": False, "services": []}
         return {
             "traffic": observed,
             "policy_services": build_service_intelligence(
                 policy_store.list_services(), observed, dns_rows, health,
-                policy_store.policy_group_catalog(), policy_store.list_profiles()
+                policy_store.policy_group_catalog(), policy_store.list_profiles(),
+                (_health_meta or {}).get("state", "missing"),
+                (_health_meta or {}).get("age_seconds"),
             ),
             "dns": dns_rows,
             "coverage": coverage,
@@ -3490,20 +3510,26 @@ def api_activity_dns(
 
 
 def _activity_managed_names():
+    """Return local and revision-bound advisory names for Activity views.
+
+    Activity navigation must remain usable during a RouterOS outage.  The
+    reconciler publishes managed-device observations independently, so this
+    display-only lookup must not make a live restricted-device request.
+    """
     local = policy_store.list_device_policy()
     names = {}
     for ip, cfg in local.items():
         if ip:
             names[str(ip)] = str(cfg.get("alias") or ip)
-    try:
-        for item in router.get_restricted_devices():
-            ip = str(item.get("address") or item.get("ip") or "")
-            if not ip:
-                continue
-            cfg = local.get(ip, {})
-            names[ip] = str(cfg.get("alias") or item.get("name") or names.get(ip) or ip)
-    except RouterError:
-        pass
+    observation, _meta = _advisory_router_payload(
+        "router:managed-device-observation", max_age_seconds=180
+    )
+    for item in (observation or {}).get("devices") or []:
+        ip = str(item.get("address") or item.get("ip") or "")
+        if not ip:
+            continue
+        cfg = local.get(ip, {})
+        names[ip] = str(cfg.get("alias") or item.get("name") or names.get(ip) or ip)
     return names
 
 
@@ -3543,6 +3569,120 @@ def _activity_local_timestamp(value, timezone_name):
         return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
     except (ValueError, ZoneInfoNotFoundError):
         return str(value)
+
+
+def _activity_drill_filters(client_ip="", capability="", routeros_state="", managed="", evidence_health=""):
+    """Normalize descriptive retained-evidence filters without RouterOS reads."""
+    values = {"client_ip": str(client_ip or "").strip(), "capability": str(capability or "").strip().lower(), "routeros_state": str(routeros_state or "").strip().lower(), "managed": str(managed or "").strip().lower(), "evidence_health": str(evidence_health or "").strip().lower()}
+    if values["client_ip"]:
+        import ipaddress as _ipaddress
+        values["client_ip"] = str(_ipaddress.ip_address(values["client_ip"]))
+    choices = {"capability": {"", "dns", "tls", "combined", "none", "aggregate-summary"}, "routeros_state": {"", "healthy", "degraded", "unverified", "not-applicable"}, "managed": {"", "managed", "unmanaged"}, "evidence_health": {"", "fresh", "stale", "no-evidence", "unavailable"}}
+    for key, allowed in choices.items():
+        if values[key] not in allowed:
+            raise ValueError(f"Invalid {key.replace('_', ' ')} filter")
+    return values
+
+
+def _activity_drill_window(hours=24, start="", end=""):
+    """Return a canonical, deliberately bounded retained-evidence window."""
+    if bool(start) != bool(end):
+        raise ValueError("Activity range requires both start and end boundaries")
+    if not start:
+        hours = int(hours)
+        if not 1 <= hours <= 720:
+            raise ValueError("Activity hours must be between 1 and 720")
+        return {"hours": hours, "start": "", "end": "", "label": f"Last {hours} hours"}
+    selected_start = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+    selected_end = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    if selected_start.tzinfo is None or selected_end.tzinfo is None:
+        raise ValueError("Activity range boundaries must include a timezone")
+    if selected_end <= selected_start or selected_end - selected_start > timedelta(days=32):
+        raise ValueError("Activity range must be positive and no longer than 32 days")
+    return {"hours": int(hours), "start": selected_start.isoformat(), "end": selected_end.isoformat(),
+            "start_at": selected_start, "end_at": selected_end,
+            "label": f"Evidence window {selected_start.isoformat()} to {selected_end.isoformat()}"}
+
+
+def _activity_analytics_window(period="7d", timezone_name="Europe/London", start="", end=""):
+    """Resolve analytics dates, retaining exact drilldown boundaries when supplied."""
+    if "T" not in str(start) and "T" not in str(end):
+        return resolve_activity_window(period, timezone_name, start, end)
+    drill = _activity_drill_window(24, start, end)
+    start_at, end_at = drill["start_at"], drill["end_at"]
+    previous_start = start_at - (end_at - start_at)
+    try:
+        local_zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        local_zone = timezone.utc
+    return {
+        "period": "custom", "start": start_at, "end": end_at,
+        "previous_start": previous_start, "previous_end": start_at,
+        "start_date": start_at.astimezone(local_zone).date().isoformat(),
+        "end_date": end_at.astimezone(local_zone).date().isoformat(),
+        "label": drill["label"],
+    }
+
+
+def _filter_service_matrix(rows, filters):
+    """In-memory filtering of the prepared, sanitized service contract."""
+    result = []
+    for row in rows or []:
+        if filters["capability"] and row.get("signature_capability") != filters["capability"]:
+            continue
+        if filters["routeros_state"] and row.get("routeros_contract_state") != filters["routeros_state"]:
+            continue
+        is_managed = bool(row.get("routeros_managed"))
+        if filters["managed"] == "managed" and not is_managed:
+            continue
+        if filters["managed"] == "unmanaged" and is_managed:
+            continue
+        # The UI vocabulary is deliberately stable and descriptive.  Older
+        # prepared contracts expose ``retained`` / ``no-retained-evidence``;
+        # normalize those implementation details before comparing them to a
+        # caller supplied evidence-health filter.
+        freshness = str(row.get("evidence_health") or row.get("evidence_freshness") or "no-evidence").lower().replace("_", "-")
+        freshness = {
+            "retained": "fresh",
+            "no-retained-evidence": "no-evidence",
+        }.get(freshness, freshness)
+        if filters["evidence_health"] and freshness != filters["evidence_health"]:
+            continue
+        result.append(row)
+    return result
+
+
+def _filter_activity_service_rows(rows, filters, category="", service_key=""):
+    """Apply descriptive service filters to retained analytics rows in memory.
+
+    The service contract is configuration plus revision-bound advisory evidence;
+    this helper deliberately does not perform a RouterOS read.
+    """
+    definitions = policy_store.list_services()
+    definitions_by_key = {str(item.get("key") or ""): item for item in definitions}
+    groups = set(policy_store.policy_group_keys())
+    requested = str(service_key or "").strip().lower()
+    if requested and (requested not in definitions_by_key or requested in groups):
+        raise ValueError("Activity filters require a concrete service")
+    health, observation = _advisory_router_payload(
+        "router:service-contract-health", max_age_seconds=180
+    )
+    contracts = build_service_intelligence(
+        definitions, [], [], health or {}, policy_store.policy_group_catalog(),
+        router_observation_state=str(observation.get("state") or "missing"),
+    )
+    by_key = {str(item.get("key") or ""): item for item in _filter_service_matrix(contracts, filters)}
+    category = str(category or "").strip().lower()
+    result = []
+    for row in rows or []:
+        key = str(row.get("service_key") or "").strip().lower()
+        contract = by_key.get(key)
+        if not contract or (requested and key != requested):
+            continue
+        if category and str(contract.get("category") or "").lower() != category:
+            continue
+        result.append(row)
+    return result
 
 
 @timed("summary.compose")
@@ -3832,13 +3972,20 @@ def api_activity_analytics(
         if (str(period or "7d").lower() == "7d" and not selected and not start and not end):
             prepared, meta = _prepared_payload("history:7d")
             if prepared:
+                prepared_window = prepared.get("window") or {}
+                prepared_start = datetime.fromisoformat(str(prepared_window["start"]).replace("Z", "+00:00"))
+                prepared_end = datetime.fromisoformat(str(prepared_window["end"]).replace("Z", "+00:00"))
+                prepared_services = activity_store.service_historical_analytics(
+                    prepared_start, prepared_end, prepared.get("timezone_name", "Europe/London")
+                )
                 return {
                     "window": prepared.get("window") or {},
                     "current": prepared.get("current") or {},
                     "previous": prepared.get("previous") or {},
                     "comparison": prepared.get("comparison") or {},
                     "daily": prepared.get("daily") or [],
-                    "services": prepared.get("services") or [],
+                    "services": prepared_services["services"],
+                    "service_analytics": prepared_services,
                     "domains": prepared.get("domains") or [],
                     "new_domains": prepared.get("new_domains") or [],
                     "timeline": prepared.get("timeline") or [],
@@ -3848,19 +3995,21 @@ def api_activity_analytics(
             _record_prepared_fallback("history:7d")
         settings = policy_store.get_settings()
         timezone_name = settings.get("policy_timezone", "Europe/London")
-        window = resolve_activity_window(period, timezone_name, start, end)
+        window = _activity_analytics_window(period, timezone_name, start, end)
         if selected:
             import ipaddress as _ipaddress
             _ipaddress.ip_address(selected)
         current = activity_store.overview_range(window["start"], window["end"], selected)
         previous = activity_store.overview_range(window["previous_start"], window["previous_end"], selected)
+        service_analytics = activity_store.service_historical_analytics(window["start"], window["end"], timezone_name, selected)
         return {
             "window": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in window.items()},
             "current": current,
             "previous": previous,
             "comparison": compare_activity_totals(current, previous),
             "daily": activity_store.daily_history(window["start"], window["end"], timezone_name, selected),
-            "services": activity_store.top_services_range(window["start"], window["end"], 30, selected),
+            "services": service_analytics["services"],
+            "service_analytics": service_analytics,
             "domains": activity_store.top_domains_range(window["start"], window["end"], 50, selected),
             "new_domains": activity_store.new_domains_range(window["start"], window["end"], 30, 50, selected),
             "timeline": activity_store.evidence_timeline(window["start"], window["end"], selected, 160),
@@ -3882,6 +4031,10 @@ def activity_analytics_page(
     service: str = "",
     start: str = "",
     end: str = "",
+    capability: str = "",
+    routeros_state: str = "",
+    managed: str = "",
+    evidence_health: str = "",
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     settings = policy_store.get_settings()
@@ -3893,6 +4046,18 @@ def activity_analytics_page(
     selected_service = str(service or "").strip().lower()
     prepared_meta = None
     try:
+        filters = _activity_drill_filters(selected, capability, routeros_state, managed, evidence_health)
+        # Use the canonical address in retained-data queries and every generated
+        # drilldown URL, rather than merely validating the caller's spelling.
+        selected = filters["client_ip"]
+        if selected_service:
+            definitions = {str(item.get("key") or ""): item for item in policy_store.list_services()}
+            if selected_service not in definitions or selected_service in policy_store.policy_group_keys():
+                raise ValueError("Activity filters require a concrete service")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        keys_by_name = _activity_service_keys_by_name()
         prepared = None
         if (str(period or "7d").lower() == "7d" and not selected and not start and not end):
             prepared, prepared_meta = _prepared_payload("history:7d")
@@ -3910,13 +4075,21 @@ def activity_analytics_page(
             active_periods = []
             timezone_name = str(prepared.get("timezone_name") or timezone_name)
             selected_name = "All devices"
+            prepared_start = datetime.fromisoformat(str(window["start"]).replace("Z", "+00:00"))
+            prepared_end = datetime.fromisoformat(str(window["end"]).replace("Z", "+00:00"))
+            service_analytics = activity_store.service_historical_analytics(
+                prepared_start, prepared_end, timezone_name
+            )
+            services = service_analytics["services"]
+            _decorate_activity_service_keys(service_analytics["services"], keys_by_name)
+            _decorate_activity_service_keys(service_analytics["movers"], keys_by_name)
         else:
             if str(period or "7d").lower() == "7d" and not selected and not start and not end:
                 _record_prepared_fallback("history:7d")
             if selected:
                 import ipaddress as _ipaddress
                 _ipaddress.ip_address(selected)
-            window = resolve_activity_window(period, timezone_name, start, end)
+            window = _activity_analytics_window(period, timezone_name, start, end)
             current = activity_store.overview_range(window["start"], window["end"], selected or None)
             previous = activity_store.overview_range(window["previous_start"], window["previous_end"], selected or None)
             comparison = compare_activity_totals(current, previous)
@@ -3924,10 +4097,7 @@ def activity_analytics_page(
             top_devices = activity_store.top_devices_range(window["start"], window["end"], 24)
             _decorate_activity_identity(top_devices, names)
             services = activity_store.top_services_range(window["start"], window["end"], 30, selected or None)
-            service_defs = policy_store.list_services()
-            keys_by_name = {str(item.get("name") or "").lower(): str(item.get("key") or "") for item in service_defs}
-            for item in services:
-                item["service_key"] = keys_by_name.get(str(item.get("service_name") or "").lower(), "")
+            _decorate_activity_service_keys(services, keys_by_name)
             domains = activity_store.top_domains_range(window["start"], window["end"], 60, selected or None)
             new_domains = activity_store.new_domains_range(window["start"], window["end"], 30, 60, selected or None)
             timeline = activity_store.evidence_timeline(window["start"], window["end"], selected or None, 180)
@@ -3938,9 +4108,22 @@ def activity_analytics_page(
             for item in active_periods:
                 item["local_start"] = _activity_local_timestamp(item.get("start"), timezone_name)
                 item["local_end"] = _activity_local_timestamp(item.get("end"), timezone_name)
+            service_analytics = activity_store.service_historical_analytics(window["start"], window["end"], timezone_name, selected or None)
+            services = service_analytics["services"]
+            _decorate_activity_service_keys(service_analytics["services"], keys_by_name)
+            _decorate_activity_service_keys(service_analytics["movers"], keys_by_name)
             for item in new_domains:
                 item["local_first_seen"] = _activity_local_timestamp(item.get("first_seen"), timezone_name)
             selected_name = names.get(selected, selected) if selected else "All devices"
+        services = _filter_activity_service_rows(
+            services, filters, selected_category, selected_service
+        )
+        service_analytics["services"] = _filter_activity_service_rows(
+            service_analytics.get("services") or [], filters, selected_category, selected_service
+        )
+        service_analytics["movers"] = _filter_activity_service_rows(
+            service_analytics.get("movers") or [], filters, selected_category, selected_service
+        )
     except (ActivityError, ValueError) as exc:
         error = str(exc)
         try:
@@ -3950,6 +4133,8 @@ def activity_analytics_page(
         current = previous = {}
         comparison = {}
         daily = top_devices = services = domains = new_domains = timeline = active_periods = []
+        service_analytics = {"services": [], "movers": [], "errors": []}
+        filters = {"client_ip": "", "capability": "", "routeros_state": "", "managed": "", "evidence_health": ""}
         selected_name = names.get(selected, selected) if selected else "All devices"
         prepared_meta = None
 
@@ -3964,6 +4149,7 @@ def activity_analytics_page(
             "selected_ip": selected,
             "selected_category": selected_category,
             "selected_service": selected_service,
+            "filters": filters,
             "selected_name": selected_name,
             "managed_names": names,
             "window": window,
@@ -3973,6 +4159,7 @@ def activity_analytics_page(
             "daily": daily,
             "top_devices": top_devices,
             "services": services,
+            "service_analytics": service_analytics,
             "domains": domains,
             "new_domains": new_domains,
             "timeline": timeline,
@@ -4266,6 +4453,10 @@ def activity_service_page(
     start: str = "",
     end: str = "",
     client_ip: str = "",
+    capability: str = "",
+    routeros_state: str = "",
+    managed: str = "",
+    evidence_health: str = "",
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     definitions = {item["key"]: item for item in policy_store.list_services()}
@@ -4278,21 +4469,21 @@ def activity_service_page(
     # Activity drilldowns consume the reconciler's revision-bound RouterOS
     # observation.  This stays advisory: no observation is ever RouterOS write
     # authority, and a missing/stale observation remains visible to the viewer.
+    try:
+        if start:
+            start = datetime.fromisoformat(str(start).replace("Z", "+00:00")).isoformat()
+        if end:
+            end = datetime.fromisoformat(str(end).replace("Z", "+00:00")).isoformat()
+        filters = _activity_drill_filters(client_ip, capability, routeros_state, managed, evidence_health)
+        drill_window = _activity_drill_window(hours, start, end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     health, service_observation = _advisory_router_payload(
         "router:service-contract-health", max_age_seconds=180
     )
     router_health = {}
     router_health_current = service_observation.get("state") == "fresh"
-    try:
-        if health is None:
-            # A missing prepared observation may be filled by one read-only
-            # current check. The observation state remains MISSING in the UI,
-            # and this response is never published or used as mutation authority.
-            health = router.get_service_contract_health()
-            router_health_current = True
-    except RouterError:
-        router_health = {}
-    else:
+    if health:
         router_health = next(
             (item for item in health.get("services", []) if item.get("key") == service_key), {}
         )
@@ -4303,43 +4494,47 @@ def activity_service_page(
         router_health_current=router_health_current,
     )
 
+    # Descriptive filters constrain this concrete detail too.  The contract is
+    # assembled from local configuration and revision-bound advisory evidence;
+    # this deliberately performs no live RouterOS operation.
+    service_contract = next((item for item in build_service_intelligence(
+        list(definitions.values()), [], [], health or {}, policy_store.policy_group_catalog(),
+        router_observation_state=str(service_observation.get("state") or "missing"),
+    ) if item.get("key") == service_key), {})
+    filter_excluded = not bool(_filter_service_matrix([service_contract], filters))
+
     error = None
     detail = {}
-    selected_client = str(client_ip or "").strip() or None
+    selected_client = filters["client_ip"] or None
+    selected_start = drill_window.get("start_at")
+    selected_end = drill_window.get("end_at")
     try:
-        if bool(start) != bool(end):
-            raise ValueError("Activity range requires both start and end boundaries")
-        if selected_client:
-            import ipaddress as _ipaddress
-            _ipaddress.ip_address(selected_client)
-        if start:
-            selected_start = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
-            selected_end = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        if filter_excluded:
+            error = "This service is excluded by the active descriptive filters. Clear filters to restore the bounded service view."
+        elif drill_window["start"]:
             detail = activity_store.service_detail(
                 definition["name"], start=selected_start, end=selected_end,
                 client_ip=selected_client,
             )
+            history = activity_store.service_historical_analytics(
+                selected_start, selected_end, policy_store.get_settings().get("policy_timezone", "Europe/London"), selected_client, definition["name"], 1,
+            )
+            detail["historical"] = (history.get("services") or [{}])[0]
         else:
             detail = activity_store.service_detail(
-                definition["name"], hours, client_ip=selected_client,
+                definition["name"], drill_window["hours"], client_ip=selected_client,
             )
-        name_map = {}
-        try:
-            live = router.get_restricted_devices()
-        except RouterError:
-            live = []
+        name_map = _activity_managed_names()
         local = policy_store.list_device_policy()
-        for item in live:
-            ip = str(item.get("address") or item.get("ip") or "")
-            if ip:
-                cfg = local.get(ip, {})
-                name_map[ip] = str(cfg.get("alias") or item.get("name") or ip)
+        for ip, cfg in local.items():
+            name_map.setdefault(str(ip), str(cfg.get("alias") or ip))
         for item in detail.get("top_devices", []):
             ip = str(item.get("client_ip") or "")
             item["display_name"] = name_map.get(ip, ip)
             item["managed"] = ip in name_map
     except (ActivityError, ValueError) as exc:
         error = str(exc)
+        drill_window = {"hours": hours, "start": "", "end": "", "label": "Invalid evidence window"}
 
     return templates.TemplateResponse(
         "activity_service.html",
@@ -4351,13 +4546,15 @@ def activity_service_page(
             "service_signal": service_signal,
             "service_observation": service_observation,
             "detail": detail,
-            "hours": hours,
-            "selected_start": start,
-            "selected_end": end,
+            "hours": drill_window["hours"],
+            "selected_start": drill_window["start"],
+            "selected_end": drill_window["end"],
+            "drill_window": drill_window,
             "selected_client": selected_client,
+            "filters": filters,
             "error": error,
         },
-        status_code=503 if error else 200,
+        status_code=503 if error and not filter_excluded else 200,
     )
 
 
@@ -4366,32 +4563,55 @@ def activity_device_page(
     request: Request,
     client_ip: str,
     hours: int = 24,
+    start: str = "",
+    end: str = "",
+    service: str = "",
+    capability: str = "",
+    routeros_state: str = "",
+    managed: str = "",
+    evidence_health: str = "",
     user=Depends(require_role("admin", "operator", "viewer")),
 ):
     device_label = client_ip
+    managed_filter = managed
     managed = False
     try:
+        filters = _activity_drill_filters("", capability, routeros_state, managed_filter, evidence_health)
+        drill_window = _activity_drill_window(hours, start, end)
+        import ipaddress as _ipaddress
+        client_ip = str(_ipaddress.ip_address(client_ip))
+        service_key = str(service or "").strip().lower()
+        definitions = {item["key"]: item for item in policy_store.list_services()}
+        if service_key and (service_key not in definitions or service_key in policy_store.policy_group_keys()):
+            raise ValueError("Activity filters require a concrete service")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
         local_policy = policy_store.list_device_policy().get(client_ip, {})
-        router_name = ""
-        try:
-            for item in router.get_restricted_devices():
-                if str(item.get("address") or "") == client_ip:
-                    managed = True
-                    router_name = str(item.get("name") or "")
-                    break
-        except RouterError:
-            managed = client_ip in policy_store.list_device_policy()
-        device_label = str(local_policy.get("alias") or router_name or client_ip)
+        managed_names = _activity_managed_names()
+        managed = client_ip in managed_names or client_ip in policy_store.list_device_policy()
+        device_label = str(local_policy.get("alias") or managed_names.get(client_ip) or client_ip)
 
-        detail = activity_store.device_detail(client_ip, hours)
-        series = activity_store.traffic_series(client_ip, hours)
-        services = activity_store.top_services(hours, 12, client_ip)
+        if drill_window["start"]:
+            detail = activity_store.overview_range(drill_window["start_at"], drill_window["end_at"], client_ip)
+            series = []
+            services = activity_store.top_services_range(drill_window["start_at"], drill_window["end_at"], 12, client_ip)
+            destinations = []
+            domains = activity_store.top_domains_range(drill_window["start_at"], drill_window["end_at"], 30, client_ip)
+            dns = []
+        else:
+            detail = activity_store.device_detail(client_ip, drill_window["hours"])
+            series = activity_store.traffic_series(client_ip, drill_window["hours"])
+            services = activity_store.top_services(drill_window["hours"], 12, client_ip)
+            destinations = activity_store.top_destinations(drill_window["hours"], 20, client_ip)
+            domains = activity_store.dns_top_domains(drill_window["hours"], 30, client_ip)
+            dns = activity_store.recent_dns(drill_window["hours"], 100, client_ip)
+        if service_key:
+            services = [item for item in services if str(item.get("service_name") or "").lower() == definitions[service_key]["name"].lower()]
         policy_services = build_policy_service_activity(
             policy_store.list_services(), services, policy_store.policy_group_catalog(), policy_store.list_profiles()
         )
-        destinations = activity_store.top_destinations(hours, 20, client_ip)
-        domains = activity_store.dns_top_domains(hours, 30, client_ip)
-        dns = activity_store.recent_dns(hours, 100, client_ip)
+        policy_services = _filter_service_matrix(policy_services, filters)
     except (ActivityError, ValueError) as exc:
         return templates.TemplateResponse(
             "activity_device.html",
@@ -4401,7 +4621,12 @@ def activity_device_page(
                 "client_ip": client_ip,
                 "device_label": device_label,
                 "managed": managed,
-                "hours": hours,
+                "hours": drill_window["hours"] if 'drill_window' in locals() else hours,
+                "selected_start": drill_window["start"] if 'drill_window' in locals() else "",
+                "selected_end": drill_window["end"] if 'drill_window' in locals() else "",
+                "selected_service": service,
+                "filters": filters if 'filters' in locals() else {},
+                "drill_window": drill_window if 'drill_window' in locals() else {"label": "Invalid evidence window"},
                 "error": str(exc),
                 "detail": {},
                 "series": [],
@@ -4422,7 +4647,12 @@ def activity_device_page(
             "client_ip": client_ip,
             "device_label": device_label,
             "managed": managed,
-            "hours": hours,
+            "hours": drill_window["hours"],
+            "selected_start": drill_window["start"],
+            "selected_end": drill_window["end"],
+            "selected_service": service_key,
+            "filters": filters,
+            "drill_window": drill_window,
             "error": None,
             "detail": detail,
             "series": series,

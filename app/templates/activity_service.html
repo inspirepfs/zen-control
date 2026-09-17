@@ -22,12 +22,14 @@
 <main>
 {% set page_help = zen_help('activity_services') %}
 {% include "_context_help.jinja" %}
+{% set clear_window %}{% if selected_start %}start={{selected_start|urlencode}}&amp;end={{selected_end|urlencode}}{% else %}hours={{hours}}{% endif %}{% endset %}
+  {% if selected_client or filters.capability or filters.routeros_state or filters.managed or filters.evidence_health %}<section class="card"><p class="muted small" role="status">{{drill_window.label}} · active filters: device {{selected_client or 'all'}}, capability {{filters.capability or 'all'}}, RouterOS {{filters.routeros_state or 'all'}}, managed {{filters.managed or 'all'}}, evidence health {{filters.evidence_health or 'all'}}. <a href="/activity/service/{{service.key}}{% if selected_start %}?start={{selected_start|urlencode}}&amp;end={{selected_end|urlencode}}{% else %}?{{clear_window}}{% endif %}">Clear filters</a></p></section>{% endif %}
   {% if error %}
     <section class="card"><div class="conflict-warning">{{error}}</div></section>
   {% else %}
   <section class="card">
     <div class="card-heading">
-      <div><h2>{% if selected_start %}Selected historical service summary{% else %}{{hours}} hour service summary{% endif %}</h2><p class="muted">Retained IPFIX traffic and Pi-hole DNS evidence attributed to this service{% if selected_start %} from {{selected_start}} to {{selected_end}}{% endif %}{% if selected_client %} for {{selected_client}}{% endif %}.</p></div>
+      <div><h2>{% if selected_start %}Selected historical service summary{% else %}{{hours}} hour service summary{% endif %}</h2><p class="muted">{{drill_window.label}} · retained IPFIX traffic and Pi-hole DNS evidence attributed to this service{% if selected_client %} for {{selected_client}}{% endif %}.</p></div>
       {% if service_signal.state == 'healthy' %}
         {% if router_health.healthy %}<span class="policy-badge enabled">{{service_signal.label}}</span>{% endif %}
       {% elif service_signal.state in ('degraded', 'unverified') %}
@@ -44,6 +46,17 @@
     </div>
     <div class="muted small" style="margin-top:6px">First flow {{detail.first_seen or '—'}} · Last flow {{detail.last_seen or '—'}} · Last DNS {{detail.dns_last_seen or '—'}}</div>
   </section>
+
+  {% if detail.historical %}
+  <section class="card">
+    <div class="card-heading"><div><h2>Equivalent-window comparison</h2><p class="muted">Retained source semantics: traffic {{detail.historical.traffic_evidence.current|upper}} · DNS {{detail.historical.dns_evidence.current|upper}}.</p></div></div>
+    <div class="service-drill-grid">
+      {% for label,key in [('Traffic','total_bytes'),('Flows','flows'),('DNS queries','dns_queries'),('Blocked DNS','dns_blocked'),('Active devices','active_devices'),('Domains','domains')] %}
+      {% set metric = detail.historical.comparison[key] %}<div><span>{{label}}</span><strong>{% if metric.current is none %}NO EVIDENCE{% elif key == 'total_bytes' %}{{detail.historical.total_bytes_human}}{% else %}{{metric.current}}{% endif %}</strong><small>{% if metric.delta is none %}—{% elif metric.delta_percent is none %}NEW{% else %}{{metric.delta_percent}}%{% endif %}</small></div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
 
   <section class="card classifier-contract-panel">
     <div class="card-heading"><div><h2>Classifier coverage</h2><p class="muted">The signatures that make this service identifiable.</p></div></div>
@@ -76,7 +89,7 @@
           <thead><tr><th>Device</th><th>Traffic</th><th>Flows</th><th>Last seen</th></tr></thead>
           <tbody>
           {% for item in detail.top_devices %}
-            <tr><td><strong>{% if item.managed %}<a class="activity-inline-link" href="/devices/{{item.client_ip}}">{{item.display_name}}</a> <span class="muted">({{item.client_ip}})</span>{% else %}{{item.client_ip}}{% endif %}</strong>{% if item.managed %}<div><a class="inline-context-link" href="/policy/explain/{{item.client_ip}}?service={{service.key}}">why this service?</a> · <a class="inline-context-link" href="/activity/device/{{item.client_ip}}">activity</a> · <a class="inline-context-link" href="/?view=devices&amp;section=managed&amp;focus=device:{{item.client_ip}}#devices/managed">managed device</a></div>{% endif %}</td><td>{{item.total_bytes_human}}</td><td>{{item.flows}}</td><td>{{item.last_seen or '—'}}</td></tr>
+            <tr><td><strong>{% if item.managed %}<a class="activity-inline-link" href="/devices/{{item.client_ip}}">{{item.display_name}}</a> <span class="muted">({{item.client_ip}})</span>{% else %}{{item.client_ip}}{% endif %}</strong><div><a class="inline-context-link" href="/activity/device/{{item.client_ip}}?{% if selected_start %}start={{selected_start|urlencode}}&amp;end={{selected_end|urlencode}}&amp;{% else %}hours={{hours}}&amp;{% endif %}service={{service.key|urlencode}}&amp;capability={{filters.capability}}&amp;routeros_state={{filters.routeros_state}}&amp;managed={{filters.managed}}&amp;evidence_health={{filters.evidence_health}}">activity in this evidence window</a>{% if item.managed %} · <a class="inline-context-link" href="/policy/explain/{{item.client_ip}}?service={{service.key}}">why this service?</a> · <a class="inline-context-link" href="/?view=devices&amp;section=managed&amp;focus=device:{{item.client_ip}}#devices/managed">managed device</a>{% endif %}</div></td><td>{{item.total_bytes_human}}</td><td>{{item.flows}}</td><td>{{item.last_seen or '—'}}</td></tr>
           {% else %}<tr><td colspan="4" class="muted">No attributed IPFIX traffic in this window.</td></tr>{% endfor %}
           </tbody>
         </table>
@@ -90,7 +103,7 @@
           <thead><tr><th>Domain</th><th>Queries</th><th>Devices</th><th>Blocked</th></tr></thead>
           <tbody>
           {% for item in detail.top_domains %}
-            <tr><td><strong>{{item.domain}}</strong></td><td>{{item.queries}}</td><td>{{item.devices}}</td><td>{{item.blocked}}</td></tr>
+            <tr><td><strong>{% if selected_start %}<a class="activity-inline-link" href="/activity/analytics?period=custom&amp;start={{selected_start|urlencode}}&amp;end={{selected_end|urlencode}}&amp;service={{service.key|urlencode}}{% if selected_client %}&amp;client_ip={{selected_client|urlencode}}{% endif %}{% if filters.capability %}&amp;capability={{filters.capability|urlencode}}{% endif %}{% if filters.routeros_state %}&amp;routeros_state={{filters.routeros_state|urlencode}}{% endif %}{% if filters.managed %}&amp;managed={{filters.managed|urlencode}}{% endif %}{% if filters.evidence_health %}&amp;evidence_health={{filters.evidence_health|urlencode}}{% endif %}">{{item.domain}}</a>{% else %}{{item.domain}}{% endif %}</strong></td><td>{{item.queries}}</td><td>{{item.devices}}</td><td>{{item.blocked}}</td></tr>
           {% else %}<tr><td colspan="4" class="muted">No DNS evidence attributed to this service.</td></tr>{% endfor %}
           </tbody>
         </table>

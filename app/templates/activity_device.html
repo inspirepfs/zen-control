@@ -27,11 +27,12 @@
     <div class="conflict-warning">{{error}}</div>
   </section>
   {% else %}
+  {% if selected_start or selected_service or filters.capability or filters.routeros_state or filters.managed or filters.evidence_health %}<section class="card"><p class="muted small" role="status">{{drill_window.label}} · active filters: service {{selected_service or 'all'}}, capability {{filters.capability or 'all'}}, RouterOS {{filters.routeros_state or 'all'}}, managed {{filters.managed or 'all'}}, evidence health {{filters.evidence_health or 'all'}}. <a href="/activity/device/{{client_ip}}?{% if selected_start %}start={{selected_start|urlencode}}&amp;end={{selected_end|urlencode}}{% else %}hours={{hours}}{% endif %}">Clear filters</a></p></section>{% endif %}
   <section class="card">
     <div class="card-heading">
       <div>
         <h2>Device usage</h2>
-        <p class="muted">Last {{hours}} hours · {% if managed %}managed device · {{client_ip}}{% else %}{{client_ip}}{% endif %}</p>
+        <p class="muted">{{drill_window.label}} · {% if managed %}managed device · {{client_ip}}{% else %}{{client_ip}}{% endif %}</p>
       </div>
     </div>
     <div class="activity-kpis">
@@ -63,7 +64,7 @@
       <h2>Policy service activity</h2>
       {% for s in policy_services if s.observed or s.blocked_by_profiles %}
         <div class="activity-row">
-          <strong>{{s.name}}{% if s.kind == 'group' %} <span class="muted small">GROUP</span>{% endif %}</strong>
+          <strong>{% if s.key and s.kind != 'group' %}<a class="activity-inline-link" href="/activity/service/{{s.key}}?{% if selected_start %}start={{selected_start|urlencode}}&amp;end={{selected_end|urlencode}}&amp;{% else %}hours={{hours}}&amp;{% endif %}client_ip={{client_ip}}&amp;capability={{filters.capability}}&amp;routeros_state={{filters.routeros_state}}&amp;managed={{filters.managed}}&amp;evidence_health={{filters.evidence_health}}">{{s.name}}</a>{% else %}{{s.name}}{% endif %}{% if s.kind == 'group' %} <span class="muted small">GROUP</span>{% endif %}</strong>
           <span>{{s.total_bytes_human}}{% if s.blocked_by_profiles %} · policy: {{s.blocked_by_profiles|join(', ')}}{% endif %}</span>
         </div>
       {% else %}<p class="muted">No service attribution yet.</p>{% endfor %}

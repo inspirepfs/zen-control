@@ -502,6 +502,47 @@ class ActivityStore:
             row["percent"] = round(row["total_bytes"] * 100 / total, 1)
         return rows
 
+    def service_matrix(self, hours=24, limit=100):
+        """Return bounded retained service aggregates for the concrete matrix.
+
+        These are deliberately two catalogue-wide, parameterized aggregates --
+        one per retained evidence source -- rather than a query per configured
+        service.  The caller joins the results to the current configuration in
+        memory, so opening Activity cannot turn a growing service catalogue into
+        database or RouterOS fan-out.
+        """
+        hours = max(1, min(int(hours), 24 * 31))
+        limit = max(1, min(int(limit), 200))
+        traffic = self._query("""
+            SELECT CASE WHEN service='' THEN 'Other' ELSE service END AS service_name,
+                   COALESCE(sum(bytes),0) AS total_bytes, COALESCE(sum(flows),0) AS flows,
+                   count(DISTINCT client_ip) AS traffic_devices, max(bucket) AS last_flow
+            FROM flow_5m
+            WHERE bucket >= now() - (%s * interval '1 hour')
+            GROUP BY service_name ORDER BY total_bytes DESC LIMIT %s
+        """, (hours, limit))
+        dns = self._query("""
+            SELECT CASE WHEN service='' THEN 'Other' ELSE service END AS service_name,
+                   count(*) AS queries, count(*) FILTER (WHERE blocked) AS blocked,
+                   count(DISTINCT client_ip) AS dns_devices,
+                   count(DISTINCT domain) AS domains, max(event_time) AS last_dns
+            FROM dns_queries
+            WHERE event_time >= now() - (%s * interval '1 hour')
+            GROUP BY service_name ORDER BY queries DESC LIMIT %s
+        """, (hours, limit))
+        for row in traffic:
+            row["total_bytes"] = int(row.get("total_bytes") or 0)
+            row["flows"] = int(row.get("flows") or 0)
+            row["traffic_devices"] = int(row.get("traffic_devices") or 0)
+            row["last_flow"] = row["last_flow"].isoformat() if row.get("last_flow") else None
+        for row in dns:
+            row["queries"] = int(row.get("queries") or 0)
+            row["blocked"] = int(row.get("blocked") or 0)
+            row["dns_devices"] = int(row.get("dns_devices") or 0)
+            row["domains"] = int(row.get("domains") or 0)
+            row["last_dns"] = row["last_dns"].isoformat() if row.get("last_dns") else None
+        return traffic, dns
+
     def top_destinations(self, hours=24, limit=15, client_ip=None):
         params = [int(hours)]
         extra = ""
@@ -1067,6 +1108,210 @@ class ActivityStore:
             })
         result.sort(key=lambda item: abs(item["delta_bytes"]), reverse=True)
         return result[:limit]
+
+    @staticmethod
+    def _service_evidence(row, prefix, metrics):
+        """Keep an empty retained source distinct from a measured zero.
+
+        The aggregate queries include a record count as well as metric totals.
+        That lets callers distinguish a real zero within observed samples (for
+        example, zero blocked DNS queries) from a range for which the source
+        supplied no retained samples at all.
+        """
+        records = row.get(prefix + "_records")
+        if records is None:
+            return {"status": "unavailable", "values": {key: None for key in metrics}}
+        records = int(records or 0)
+        values = {key: int(row.get(prefix + "_" + key) or 0) for key in metrics}
+        if records < 0 or any(value < 0 for value in values.values()):
+            return {"status": "inconsistent", "values": {key: None for key in metrics}}
+        if not records:
+            return {"status": "no_evidence", "values": {key: None for key in metrics}}
+        return {"status": "measured", "values": values}
+
+    @staticmethod
+    def _service_change(current, previous):
+        if current is None or previous is None:
+            return {"current": current, "previous": previous, "delta": None, "delta_percent": None}
+        delta = current - previous
+        return {
+            "current": current,
+            "previous": previous,
+            "delta": delta,
+            # A percentage against a zero baseline is deliberately undefined.
+            "delta_percent": round(delta * 100 / previous, 1) if previous else None,
+        }
+
+    def service_historical_analytics(self, start, end, timezone_name="Europe/London", client_ip=None, service_name=None, limit=30):
+        """Return bounded per-service current/previous analytics in six queries.
+
+        All services are compared from the same two aggregate scans.  The
+        supporting device/domain and trend scans are likewise batched by
+        service, avoiding per-service database fan-out for movers or detail.
+        """
+        start, end = self._validate_range(start, end)
+        try:
+            tz = ZoneInfo(str(timezone_name or "Europe/London"))
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown timezone: {timezone_name}") from exc
+        selected_client = str(client_ip or "").strip()
+        if selected_client:
+            selected_client = str(ipaddress.ip_address(selected_client))
+        selected_service = str(service_name or "").strip()
+        limit = max(1, min(int(limit), 100))
+        previous_start = start - (end - start)
+        service_filter = " AND lower(service)=lower(%s)" if selected_service else ""
+        client_filter = " AND client_ip=%s" if selected_client else ""
+        suffix_params = (() if not selected_service else (selected_service,)) + (() if not selected_client else (selected_client,))
+        errors = []
+
+        def query(source, sql, params):
+            try:
+                return self._query(sql, params)
+            except ActivityError as exc:
+                errors.append({"source": source, "error": str(exc)})
+                return None
+
+        # The first two queries each aggregate both equivalent windows.
+        flow_rows = query("traffic", f"""
+            SELECT CASE WHEN NULLIF(service,'') IS NULL THEN 'Other' ELSE service END AS service_name,
+                   count(*) FILTER (WHERE bucket >= %s AND bucket < %s) AS current_records,
+                   COALESCE(sum(bytes) FILTER (WHERE bucket >= %s AND bucket < %s),0) AS current_total_bytes,
+                   COALESCE(sum(flows) FILTER (WHERE bucket >= %s AND bucket < %s),0) AS current_flows,
+                   count(DISTINCT client_ip) FILTER (WHERE bucket >= %s AND bucket < %s) AS current_active_devices,
+                   count(*) FILTER (WHERE bucket >= %s AND bucket < %s) AS previous_records,
+                   COALESCE(sum(bytes) FILTER (WHERE bucket >= %s AND bucket < %s),0) AS previous_total_bytes,
+                   COALESCE(sum(flows) FILTER (WHERE bucket >= %s AND bucket < %s),0) AS previous_flows,
+                   count(DISTINCT client_ip) FILTER (WHERE bucket >= %s AND bucket < %s) AS previous_active_devices
+            FROM flow_5m
+            WHERE bucket >= %s AND bucket < %s{service_filter}{client_filter}
+            GROUP BY service_name
+        """, (start, end, start, end, start, end, start, end,
+                previous_start, start, previous_start, start, previous_start, start, previous_start, start,
+                previous_start, end) + suffix_params)
+        dns_rows = query("dns", f"""
+            SELECT CASE WHEN NULLIF(service,'') IS NULL THEN 'Other' ELSE service END AS service_name,
+                   count(*) FILTER (WHERE event_time >= %s AND event_time < %s) AS current_records,
+                   count(*) FILTER (WHERE event_time >= %s AND event_time < %s) AS current_dns_queries,
+                   count(*) FILTER (WHERE event_time >= %s AND event_time < %s AND blocked) AS current_dns_blocked,
+                   count(DISTINCT client_ip) FILTER (WHERE event_time >= %s AND event_time < %s) AS current_active_devices,
+                   count(DISTINCT domain) FILTER (WHERE event_time >= %s AND event_time < %s) AS current_domains,
+                   count(*) FILTER (WHERE event_time >= %s AND event_time < %s) AS previous_records,
+                   count(*) FILTER (WHERE event_time >= %s AND event_time < %s) AS previous_dns_queries,
+                   count(*) FILTER (WHERE event_time >= %s AND event_time < %s AND blocked) AS previous_dns_blocked,
+                   count(DISTINCT client_ip) FILTER (WHERE event_time >= %s AND event_time < %s) AS previous_active_devices,
+                   count(DISTINCT domain) FILTER (WHERE event_time >= %s AND event_time < %s) AS previous_domains
+            FROM dns_queries
+            WHERE event_time >= %s AND event_time < %s{service_filter}{client_filter}
+            GROUP BY service_name
+        """, (start, end, start, end, start, end, start, end, start, end,
+                previous_start, start, previous_start, start, previous_start, start, previous_start, start, previous_start, start,
+                previous_start, end) + suffix_params)
+
+        device_rows = query("top_devices", f"""
+            SELECT CASE WHEN NULLIF(service,'') IS NULL THEN 'Other' ELSE service END AS service_name,
+                   client_ip, COALESCE(sum(bytes),0) AS total_bytes, COALESCE(sum(flows),0) AS flows,
+                   max(bucket) AS last_seen
+            FROM flow_5m WHERE bucket >= %s AND bucket < %s{service_filter}{client_filter}
+            GROUP BY service_name, client_ip ORDER BY total_bytes DESC
+        """, (start, end) + suffix_params)
+        domain_rows = query("top_domains", f"""
+            SELECT CASE WHEN NULLIF(service,'') IS NULL THEN 'Other' ELSE service END AS service_name,
+                   domain, count(*) AS queries, count(*) FILTER (WHERE blocked) AS blocked,
+                   count(DISTINCT client_ip) AS devices, max(event_time) AS last_seen
+            FROM dns_queries WHERE event_time >= %s AND event_time < %s AND domain <> ''{service_filter}{client_filter}
+            GROUP BY service_name, domain ORDER BY queries DESC
+        """, (start, end) + suffix_params)
+        flow_trends = query("traffic_trends", f"""
+            SELECT CASE WHEN NULLIF(service,'') IS NULL THEN 'Other' ELSE service END AS service_name,
+                   date_trunc('hour', bucket) AS bucket, count(*) AS records,
+                   COALESCE(sum(bytes),0) AS total_bytes, COALESCE(sum(flows),0) AS flows
+            FROM flow_5m WHERE bucket >= %s AND bucket < %s{service_filter}{client_filter}
+            GROUP BY service_name, bucket ORDER BY bucket
+        """, (start, end) + suffix_params)
+        dns_trends = query("dns_trends", f"""
+            SELECT CASE WHEN NULLIF(service,'') IS NULL THEN 'Other' ELSE service END AS service_name,
+                   date_trunc('hour', event_time) AS bucket, count(*) AS records,
+                   count(*) FILTER (WHERE blocked) AS dns_blocked, count(DISTINCT domain) AS domains
+            FROM dns_queries WHERE event_time >= %s AND event_time < %s{service_filter}{client_filter}
+            GROUP BY service_name, bucket ORDER BY bucket
+        """, (start, end) + suffix_params)
+
+        merged = {}
+        names = set()
+        for rows in (flow_rows or [], dns_rows or [], device_rows or [], domain_rows or [], flow_trends or [], dns_trends or []):
+            names.update(str(row.get("service_name") or "Other") for row in rows)
+        if selected_service:
+            names.add(selected_service)
+        for name in names:
+            merged[name] = {"service_name": name, "_flow": {}, "_dns": {}, "top_devices": [], "top_domains": [], "hourly": {}}
+        for row in flow_rows or []:
+            merged[str(row.get("service_name") or "Other")]["_flow"] = row
+        for row in dns_rows or []:
+            merged[str(row.get("service_name") or "Other")]["_dns"] = row
+        for row in device_rows or []:
+            item = dict(row); item["total_bytes"] = int(item.get("total_bytes") or 0); item["flows"] = int(item.get("flows") or 0)
+            item["total_bytes_human"] = _format_bytes(item["total_bytes"])
+            item["last_seen"] = item["last_seen"].isoformat() if item.get("last_seen") else None
+            merged[str(item.get("service_name") or "Other")]["top_devices"].append(item)
+        for row in domain_rows or []:
+            item = dict(row)
+            for key in ("queries", "blocked", "devices"): item[key] = int(item.get(key) or 0)
+            item["last_seen"] = item["last_seen"].isoformat() if item.get("last_seen") else None
+            merged[str(item.get("service_name") or "Other")]["top_domains"].append(item)
+        for rows, kind in ((flow_trends or [], "traffic"), (dns_trends or [], "dns")):
+            for row in rows:
+                name = str(row.get("service_name") or "Other")
+                bucket = row.get("bucket")
+                if not bucket: continue
+                item = merged[name]["hourly"].setdefault(bucket, {"bucket": bucket, "traffic_records": None, "dns_records": None})
+                if kind == "traffic": item.update({"traffic_records": int(row.get("records") or 0), "total_bytes": int(row.get("total_bytes") or 0), "flows": int(row.get("flows") or 0)})
+                else: item.update({"dns_records": int(row.get("records") or 0), "dns_queries": int(row.get("records") or 0), "dns_blocked": int(row.get("dns_blocked") or 0), "domains": int(row.get("domains") or 0)})
+
+        services = []
+        for item in merged.values():
+            flow = item.pop("_flow"); dns = item.pop("_dns")
+            current_flow = self._service_evidence(flow, "current", ("total_bytes", "flows", "active_devices")) if flow_rows is not None else self._service_evidence({}, "current", ("total_bytes", "flows", "active_devices"))
+            previous_flow = self._service_evidence(flow, "previous", ("total_bytes", "flows", "active_devices")) if flow_rows is not None else self._service_evidence({}, "previous", ("total_bytes", "flows", "active_devices"))
+            current_dns = self._service_evidence(dns, "current", ("dns_queries", "dns_blocked", "active_devices", "domains")) if dns_rows is not None else self._service_evidence({}, "current", ("dns_queries", "dns_blocked", "active_devices", "domains"))
+            previous_dns = self._service_evidence(dns, "previous", ("dns_queries", "dns_blocked", "active_devices", "domains")) if dns_rows is not None else self._service_evidence({}, "previous", ("dns_queries", "dns_blocked", "active_devices", "domains"))
+            current = {**current_flow["values"], **current_dns["values"]}
+            previous = {**previous_flow["values"], **previous_dns["values"]}
+            current["active_devices"] = max((value for value in (current_flow["values"]["active_devices"], current_dns["values"]["active_devices"]) if value is not None), default=None)
+            previous["active_devices"] = max((value for value in (previous_flow["values"]["active_devices"], previous_dns["values"]["active_devices"]) if value is not None), default=None)
+            hourly = []
+            for trend in item["hourly"].values():
+                stamp = trend.pop("bucket")
+                trend["traffic_evidence_status"] = "measured" if trend.get("traffic_records") else ("no_evidence" if flow_trends is not None else "unavailable")
+                trend["dns_evidence_status"] = "measured" if trend.get("dns_records") else ("no_evidence" if dns_trends is not None else "unavailable")
+                trend["bucket"] = stamp.isoformat()
+                hourly.append(trend)
+            hourly.sort(key=lambda row: row["bucket"])
+            daily = {}
+            for trend in hourly:
+                day = datetime.fromisoformat(trend["bucket"]).astimezone(tz).date().isoformat()
+                day_row = daily.setdefault(day, {"day": day, "total_bytes": 0, "flows": 0, "dns_queries": 0, "dns_blocked": 0, "traffic_records": 0, "dns_records": 0})
+                for key in ("total_bytes", "flows", "dns_queries", "dns_blocked", "traffic_records", "dns_records"): day_row[key] += int(trend.get(key) or 0)
+            item.update({
+                "current": current, "previous": previous,
+                "comparison": {key: self._service_change(current.get(key), previous.get(key)) for key in current},
+                "traffic_evidence": {"current": current_flow["status"], "previous": previous_flow["status"]},
+                "dns_evidence": {"current": current_dns["status"], "previous": previous_dns["status"]},
+                "dns_blocked_evidence": "zero_when_proven" if current_dns["status"] == "measured" and current.get("dns_blocked") == 0 else current_dns["status"],
+                "hourly": hourly, "daily": [daily[key] for key in sorted(daily)],
+                "top_devices": item["top_devices"][:10], "top_domains": item["top_domains"][:20],
+            })
+            item["total_bytes"] = current.get("total_bytes")
+            item["total_bytes_human"] = _format_bytes(item["total_bytes"]) if item["total_bytes"] is not None else None
+            services.append(item)
+        services.sort(key=lambda row: (row["current"].get("total_bytes") is not None, row["current"].get("total_bytes") or 0), reverse=True)
+        movers = [row for row in services if row["comparison"]["total_bytes"]["delta"] is not None]
+        movers.sort(key=lambda row: abs(row["comparison"]["total_bytes"]["delta"]), reverse=True)
+        return {
+            "schema": "zen_service_historical_analytics_v1", "query_count": 6,
+            "window": {"start": start.isoformat(), "end": end.isoformat(), "previous_start": previous_start.isoformat(), "previous_end": start.isoformat(), "timezone": str(tz.key)},
+            "services": services[:limit], "movers": movers[:limit], "errors": errors,
+        }
 
     def service_detail(self, service_name, hours=24, start=None, end=None, client_ip=None):
         service_name = str(service_name or "").strip()
@@ -2014,17 +2259,43 @@ def build_service_intelligence(
     router_health=None,
     policy_groups=None,
     profiles=None,
+    router_observation_state="missing",
+    router_observation_age_seconds=None,
 ):
     """Build a stats-heavy, policy-aware service classification view."""
     base = build_policy_service_activity(service_defs, observed_rows, policy_groups, profiles)
     defs = {str(item.get("key") or ""): dict(item) for item in service_defs or []}
+    traffic_by_token = {}
+    for item in observed_rows or []:
+        token = _service_token(item.get("service_name"))
+        if not token:
+            continue
+        bucket = traffic_by_token.setdefault(token, {
+            "traffic_devices": 0, "last_flow": None,
+        })
+        bucket["traffic_devices"] = max(
+            bucket["traffic_devices"], int(item.get("traffic_devices") or 0)
+        )
+        candidate_last_flow = item.get("last_flow")
+        if candidate_last_flow and (not bucket["last_flow"] or str(candidate_last_flow) > str(bucket["last_flow"])):
+            bucket["last_flow"] = candidate_last_flow
     dns_by_token = {}
     for row in dns_rows or []:
         name = str(row.get("service_name") or "Other")
         token = _service_token(name)
-        bucket = dns_by_token.setdefault(token, {"queries": 0, "blocked": 0})
+        bucket = dns_by_token.setdefault(token, {
+            "queries": 0, "blocked": 0, "dns_devices": 0,
+            "domains": 0, "last_dns": None,
+        })
         bucket["queries"] += int(row.get("queries") or 0)
         bucket["blocked"] += int(row.get("blocked") or 0)
+        # Each source's distinct count is retained separately.  Adding them
+        # would invent a household-wide distinct-device/domain total.
+        bucket["dns_devices"] = max(bucket["dns_devices"], int(row.get("dns_devices") or 0))
+        bucket["domains"] += int(row.get("domains") or 0)
+        candidate_last_dns = row.get("last_dns")
+        if candidate_last_dns and (not bucket["last_dns"] or str(candidate_last_dns) > str(bucket["last_dns"])):
+            bucket["last_dns"] = candidate_last_dns
     health_by_key = {
         str(item.get("key") or ""): dict(item)
         for item in (router_health or {}).get("services", [])
@@ -2037,17 +2308,60 @@ def build_service_intelligence(
         for member_key in row.get("members") or []:
             member = defs.get(str(member_key), {})
             tokens.update({_service_token(member_key), _service_token(member.get("name"))})
-        queries = blocked = 0
+        queries = blocked = dns_devices = domains = 0
+        last_dns = None
         for token in tokens:
             if token and token in dns_by_token:
                 queries += dns_by_token[token]["queries"]
                 blocked += dns_by_token[token]["blocked"]
+                dns_devices = max(dns_devices, dns_by_token[token]["dns_devices"])
+                domains += dns_by_token[token]["domains"]
+                candidate_last_dns = dns_by_token[token]["last_dns"]
+                if candidate_last_dns and (not last_dns or str(candidate_last_dns) > str(last_dns)):
+                    last_dns = candidate_last_dns
         health = health_by_key.get(key)
         tls_patterns = list(definition.get("tls_patterns") or [])
         dns_suffixes = list(definition.get("dns_suffixes") or [])
         has_tls = bool(tls_patterns)
         has_dns = bool(dns_suffixes)
         expects_routeros_contract = bool(definition.get("routeros_managed")) and has_tls
+        traffic_devices = max(
+            (traffic_by_token.get(token, {}).get("traffic_devices", 0) for token in tokens),
+            default=0,
+        )
+        last_flow = max(
+            (traffic_by_token.get(token, {}).get("last_flow") for token in tokens
+             if traffic_by_token.get(token, {}).get("last_flow")),
+            key=str,
+            default=None,
+        )
+        last_activity = max(
+            (value for value in (last_flow, last_dns) if value),
+            key=str,
+            default=None,
+        )
+        observation_state = str(router_observation_state or "missing").lower()
+        if row.get("kind") == "group":
+            contract_state = "not-applicable"
+            capability = "aggregate-summary"
+        elif not expects_routeros_contract:
+            contract_state = "not-applicable"
+            capability = (
+                "combined" if has_tls and has_dns else "tls-only" if has_tls else
+                "dns-only" if has_dns else "unsigned/telemetry-only"
+            )
+        elif observation_state == "fresh" and health:
+            contract_state = "healthy" if health.get("healthy") else "degraded"
+            capability = "combined" if has_dns else "tls-only"
+        elif observation_state == "stale":
+            contract_state = "stale"
+            capability = "combined" if has_dns else "tls-only"
+        elif observation_state == "missing":
+            contract_state = "missing"
+            capability = "combined" if has_dns else "tls-only"
+        else:
+            contract_state = "unverified"
+            capability = "combined" if has_dns else "tls-only"
         row.update({
             "category": definition.get("category") or "other",
             "dns_suffixes": dns_suffixes,
@@ -2060,6 +2374,24 @@ def build_service_intelligence(
             "expects_routeros_contract": expects_routeros_contract,
             "dns_queries": queries,
             "dns_blocked": blocked,
+            "traffic_devices": traffic_devices,
+            "dns_devices": dns_devices,
+            "distinct_devices": {
+                "traffic": traffic_devices,
+                "dns": dns_devices,
+            },
+            "distinct_domains": domains,
+            "last_activity": last_activity,
+            "evidence_freshness": "retained" if last_activity else "no-retained-evidence",
+            # Keep a stable, descriptive filter value separate from the
+            # detailed display provenance above.  This is retained-evidence
+            # metadata only; it has no policy or RouterOS write meaning.
+            "evidence_health": "fresh" if last_activity else "no-evidence",
+            "signature_counts": {"tls": len(tls_patterns), "dns": len(dns_suffixes)},
+            "signature_capability": capability,
+            "routeros_contract_state": contract_state,
+            "routeros_observation_state": observation_state,
+            "routeros_observation_age_seconds": router_observation_age_seconds,
             "router_health": health or {},
             "detector_addresses": int((health or {}).get("detector_addresses") or 0),
         })

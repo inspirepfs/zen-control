@@ -23,10 +23,11 @@
 <main class="analytics-main">
 {% set page_help = zen_help('activity_history') %}
 {% include "_context_help.jinja" %}
-{% set filter_suffix %}{% if selected_ip %}&amp;client_ip={{selected_ip}}{% endif %}{% if selected_category %}&amp;category={{selected_category|urlencode}}{% endif %}{% if selected_service %}&amp;service={{selected_service|urlencode}}{% endif %}{% endset %}
-{% set drill_filter_suffix %}{% if selected_category %}&amp;category={{selected_category|urlencode}}{% endif %}{% if selected_service %}&amp;service={{selected_service|urlencode}}{% endif %}{% endset %}
+{% set filter_suffix %}{% if selected_ip %}&amp;client_ip={{selected_ip}}{% endif %}{% if selected_category %}&amp;category={{selected_category|urlencode}}{% endif %}{% if selected_service %}&amp;service={{selected_service|urlencode}}{% endif %}{% if filters.capability %}&amp;capability={{filters.capability|urlencode}}{% endif %}{% if filters.routeros_state %}&amp;routeros_state={{filters.routeros_state|urlencode}}{% endif %}{% if filters.managed %}&amp;managed={{filters.managed|urlencode}}{% endif %}{% if filters.evidence_health %}&amp;evidence_health={{filters.evidence_health|urlencode}}{% endif %}{% endset %}
+{% set drill_filter_suffix %}{% if selected_category %}&amp;category={{selected_category|urlencode}}{% endif %}{% if selected_service %}&amp;service={{selected_service|urlencode}}{% endif %}{% if filters.capability %}&amp;capability={{filters.capability|urlencode}}{% endif %}{% if filters.routeros_state %}&amp;routeros_state={{filters.routeros_state|urlencode}}{% endif %}{% if filters.managed %}&amp;managed={{filters.managed|urlencode}}{% endif %}{% if filters.evidence_health %}&amp;evidence_health={{filters.evidence_health|urlencode}}{% endif %}{% endset %}
   {% if prepared_view %}<div class="local-only-note">Prepared 7-day read model · {{prepared_view.age_seconds|round(1)}}s old · config revision {{prepared_view.source_revision}} · generation {{prepared_view.generation}}</div>{% endif %}
   <section class="card analytics-filter-card">
+    {% if selected_ip or selected_category or selected_service or filters.capability or filters.routeros_state or filters.managed or filters.evidence_health %}<p class="muted small" role="status">{{window.label if window else 'Bounded evidence window'}} · active filters: device {{selected_ip or 'all'}}, category {{selected_category or 'all'}}, service {{selected_service or 'all'}}, capability {{filters.capability or 'all'}}, RouterOS {{filters.routeros_state or 'all'}}, managed {{filters.managed or 'all'}}, evidence health {{filters.evidence_health or 'all'}}. <a href="/activity/analytics?period=custom&amp;start={{window.start|urlencode}}&amp;end={{window.end|urlencode}}">Clear filters</a></p>{% endif %}
     <div class="analytics-filter-row">
       <nav class="analytics-periods" aria-label="Activity period">
         {% for key,label in [('today','Today'),('yesterday','Yesterday'),('7d','7 days'),('30d','30 days')] %}
@@ -37,6 +38,7 @@
         <input type="hidden" name="period" value="{{period}}">
         {% if selected_category %}<input type="hidden" name="category" value="{{selected_category}}">{% endif %}
         {% if selected_service %}<input type="hidden" name="service" value="{{selected_service}}">{% endif %}
+        {% if filters.capability %}<input type="hidden" name="capability" value="{{filters.capability}}">{% endif %}{% if filters.routeros_state %}<input type="hidden" name="routeros_state" value="{{filters.routeros_state}}">{% endif %}{% if filters.managed %}<input type="hidden" name="managed" value="{{filters.managed}}">{% endif %}{% if filters.evidence_health %}<input type="hidden" name="evidence_health" value="{{filters.evidence_health}}">{% endif %}
         {% if period == 'custom' %}<input type="hidden" name="start" value="{{custom_start}}"><input type="hidden" name="end" value="{{custom_end}}">{% endif %}
         <label>Device
           <select name="client_ip" onchange="this.form.submit()">
@@ -53,10 +55,23 @@
       {% if selected_ip %}<input type="hidden" name="client_ip" value="{{selected_ip}}">{% endif %}
       {% if selected_category %}<input type="hidden" name="category" value="{{selected_category}}">{% endif %}
       {% if selected_service %}<input type="hidden" name="service" value="{{selected_service}}">{% endif %}
+      {% if filters.capability %}<input type="hidden" name="capability" value="{{filters.capability}}">{% endif %}{% if filters.routeros_state %}<input type="hidden" name="routeros_state" value="{{filters.routeros_state}}">{% endif %}{% if filters.managed %}<input type="hidden" name="managed" value="{{filters.managed}}">{% endif %}{% if filters.evidence_health %}<input type="hidden" name="evidence_health" value="{{filters.evidence_health}}">{% endif %}
       <label>Custom start <input type="date" name="start" value="{{custom_start or window.start_date if window else ''}}" required></label>
       <label>Custom end <input type="date" name="end" value="{{custom_end or window.end_date if window else ''}}" required></label>
       <button>Apply custom range</button>
     </form>
+  </section>
+
+  <section class="card analytics-daily-card">
+    <div class="card-heading"><div><h2>Service movers</h2><p class="muted">One bounded retained aggregate compares every service with the immediately preceding equivalent window.</p></div></div>
+    <div class="analytics-ranked-list">
+      {% for item in service_analytics.movers %}
+      <a class="analytics-ranked-row" href="{% if item.service_key %}/activity/service/{{item.service_key}}?start={{window.start|urlencode}}&amp;end={{window.end|urlencode}}{% if selected_ip %}&amp;client_ip={{selected_ip|urlencode}}{% endif %}{% if filters.capability %}&amp;capability={{filters.capability|urlencode}}{% endif %}{% if filters.routeros_state %}&amp;routeros_state={{filters.routeros_state|urlencode}}{% endif %}{% if filters.managed %}&amp;managed={{filters.managed|urlencode}}{% endif %}{% if filters.evidence_health %}&amp;evidence_health={{filters.evidence_health|urlencode}}{% endif %}{% else %}#{% endif %}">
+        <span><strong>{{item.service_name}}</strong><small>{{item.total_bytes_human or 'NO EVIDENCE'}} · traffic {{item.traffic_evidence.current|upper}} · DNS {{item.dns_evidence.current|upper}}</small></span>
+        <strong>{% set change = item.comparison.total_bytes %}{% if change.delta is none %}—{% elif change.delta > 0 %}+{{change.delta_human if change.delta_human else change.delta}}{% else %}{{change.delta}}{% endif %}{% if change.delta_percent is not none %} ({{change.delta_percent}}%){% elif change.current %} (NEW){% endif %}</strong>
+      </a>
+      {% else %}<p class="muted">No comparable retained service evidence in these equivalent windows.</p>{% endfor %}
+    </div>
   </section>
 
   {% if error %}
@@ -113,7 +128,7 @@
       <div class="card-heading"><div><h2>Top devices</h2><p class="muted">Household traffic ranked for this period.</p></div></div>
       <div class="analytics-ranked-list">
         {% for item in top_devices %}
-        <a class="analytics-ranked-row" href="/activity/analytics?period={{period}}&amp;client_ip={{item.client_ip}}{{drill_filter_suffix}}{% if period == 'custom' %}&amp;start={{custom_start}}&amp;end={{custom_end}}{% endif %}">
+        <a class="analytics-ranked-row" href="/activity/analytics?period=custom&amp;start={{window.start|urlencode}}&amp;end={{window.end|urlencode}}&amp;client_ip={{item.client_ip}}{{drill_filter_suffix}}">
           <span><strong>{% if item.managed %}{{item.display_name}} <span class="muted">({{item.client_ip}})</span>{% else %}{{item.client_ip}}{% endif %}</strong><small>{{item.flows}} flows</small></span>
           <span>{{item.total_bytes_human}}</span>
         </a>
@@ -135,7 +150,7 @@
       <div class="card-heading"><div><h2>Top services</h2><p class="muted">What accounted for the most traffic in this period.</p></div></div>
       <div class="analytics-ranked-list">
         {% for item in services %}
-          {% if item.service_key %}<a class="analytics-ranked-row" href="/activity/service/{{item.service_key}}?start={{window.start|urlencode}}&amp;end={{window.end|urlencode}}{% if selected_ip %}&amp;client_ip={{selected_ip|urlencode}}{% endif %}">{% else %}<div class="analytics-ranked-row">{% endif %}
+          {% if item.service_key %}<a class="analytics-ranked-row" href="/activity/service/{{item.service_key}}?start={{window.start|urlencode}}&amp;end={{window.end|urlencode}}{% if selected_ip %}&amp;client_ip={{selected_ip|urlencode}}{% endif %}{% if filters.capability %}&amp;capability={{filters.capability|urlencode}}{% endif %}{% if filters.routeros_state %}&amp;routeros_state={{filters.routeros_state|urlencode}}{% endif %}{% if filters.managed %}&amp;managed={{filters.managed|urlencode}}{% endif %}{% if filters.evidence_health %}&amp;evidence_health={{filters.evidence_health|urlencode}}{% endif %}">{% else %}<div class="analytics-ranked-row">{% endif %}
             <span><strong>{{item.service_name}}</strong><small>{{item.flows}} flows · {{item.percent}}%</small></span><span>{{item.total_bytes_human}}</span>
           {% if item.service_key %}</a>{% else %}</div>{% endif %}
         {% else %}<p class="muted">No service attribution in this period.</p>{% endfor %}
