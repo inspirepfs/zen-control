@@ -446,12 +446,31 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertIn("paths.length!==context.paths.length", web.PAGE)
 
     def test_reconciliation_actions_are_explicit(self):
-        with self.assertRaises(web.WebConsoleError):
-            web.command_for_action({"action": "reconcile_commit", "commit": "abc", "reason": "manual"}, self.base_state("READY_TO_COMMIT"))
-        req = web.command_for_action({"action": "reconcile_commit", "commit": "abc", "reason": "manual", "confirm": "ADOPT"}, self.base_state("READY_TO_COMMIT"))
-        self.assertEqual(req.argv[0], "reconcile-commit")
-        with self.assertRaises(web.WebConsoleError):
-            web.command_for_action({"action": "reconcile_push"}, self.base_state("COMMITTED"))
+        legacy_actions = (
+            ("reconcile_commit", {"commit": "abc", "reason": "manual", "confirm": "ADOPT"}, "READY_TO_COMMIT"),
+            ("reconcile_push", {"commit": "abc", "reason": "manual", "confirm": "PUSH"}, "COMMITTED"),
+        )
+        for action, payload, status in legacy_actions:
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(web.WebConsoleError, f"unsupported action: {action}"):
+                    web.command_for_action({"action": action, **payload}, self.base_state(status))
+
+        self.assertEqual(
+            web.command_for_action({"action": "requalify"}, self.base_state("READY_TO_COMMIT")).argv,
+            ["requalify", "b" * 64],
+        )
+        self.assertEqual(
+            web.command_for_action({"action": "finalize_review"}, self.base_state("READY_TO_COMMIT")).argv,
+            ["finalize", "b" * 64],
+        )
+        self.assertEqual(
+            web.command_for_action({"action": "finalize_commit", "confirm": "COMMIT"}, self.base_state("READY_TO_COMMIT")).argv,
+            ["finalize", "b" * 64, "--commit"],
+        )
+        self.assertEqual(
+            web.command_for_action({"action": "finalize_push", "confirm": "PUSH"}, self.base_state("COMMITTED")).argv,
+            ["finalize", "b" * 64, "--push"],
+        )
 
 
 class AuthenticationTests(unittest.TestCase):

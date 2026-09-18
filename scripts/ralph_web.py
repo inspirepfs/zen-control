@@ -33,6 +33,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 import ralph_efficiency as efficiency_policy
 import ralph_model as model_policy
+import ralph
 from ralph_profile import ZEN_PROFILE
 
 ROOT = ZEN_PROFILE.repository_root(__file__)
@@ -243,6 +244,38 @@ def _controller_command(*argv: str) -> list[str]:
     return [sys.executable, str(ZEN_PROFILE.controller_cli(ROOT)), *argv]
 
 
+def _controller_test_reconciliation_candidate(state: dict[str, Any]) -> dict[str, str] | None:
+    """Return the controller-derived candidate without Web eligibility filtering."""
+    try:
+        candidate = ralph.ready_to_commit_test_reconciliation_candidate(state)
+    # A partially written or older controller state is not an adoption
+    # candidate.  Fail closed at this display/dispatch boundary rather than
+    # exposing an action or failing the snapshot while the controller state is
+    # being refreshed.
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not isinstance(candidate, dict):
+        return None
+    path = str(candidate.get("path") or "").strip()
+    if not path:
+        return None
+    return {
+        "path": path,
+        "delta_kind": str(candidate.get("delta_kind") or "").strip(),
+    }
+
+
+def _test_reconciliation_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    # READY_TO_COMMIT is controller state.  The controller helper below remains
+    # the sole authority for whether that state has an adoption candidate.
+    if str(state.get("status") or "") != "READY_TO_COMMIT":
+        return {"eligible": False}
+    candidate = _controller_test_reconciliation_candidate(state)
+    if candidate is None:
+        return {"eligible": False}
+    return {"eligible": True, **candidate}
+
+
 def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
     state = _read_json(STATE, {})
     if not isinstance(state, dict):
@@ -294,6 +327,7 @@ def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
         "efficiency_defaults": efficiency_policy.defaults(),
         "model_policy": model_selection,
         "gate": _gate_snapshot(state),
+        "test_reconciliation": _test_reconciliation_snapshot(state),
         "usage": {
             "model": usage.get("model"),
             "plan_type": usage.get("plan_type"),
@@ -529,7 +563,9 @@ class CommandRequest:
 
 def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> CommandRequest:
     action = str(payload.get("action") or "").strip()
-    plan_hash = str(payload.get("plan_hash") or state.get("plan_hash") or "").strip()
+    # The active controller snapshot is authoritative; never let the client
+    # select a different plan context for a command.
+    plan_hash = str(state.get("plan_hash") or "").strip()
     status = str(state.get("status") or "IDLE")
 
     def reason() -> str:
@@ -678,6 +714,26 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
         if status != "READY_TO_COMMIT":
             raise WebConsoleError("requalify requires READY_TO_COMMIT")
         return CommandRequest(["requalify", plan_hash], background=True, activity="QUALIFYING")
+    if action == "reconcile_ready_test":
+        if status != "READY_TO_COMMIT":
+            raise WebConsoleError("reconcile-ready-test requires READY_TO_COMMIT")
+        if str(payload.get("confirm") or "") != "ADOPT":
+            raise WebConsoleError("reconcile-ready-test requires confirm=ADOPT")
+        candidate = _controller_test_reconciliation_candidate(state)
+        if candidate is None:
+            raise WebConsoleError("no eligible controller test-reconciliation candidate")
+        # The displayed path is not an API authority input.  The browser does
+        # not submit it; if an older client echoes one, it can only act as a
+        # stale-display check and can never replace the current controller
+        # candidate used below.
+        requested_path = str(payload.get("path") or "").strip()
+        if requested_path and requested_path != candidate["path"]:
+            raise WebConsoleError("selected path must exactly match the controller candidate")
+        return CommandRequest(
+            ["adopt-test-reconciliation", plan_hash, "--path", candidate["path"],
+             "--confirm", "ADOPT", "--reason", reason()],
+            confirm="ADOPT", activity="RECONCILING",
+        )
     if action == "finalize_review":
         return CommandRequest(["finalize", plan_hash], activity="REVIEWING")
     if action == "finalize_commit":
@@ -692,17 +748,6 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
         if str(payload.get("confirm") or "") != "PUSH":
             raise WebConsoleError("push requires confirm=PUSH")
         return CommandRequest(["finalize", plan_hash, "--push"], confirm="PUSH", activity="PUSHING")
-    if action == "reconcile_commit":
-        if str(payload.get("confirm") or "") != "ADOPT":
-            raise WebConsoleError("reconcile-commit requires confirm=ADOPT")
-        commit = str(payload.get("commit") or "").strip()
-        if not commit:
-            raise WebConsoleError("commit SHA is required")
-        return CommandRequest(["reconcile-commit", plan_hash, "--commit", commit, "--reason", reason()], confirm="ADOPT", activity="RECONCILING")
-    if action == "reconcile_push":
-        if str(payload.get("confirm") or "") != "PUSHED":
-            raise WebConsoleError("reconcile-push requires confirm=PUSHED")
-        return CommandRequest(["reconcile-push", plan_hash], confirm="PUSHED", activity="RECONCILING")
     raise WebConsoleError(f"unsupported action: {action or '-'}")
 
 
@@ -799,7 +844,7 @@ function kv(obj){return Object.entries(obj).map(([k,v])=>`<div>${esc(k)}</div><d
 function num(v){return Number(v||0).toLocaleString();}
 function when(epoch){if(!epoch)return 'unknown';return new Date(Number(epoch)*1000).toLocaleString();}
 function stripAnsi(s){return String(s||'').replace(/\x1b\[[0-9;]*m/g,'');}
-const renderedValues=new WeakMap(),pendingTargetUpdates=new Map();let renderedControlsIdentity=null,latestSnapshot=null,refreshGeneration=0,actionFeedback=null,localActionState=null,efficiencyDirty=false;
+const renderedValues=new WeakMap(),pendingTargetUpdates=new Map();let renderedControlsIdentity=null,renderedReadyTestReconciliationIdentity=null,latestSnapshot=null,refreshGeneration=0,actionFeedback=null,localActionState=null,efficiencyDirty=false;
 function selectionIntersectsTarget(target){const selection=window.getSelection();if(!target||!selection||selection.isCollapsed||!selection.rangeCount)return false;for(let i=0;i<selection.rangeCount;i++){try{if(selection.getRangeAt(i).intersectsNode(target))return true;}catch(_e){}}return false;}
 function valuesFor(target){let values=renderedValues.get(target);if(!values){values=new Map();renderedValues.set(target,values);}return values;}
 function pendingFor(target){let updates=pendingTargetUpdates.get(target);if(!updates){updates=new Map();pendingTargetUpdates.set(target,updates);}return updates;}
@@ -816,23 +861,25 @@ function markdownInline(text){let value=esc(text);value=value.replace(/`([^`]+)`
 function renderMarkdown(text){const lines=String(text??'').replace(/\r\n?/g,'\n').split('\n');let out=[],code=false,list='';const closeList=()=>{if(list){out.push(`</${list}>`);list='';}};for(const raw of lines){if(/^\s*```/.test(raw)){closeList();if(code){out.push('</code></pre>');code=false;}else{out.push('<pre class="md-code"><code>');code=true;}continue;}if(code){out.push(esc(raw)+'\n');continue;}const line=raw.trimEnd();if(!line.trim()){closeList();continue;}let m=line.match(/^(#{1,6})\s+(.+)$/);if(m){closeList();const level=m[1].length;out.push(`<h${level}>${markdownInline(m[2])}</h${level}>`);continue;}if(/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)){closeList();out.push('<hr>');continue;}m=line.match(/^\s*[-*+]\s+(.+)$/);if(m){if(list!=='ul'){closeList();out.push('<ul>');list='ul';}out.push(`<li>${markdownInline(m[1])}</li>`);continue;}m=line.match(/^\s*\d+[.)]\s+(.+)$/);if(m){if(list!=='ol'){closeList();out.push('<ol>');list='ol';}out.push(`<li>${markdownInline(m[1])}</li>`);continue;}m=line.match(/^\s*>\s?(.*)$/);if(m){closeList();out.push(`<blockquote>${markdownInline(m[1])}</blockquote>`);continue;}closeList();out.push(`<p>${markdownInline(line.trim())}</p>`);}closeList();if(code)out.push('</code></pre>');return out.join('')||'<div class="small">No completion report yet.</div>';}
 function setReportMode(mode){reportMode=mode==='markdown'?'markdown':'rendered';const rendered=document.getElementById('reportRendered'),raw=document.getElementById('reportMarkdown'),renderedButton=document.getElementById('reportRenderedButton'),rawButton=document.getElementById('reportMarkdownButton');if(rendered)rendered.hidden=reportMode!=='rendered';if(raw)raw.hidden=reportMode!=='markdown';if(renderedButton)renderedButton.classList.toggle('active',reportMode==='rendered');if(rawButton)rawButton.classList.toggle('active',reportMode==='markdown');}
 function renderReport(report){const text=report?.preview||'No completion report yet.';renderHTML('reportRendered',renderMarkdown(text));renderText('reportMarkdown',text);renderText('reportPath',report?.path?`Source: ${report.path}`:'');setReportMode(reportMode);}
-function actionLabel(action){return ({approve:'Plan approved',reject:'Plan rejected',resume:'Plan resumed',resolve_gate:'Human gate resolved',steer:'Direction submitted',requalify:'Qualified delta revalidated',finalize_review:'Finalization review',finalize_commit:'Qualified delta committed',finalize_push:'Commit pushed',retire:'Plan retired',authorize_self_hosting:'Self-hosting authority granted',efficiency_update:'Efficiency policy updated',efficiency_reset_all:'Efficiency policy reset'})[action]||'Operator action complete';}
+function actionLabel(action){return ({approve:'Plan approved',reject:'Plan rejected',resume:'Plan resumed',resolve_gate:'Human gate resolved',steer:'Direction submitted',requalify:'Qualified delta revalidated',reconcile_ready_test:'Late test delta adopted for requalification',finalize_review:'Finalization review',finalize_commit:'Qualified delta committed',finalize_push:'Commit pushed',retire:'Plan retired',authorize_self_hosting:'Self-hosting authority granted',efficiency_update:'Efficiency policy updated',efficiency_reset_all:'Efficiency policy reset'})[action]||'Operator action complete';}
 function renderActionFeedback(){if(!actionFeedback)return;const feedback=actionFeedback;const heading=feedback.error?`${actionLabel(feedback.action)} failed`:actionLabel(feedback.action);const output=[prettyOutput(feedback.stdout),prettyOutput(feedback.stderr)].filter(Boolean).join('');const granted=feedback.grantedPaths?.length?`<pre class="action-detail">${esc(`Granted authority over named RALPH tooling paths:\n${feedback.grantedPaths.join('\n')}`)}</pre>`:'';const detail=feedback.error?`<pre class="action-detail">${esc(feedback.error)}</pre>`:(output||'<div class="small">Controller accepted the action. Current state is shown above.</div>');renderHTML('actionResult',`<div class="action-title ${feedback.error?'bad':''}">${esc(heading)}</div>${granted}${detail}`);}
 function renderActionResult(action,j,grantedPaths=[]){actionFeedback={action,stdout:j.stdout,stderr:j.stderr,grantedPaths};renderActionFeedback();}
 function renderActionFailure(action,message){actionFeedback={action,error:message||'action failed'};renderActionFeedback();}
 function renderSelfHostingReview(){const context=document.getElementById('selfHostingContext');if(context&&!context.dataset.reviewed){context.dataset.reviewed='true';context.insertAdjacentHTML('beforebegin','<div class="small">You are granting authority over named RALPH tooling paths. Review every displayed candidate before submission.</div>');}}
 async function post(payload){const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json','X-RALPH-CSRF':CSRF},body:JSON.stringify(payload)});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||j.stderr||'action failed');return j;}
 function controlButton(label,action,extra={},cls=''){return `<button class="${cls}" onclick='act(${JSON.stringify(action)},${JSON.stringify(extra)})'>${esc(label)}</button>`;}
-function actionState(action){return ({propose:'PLANNING',approve:'APPROVING',reject:'REJECTING',run:'RUNNING',steer:'STEERING',resume:'RESUMING',resolve_gate:'RESOLVING',retire:'RETIRING',authorize_self_hosting:'AUTHORIZING',requalify:'QUALIFYING',finalize_review:'REVIEWING',finalize_commit:'COMMITTING',finalize_push:'PUSHING'})[action]||'WORKING';}
+function actionState(action){return ({propose:'PLANNING',approve:'APPROVING',reject:'REJECTING',run:'RUNNING',steer:'STEERING',resume:'RESUMING',resolve_gate:'RESOLVING',retire:'RETIRING',authorize_self_hosting:'AUTHORIZING',requalify:'QUALIFYING',reconcile_ready_test:'RECONCILING',finalize_review:'REVIEWING',finalize_commit:'COMMITTING',finalize_push:'PUSHING'})[action]||'WORKING';}
 function showActionState(action){localActionState=actionState(action);renderText('status',localActionState);renderClass('job','badge info');renderText('job',localActionState.toLowerCase());}
 async function act(action,extra={}){try{let p={action,...extra};if(['reject','resume','resolve_gate','retire'].includes(action)){const reason=prompt('Reason / evidence:');if(!reason)return;p.reason=reason;}if(action==='retire'){if(prompt('Type RETIRE to confirm')!=='RETIRE')return;p.confirm='RETIRE';}if(action==='finalize_commit'){if(prompt('Type COMMIT to confirm')!=='COMMIT')return;p.confirm='COMMIT';}if(action==='finalize_push'){if(prompt('Type PUSH to confirm')!=='PUSH')return;p.confirm='PUSH';}showActionState(action);const j=await post(p);renderActionResult(action,j);await refresh();}catch(e){renderActionFailure(action,e.message);}finally{localActionState=null;}}
 async function submitGoal(){const goal=document.getElementById('goalInput').value.trim();if(!goal)return;try{showActionState('propose');await post({action:'propose',goal});await refresh();}catch(e){renderActionFailure('propose',e.message);}finally{localActionState=null;}}
 async function submitRun(){try{showActionState('run');const j=await post({action:'run',max_loops:40});renderActionResult('run',j);await refresh();}catch(e){renderActionFailure('run',e.message);}finally{localActionState=null;}}
 async function submitSteer(){const direction=document.getElementById('steerInput').value.trim();const gate=document.getElementById('gateId').textContent.trim();if(!direction)return;try{await post({action:'steer',gate,direction});await refresh();}catch(e){showError(e.message);}}
 async function submitSelfHosting(){const authority=latestSnapshot?.gate?.authority_block;const context=authority?{gate:String(authority.gate_id||''),paths:[...(authority.paths||[])]}:null;const reason=document.getElementById('selfHostingReason')?.value.trim()||'';const button=document.getElementById('selfHostingButton');const allowed=new Set(context?.paths||[]);const paths=[...document.querySelectorAll('input[data-self-host-path]:checked')].map(x=>x.value).filter(path=>allowed.has(path));if(!context){renderActionFailure('authorize_self_hosting','The controller self-hosting candidate is no longer available.');return;}if(!reason){renderActionFailure('authorize_self_hosting','Operator reason is required.');return;}if(paths.length!==context.paths.length){renderActionFailure('authorize_self_hosting','Select every controller candidate path before authorizing this exact grant.');return;}if(button)button.disabled=true;try{const j=await post({action:'authorize_self_hosting',gate:context.gate,paths,reason});renderActionResult('authorize_self_hosting',j,context.paths);await refresh();}catch(e){renderActionFailure('authorize_self_hosting',e.message);}finally{if(button)button.disabled=false;}}
+async function submitReadyTestReconciliation(){const candidate=latestSnapshot?.test_reconciliation;const path=String(candidate?.path||'');const reason=document.getElementById('testReconciliationReason')?.value.trim()||'';const button=document.getElementById('testReconciliationButton');if(!candidate?.eligible||!path){renderActionFailure('reconcile_ready_test','The controller reconciliation candidate is no longer available.');return;}if(!reason){renderActionFailure('reconcile_ready_test','Operator reason is required.');return;}if(button)button.disabled=true;try{const j=await post({action:'reconcile_ready_test',confirm:'ADOPT',reason});renderActionResult('reconcile_ready_test',j,[path]);await refresh();}catch(e){renderActionFailure('reconcile_ready_test',e.message);}finally{if(button)button.disabled=false;}}
 async function logout(){try{await fetch('/api/logout',{method:'POST',headers:{'X-RALPH-CSRF':CSRF}});}finally{location.reload();}}
 function showError(msg){renderHTML('error',`<div class="notice errorbox">${esc(msg)}</div>`);}
-function renderControls(s){const c=s.controller,g=s.gate;let out='';const st=c.status;const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);if(identity===renderedControlsIdentity)return;renderedControlsIdentity=identity;if(['PLANNING','APPROVING','REJECTING','STEERING','RESUMING','RESOLVING','RETIRING','AUTHORIZING','QUALIFYING','REVIEWING','COMMITTING','PUSHING','RECONCILING','REPORTING','WORKING'].includes(st)){out=`<div class="notice"><b>${esc(st)}</b><br><span class="small">Controller action in progress. Controls will return when the authoritative operation completes.</span></div>`;}else if(['IDLE','PLAN_COMPLETE','PUSHED'].includes(st)){out=`<div class="form"><textarea id="goalInput" placeholder="Describe the bounded engineering goal..."></textarea><button class="good" onclick="submitGoal()">Propose plan</button></div>`;}else if(st==='AWAITING_APPROVAL'){out=`<div class="notice"><b>Approval review</b><br><span class="small">Read every proposed step, objective, acceptance criterion and test-change policy before granting execution authority.</span></div><div class="actions">${controlButton('Approve plan','approve',{},'good')}${controlButton('Reject','reject',{},'danger')}</div>`;}else if(['APPROVED','RUNNING','PAUSED_USAGE_LIMIT'].includes(st)){out=`<div class="form"><div class="small">Live efficiency/resource policy is controlled in the panel above. Current mode: <b>${esc(c.efficiency_mode||'NORMAL')}</b>.</div><button class="good" onclick="submitRun()">Run approved plan</button></div>`;}else if(st==='BLOCKED_HUMAN'){const authority=g?.authority_block;if(authority){const pathRows=(authority.paths||[]).map(path=>`<label><input type="checkbox" data-self-host-path value="${esc(path)}" checked> <span class="file">${esc(path)}</span></label>`).join('');const reviewText=`Controller self-hosting authority block\nPlan hash: ${authority.plan_hash}\nStep: ${authority.step}\nGate: ${authority.gate_id}\nCandidate paths:\n${(authority.paths||[]).join('\n')}`;out=`<div class="notice gate"><b>Supervised self-hosting authority</b><br><span class="small">Controller-reported context only; the controller decides eligibility and grant validity.</span></div><div class="form"><textarea id="selfHostingContext" readonly aria-label="Controller self-hosting authority block">${esc(reviewText)}</textarea>${pathRows}<textarea id="selfHostingReason" placeholder="Operator reason for this exact self-hosting grant..."></textarea><button id="selfHostingButton" class="good" onclick="submitSelfHosting()">Authorize Self-Hosting</button><div class="actions">${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}else{out=`<div class="form"><textarea id="steerInput" placeholder="Bounded human direction for this exact gate..."></textarea><button onclick="submitSteer()">Steer & retry</button><div class="actions">${controlButton('Resume retry','resume')}${controlButton('Resolve delegated gate','resolve_gate',{gate:g?.id||''},'good')}${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}}else if(st==='READY_TO_COMMIT'){out=`<div class="actions">${controlButton('Requalify delta','requalify')}${controlButton('Finalization review','finalize_review')}${controlButton('Commit qualified delta','finalize_commit',{},'good')}</div>`;}else if(st==='COMMITTED'){out=`<div class="actions">${controlButton('Push to configured upstream','finalize_push',{},'good')}</div>`;}else{out=`<div class="small">No web action for state ${esc(st)}. Use the CLI for exceptional recovery.</div>`;}const controls=document.getElementById('controls');renderedValues.delete(controls);renderHTML('controls',out);}
+function renderReadyTestReconciliation(s){const reconciliation=s.test_reconciliation;const candidate=s.controller.status==='READY_TO_COMMIT'&&reconciliation?.eligible&&String(reconciliation.path||'')?{path:String(reconciliation.path),delta_kind:String(reconciliation.delta_kind||'')}:null;const identity=JSON.stringify(candidate);const target=document.getElementById('readyTestReconciliation');if(!target||identity===renderedReadyTestReconciliationIdentity)return;renderedReadyTestReconciliationIdentity=identity;const out=candidate?`<div class="form"><div class="small">Controller-authorized late test candidate (exact path):</div><textarea id="testReconciliationPath" readonly aria-label="Controller-authorized late test candidate">${esc(candidate.path)}</textarea><textarea id="testReconciliationReason" placeholder="Operator reason for adopting this exact candidate..."></textarea><button id="testReconciliationButton" class="good" onclick="submitReadyTestReconciliation()">Adopt exact candidate (ADOPT)</button></div>`:'';renderedValues.delete(target);renderHTML('readyTestReconciliation',out);}
+function renderControls(s){const c=s.controller,g=s.gate;let out='';const st=c.status;const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);renderReadyTestReconciliation(s);if(identity===renderedControlsIdentity)return;renderedControlsIdentity=identity;if(['PLANNING','APPROVING','REJECTING','STEERING','RESUMING','RESOLVING','RETIRING','AUTHORIZING','QUALIFYING','REVIEWING','COMMITTING','PUSHING','RECONCILING','REPORTING','WORKING'].includes(st)){out=`<div class="notice"><b>${esc(st)}</b><br><span class="small">Controller action in progress. Controls will return when the authoritative operation completes.</span></div>`;}else if(['IDLE','PLAN_COMPLETE','PUSHED'].includes(st)){out=`<div class="form"><textarea id="goalInput" placeholder="Describe the bounded engineering goal..."></textarea><button class="good" onclick="submitGoal()">Propose plan</button></div>`;}else if(st==='AWAITING_APPROVAL'){out=`<div class="notice"><b>Approval review</b><br><span class="small">Read every proposed step, objective, acceptance criterion and test-change policy before granting execution authority.</span></div><div class="actions">${controlButton('Approve plan','approve',{},'good')}${controlButton('Reject','reject',{},'danger')}</div>`;}else if(['APPROVED','RUNNING','PAUSED_USAGE_LIMIT'].includes(st)){out=`<div class="form"><div class="small">Live efficiency/resource policy is controlled in the panel above. Current mode: <b>${esc(c.efficiency_mode||'NORMAL')}</b>.</div><button class="good" onclick="submitRun()">Run approved plan</button></div>`;}else if(st==='BLOCKED_HUMAN'){const authority=g?.authority_block;if(authority){const pathRows=(authority.paths||[]).map(path=>`<label><input type="checkbox" data-self-host-path value="${esc(path)}" checked> <span class="file">${esc(path)}</span></label>`).join('');const reviewText=`Controller self-hosting authority block\nPlan hash: ${authority.plan_hash}\nStep: ${authority.step}\nGate: ${authority.gate_id}\nCandidate paths:\n${(authority.paths||[]).join('\n')}`;out=`<div class="notice gate"><b>Supervised self-hosting authority</b><br><span class="small">Controller-reported context only; the controller decides eligibility and grant validity.</span></div><div class="form"><textarea id="selfHostingContext" readonly aria-label="Controller self-hosting authority block">${esc(reviewText)}</textarea>${pathRows}<textarea id="selfHostingReason" placeholder="Operator reason for this exact self-hosting grant..."></textarea><button id="selfHostingButton" class="good" onclick="submitSelfHosting()">Authorize Self-Hosting</button><div class="actions">${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}else{out=`<div class="form"><textarea id="steerInput" placeholder="Bounded human direction for this exact gate..."></textarea><button onclick="submitSteer()">Steer & retry</button><div class="actions">${controlButton('Resume retry','resume')}${controlButton('Resolve delegated gate','resolve_gate',{gate:g?.id||''},'good')}${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}}else if(st==='READY_TO_COMMIT'){out=`<div class="actions">${controlButton('Requalify delta','requalify')}${controlButton('Finalization review','finalize_review')}${controlButton('Commit qualified delta','finalize_commit',{},'good')}</div><div id="readyTestReconciliation"></div>`;}else if(st==='COMMITTED'){out=`<div class="actions">${controlButton('Push to configured upstream','finalize_push',{},'good')}</div>`;}else{out=`<div class="small">No web action for state ${esc(st)}. Use the CLI for exceptional recovery.</div>`;}const controls=document.getElementById('controls');renderedValues.delete(controls);renderHTML('controls',out);renderedReadyTestReconciliationIdentity=null;renderReadyTestReconciliation(s);}
 function efficiencyElement(key){return document.querySelector(`[data-eff-key="${key}"]`);}
 function markEfficiencyDirty(){efficiencyDirty=true;renderText('effPolicyState','changes pending');renderClass('effPolicyState','badge warn');syncEfficiencyResetIcons();syncEfficiencyModePanels();}
 function syncEfficiencyResetIcons(){const defs=latestSnapshot?.efficiency_defaults||{};document.querySelectorAll('[data-eff-key]').forEach(el=>{const key=el.dataset.effKey;const button=document.querySelector(`[data-eff-reset="${key}"]`);if(!button)return;let changed;if(key==='mode')changed=String(el.value).toUpperCase()!==String(defs[key]||'NORMAL').toUpperCase();else changed=Number(el.value)!==Number(defs[key]);button.style.visibility=changed?'visible':'hidden';});}

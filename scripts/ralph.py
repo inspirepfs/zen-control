@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import selectors
 import shutil
 import subprocess
@@ -186,6 +187,7 @@ def default_state() -> dict:
         "recovery_checkpoint": None,
         "plan_changed_files": [],
         "plan_owned_files": [],
+        "test_reconciliation_adoptions": [],
         "human_steering": [],
         "steering_allowed_new_tests": [],
         "self_hosting_grant": None,
@@ -688,7 +690,10 @@ def final_qualification_gates() -> list[tuple[str, list[str]]]:
     return gates
 
 
-def run_final_qualification() -> tuple[bool, list[str], dict[str, float], str]:
+def run_final_qualification(requalification_state: dict | None = None) -> tuple[bool, list[str], dict[str, float], str]:
+    """Run final gates, guarding the recorded delta when requalifying."""
+    if requalification_state is not None:
+        _requalification_delta_guard(requalification_state)
     results: list[str] = []
     durations: dict[str, float] = {}
     output = ""
@@ -704,6 +709,8 @@ def run_final_qualification() -> tuple[bool, list[str], dict[str, float], str]:
         if proc.returncode != 0:
             output = proc.stdout[-12000:]
             return False, results, durations, output
+    if requalification_state is not None:
+        _requalification_delta_guard(requalification_state)
     return True, results, durations, output
 
 
@@ -1076,6 +1083,39 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
     return sorted(planned), sorted(baseline)
 
 
+def _requalification_delta_guard(state: dict) -> tuple[list[str], list[str]]:
+    """Require final requalification to cover only the recorded current delta."""
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint:
+        raise RuntimeError("requalification requires a recovery checkpoint")
+    baseline = {
+        str(path) for path in checkpoint.get("baseline_dirty_paths") or []
+    } | {
+        str(path) for path in checkpoint.get("baseline_untracked_paths") or []
+    }
+    planned = {str(path) for path in state.get("plan_changed_files") or []}
+    if not planned:
+        raise RuntimeError("requalification requires recorded plan changes")
+    overlap = sorted(baseline & planned)
+    if overlap:
+        raise RuntimeError(f"requalification refuses plan paths dirty at approval: {overlap}")
+    current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
+    unexpected = sorted(current - baseline - planned)
+    if unexpected:
+        raise RuntimeError(f"unexpected working-tree delta outside baseline/plan; requalification refused: {unexpected}")
+    missing = sorted(planned - current)
+    if missing:
+        raise RuntimeError(f"recorded plan paths are no longer present in the working-tree delta: {missing}")
+    protected = sorted(path for path in planned if is_protected_path(path) or _is_runtime_authority_path(path))
+    if protected:
+        raise RuntimeError(f"requalification refuses protected/runtime authority paths: {protected}")
+    tooling = sorted(path for path in planned if is_tooling_path(path))
+    unauthorized_tooling = sorted(set(tooling) - authorized_self_hosting_paths(state))
+    if unauthorized_tooling:
+        raise RuntimeError(f"requalification refuses RALPH tooling without same-plan self-hosting authority: {unauthorized_tooling}")
+    return sorted(planned), sorted(baseline)
+
+
 def _default_commit_message(state: dict) -> str:
     goal = " ".join(str(((state.get("plan") or {}).get("goal") or "RALPH plan completion")).split())
     goal = re.sub(r"[^A-Za-z0-9 ._/-]+", "", goal).strip()
@@ -1124,14 +1164,20 @@ def cmd_requalify(args: argparse.Namespace) -> int:
         raise RuntimeError("requalify hash does not match the current plan")
     if state.get("status") != "READY_TO_COMMIT":
         raise RuntimeError(f"requalify requires READY_TO_COMMIT, found {state.get('status')}")
-    passed, gates, durations, output = run_final_qualification()
+    passed, gates, durations, output = run_final_qualification(state)
+    planned = sorted({str(path) for path in state.get("plan_changed_files") or []})
+    fingerprint = plan_delta_fingerprint(state) if passed else None
     state["final_qualification"] = {
         "state": "PASS" if passed else "FAIL",
         "gates": gates,
         "durations": durations,
         "output": output[-6000:],
         "completed_at": utc_now(),
-        "delta_fingerprint": plan_delta_fingerprint(state) if passed else None,
+        "delta_fingerprint": fingerprint,
+        "completion_summary": {
+            "delta_fingerprint": fingerprint,
+            "recorded_plan_paths": planned,
+        } if passed else None,
     }
     if not passed:
         state["status"] = "BLOCKED_HUMAN"
@@ -1165,6 +1211,9 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     if action == "review":
         if state.get("status") not in {"READY_TO_COMMIT", "COMMITTED", "PUSHED"}:
             raise RuntimeError(f"finalize review requires READY_TO_COMMIT/COMMITTED/PUSHED, found {state.get('status')}")
+        qualified, qualified_reason = qualified_delta_matches(state)
+        if not qualified:
+            raise RuntimeError(f"finalize review refused: {qualified_reason}")
         report = build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
         print(tui.completion_card(report))
         review = finalization_review(state)
@@ -1301,6 +1350,134 @@ def cmd_reconcile_push(args: argparse.Namespace) -> int:
         title="PUSH RECONCILED", plan_hash=str(state.get("plan_hash") or ""),
         commit=sha, upstream=upstream, detail="Configured upstream contains the recorded commit",
     ))
+    return 0
+
+
+def cmd_adopt_test_reconciliation(args: argparse.Namespace) -> int:
+    """Adopt the single controller-validated late test delta into plan scope."""
+    init_files()
+    state = load_state()
+    active_plan_hash = str(state.get("plan_hash") or "")
+    if not active_plan_hash or not secrets.compare_digest(str(args.plan_hash or ""), active_plan_hash):
+        raise RuntimeError("adopt-test-reconciliation hash does not match the current plan")
+    if state.get("status") != "READY_TO_COMMIT":
+        raise RuntimeError(f"adopt-test-reconciliation requires READY_TO_COMMIT, found {state.get('status')}")
+    path = str(args.path or "")
+    if path != READY_TO_COMMIT_TEST_RECONCILIATION_PATH:
+        raise RuntimeError("adopt-test-reconciliation requires the exact approved test path")
+    if str(args.confirm or "") != "ADOPT":
+        raise RuntimeError("adopt-test-reconciliation requires --confirm ADOPT")
+    reason = " ".join(str(args.reason or "").split())
+    if not reason:
+        raise RuntimeError("adopt-test-reconciliation requires a non-empty --reason")
+
+    candidate = ready_to_commit_test_reconciliation_candidate(state)
+    if candidate is None or candidate.get("path") != path:
+        raise RuntimeError("adopt-test-reconciliation refused: validated candidate is missing, stale, duplicate, or not exact")
+    if candidate.get("delta_kind") not in {"untracked", "modified"}:
+        raise RuntimeError("adopt-test-reconciliation refused nonqualifying test delta")
+    adopted_path = str(candidate["path"])
+    baseline_kind = plan_baseline_path_kind(state, adopted_path)
+    if baseline_kind != "absent":
+        raise RuntimeError("adopt-test-reconciliation refused: test path existed at approval")
+    adoptions = state.get("test_reconciliation_adoptions")
+    adoptions = list(adoptions) if isinstance(adoptions, list) else []
+    if any(isinstance(item, dict) and item.get("path") == adopted_path for item in adoptions):
+        raise RuntimeError("adopt-test-reconciliation refused duplicate adoption")
+
+    qualification = state.get("final_qualification") if isinstance(state.get("final_qualification"), dict) else {}
+    if str(qualification.get("state") or "") != "PASS":
+        raise RuntimeError("adopt-test-reconciliation requires prior final qualification PASS")
+    fingerprint = str(qualification.get("delta_fingerprint") or "").strip()
+    if not fingerprint:
+        raise RuntimeError("adopt-test-reconciliation requires a bound prior qualification fingerprint")
+    # A plan may consist solely of the approved late test.  There is no
+    # pre-adoption delta to fingerprint in that narrow case; the recorded PASS
+    # binding remains required, while a nonempty existing scope is rechecked.
+    if state.get("plan_changed_files"):
+        qualified, qualified_reason = qualified_delta_matches(state)
+        if not qualified:
+            raise RuntimeError(f"adopt-test-reconciliation refused stale qualification: {qualified_reason}")
+
+    prior_binding = {
+        "state": "PASS",
+        "completed_at": qualification.get("completed_at"),
+        "delta_fingerprint": fingerprint,
+    }
+    baseline_result = _ApprovalBaselineAbsence(path)
+    adoption = {
+        "schema": "zen_ralph_test_reconciliation_adoption_v1",
+        "plan_hash": state["plan_hash"],
+        "path": adopted_path,
+        "approval_baseline": baseline_result,
+        "operator_reason": reason[:1200],
+        "adopted_at": utc_now(),
+        "prior_qualification": prior_binding,
+        "prior_qualification_binding": prior_binding,
+    }
+    adoption["entry_hash"] = hashlib.sha256(json.dumps(adoption, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    remember_plan_files(state, [adopted_path])
+    state["test_reconciliation_adoptions"] = [*adoptions, adoption]
+
+    # `ready_to_commit_test_reconciliation_candidate` cannot produce a real
+    # candidate without a recovery checkpoint.  Keep the historical in-memory
+    # command fixtures (which deliberately replace that derivation) compatible,
+    # but never allow this branch in a controller-derived invocation.  A real
+    # adoption always immediately requalifies the expanded, guarded delta.
+    if not state.get("recovery_checkpoint"):
+        state["final_qualification"] = {
+            "state": "STALE",
+            "requalified_after": None,
+            "prior_delta_fingerprint": fingerprint,
+        }
+        state["status"] = "BLOCKED_HUMAN"
+        state["block_reason"] = "final requalification requires a recovery checkpoint"
+        save_state(state)
+        append_journal(
+            int(state.get("loop_count") or 0), int(state.get("current_step") or 0),
+            "test-reconciliation-adoption", "ADOPTED", summary=reason, files=[adopted_path],
+            next_action="requalify the expanded plan delta",
+        )
+        tui.write_event(EVENTS, "TEST_ADOPTION", f"adopted {adopted_path}", adoption=adoption)
+        live_write(state["block_reason"], "FAIL")
+        print(f"TEST_ADOPTED plan={state['plan_hash']} path={adopted_path}; requalification required")
+        return 0
+
+    passed, gates, durations, output = run_final_qualification(state)
+    resulting_fingerprint = plan_delta_fingerprint(state) if passed else None
+    state["final_qualification"] = {
+        "state": "PASS" if passed else "FAIL",
+        "gates": gates,
+        "durations": durations,
+        "output": output[-6000:],
+        "completed_at": utc_now(),
+        "delta_fingerprint": resulting_fingerprint,
+        "completion_summary": {
+            "delta_fingerprint": resulting_fingerprint,
+            "recorded_plan_paths": sorted({str(item) for item in state.get("plan_changed_files") or []}),
+        } if passed else None,
+        "requalified_after": "test-reconciliation-adoption",
+        "prior_delta_fingerprint": fingerprint,
+    }
+    if not passed:
+        state["status"] = "BLOCKED_HUMAN"
+        state["block_reason"] = "final requalification failed after test-reconciliation adoption"
+    else:
+        state["block_reason"] = None
+    save_state(state)
+    append_journal(
+        int(state.get("loop_count") or 0), int(state.get("current_step") or 0),
+        "test-reconciliation-adoption", "ADOPTED" if passed else "REQUALIFICATION_FAIL", summary=reason, files=[adopted_path],
+        gates=gates, next_action="finalize review" if passed else "human review final requalification output",
+    )
+    tui.write_event(EVENTS, "TEST_ADOPTION", f"adopted {adopted_path}", adoption=adoption)
+    if not passed:
+        live_write(state["block_reason"], "FAIL")
+        if output:
+            print(output[-6000:])
+        return 2
+    live_write(f"adopted validated test delta {adopted_path}; final qualification PASS · delta={resulting_fingerprint[:12]}", "READY")
+    print(f"TEST_ADOPTED plan={state['plan_hash']} path={adopted_path}; requalified delta={resulting_fingerprint}")
     return 0
 
 
@@ -2098,6 +2275,96 @@ def git_changed_paths() -> list[str]:
         if payload and payload not in paths:
             paths.append(payload)
     return sorted(paths)
+
+
+READY_TO_COMMIT_TEST_RECONCILIATION_PATH = "tests/test_ralph_profile.py"
+
+
+class _ApprovalBaselineAbsence(dict):
+    """Structured adoption evidence with compatibility for older in-memory callers."""
+
+    def __init__(self, path: str):
+        super().__init__(path=path, result="absent")
+
+    def __eq__(self, other: object) -> bool:
+        if other == "absent":
+            return self.get("result") == "absent"
+        return super().__eq__(other)
+
+
+def _worktree_delta_kind(path: str) -> str | None:
+    """Classify one exact current worktree path without normalizing its input."""
+    proc = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", path], check=False)
+    if proc.returncode != 0:
+        return None
+    for entry in proc.stdout.split("\0"):
+        if len(entry) < 4 or entry[3:] != path:
+            continue
+        status = entry[:2]
+        if status == "??":
+            return "untracked"
+        if status.strip():
+            return "modified"
+    return None
+
+
+def validate_ready_to_commit_test_reconciliation(
+    state: dict, requested_path: str | None = None,
+) -> tuple[bool, str]:
+    """Validate the sole controller-owned READY_TO_COMMIT test delta."""
+    path = READY_TO_COMMIT_TEST_RECONCILIATION_PATH
+    # This is intentionally an exact comparison: the caller may ask whether a
+    # value is eligible, but never normalize it into a selectable adoption path.
+    if requested_path is not None and requested_path != path:
+        return False, "test reconciliation requires the exact controller-owned test path"
+    if state.get("status") != "READY_TO_COMMIT":
+        return False, "test reconciliation requires READY_TO_COMMIT"
+    plan = state.get("plan")
+    plan_digest = str(state.get("plan_hash") or "").strip()
+    if plan is not None or plan_digest:
+        if not isinstance(plan, dict) or not plan_digest:
+            return False, "test reconciliation requires an active approved plan"
+        try:
+            validate_plan(plan)
+        except (TypeError, ValueError):
+            return False, "test reconciliation requires a valid active plan"
+        if not secrets.compare_digest(plan_hash(plan), plan_digest):
+            return False, "test reconciliation refuses stale active-plan authority"
+    if is_protected_path(path) or _is_runtime_authority_path(path) or is_tooling_path(path):
+        return False, "test reconciliation refuses protected, runtime, or tooling paths"
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint:
+        return False, "recovery checkpoint is missing"
+    checkpoint_plan_hash = str(checkpoint.get("plan_hash") or "")
+    if plan_digest and not secrets.compare_digest(checkpoint_plan_hash, plan_digest):
+        return False, "test reconciliation refuses a checkpoint outside the active plan"
+    if plan_baseline_path_kind(state, path) != "absent":
+        return False, "test path existed at approval"
+    planned = {str(item) for item in state.get("plan_changed_files") or []}
+    if path in planned:
+        return False, "test path is already a recorded plan change"
+    baseline = {
+        str(item) for item in checkpoint.get("baseline_dirty_paths") or []
+    } | {
+        str(item) for item in checkpoint.get("baseline_untracked_paths") or []
+    }
+    current = {item for item in git_changed_paths() if not item.startswith(".ralph/")}
+    unexpected = current - baseline - planned
+    if unexpected != {path}:
+        return False, "test reconciliation requires the test path to be the sole unexpected delta"
+    return True, "eligible test reconciliation delta"
+
+
+def ready_to_commit_test_reconciliation_candidate(state: dict) -> dict | None:
+    """Derive, rather than accept, the only test-reconciliation candidate."""
+    path = READY_TO_COMMIT_TEST_RECONCILIATION_PATH
+    valid, _reason = validate_ready_to_commit_test_reconciliation(state)
+    if not valid:
+        return None
+    delta_kind = _worktree_delta_kind(path)
+    if delta_kind not in {"untracked", "modified"}:
+        return None
+    return {"path": path, "delta_kind": delta_kind}
 
 
 def validate_recovery_paths(paths: Iterable[str], step: dict) -> None:
@@ -3131,7 +3398,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     )
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "self_hosting_candidate": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None, "usage_admission": {"admitted": True, "plan_hash": digest, "admitted_at": utc_now(), "reserve_percent": reserve_percent, "remaining_percent_at_admission": _minimum_remaining(proposal_usage), "scope": "proposal-and-plan"}, "codex_usage": proposal_usage, "efficiency_mode": str(policy["mode"]), "efficiency_recommendation": recommended_efficiency_mode(args.goal)})
+    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "test_reconciliation_adoptions": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "self_hosting_candidate": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None, "usage_admission": {"admitted": True, "plan_hash": digest, "admitted_at": utc_now(), "reserve_percent": reserve_percent, "remaining_percent_at_admission": _minimum_remaining(proposal_usage), "scope": "proposal-and-plan"}, "codex_usage": proposal_usage, "efficiency_mode": str(policy["mode"]), "efficiency_recommendation": recommended_efficiency_mode(args.goal)})
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
@@ -4283,6 +4550,12 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_push = sub.add_parser("reconcile-push", help="mark the recorded commit pushed after proving it exists on the configured upstream")
     reconcile_push.add_argument("plan_hash")
     reconcile_push.set_defaults(func=cmd_reconcile_push)
+    adopt_test = sub.add_parser("adopt-test-reconciliation", help="adopt only the controller-validated late test delta and require requalification")
+    adopt_test.add_argument("plan_hash")
+    adopt_test.add_argument("--path", required=True, help="must be the exact controller-approved test path")
+    adopt_test.add_argument("--confirm", required=True, help="must be ADOPT")
+    adopt_test.add_argument("--reason", required=True, help="operator reason retained in the immutable-style adoption record")
+    adopt_test.set_defaults(func=cmd_adopt_test_reconciliation)
     usage = sub.add_parser("usage", help="show RALPH context/token usage and live Codex remaining limits")
     usage.add_argument("--details", action="store_true", help="include per-loop token usage")
     usage.add_argument("--json", action="store_true", help="emit machine-readable report")
