@@ -16,7 +16,7 @@ It is not a package manifest, SDK, or plugin contract.
 | Project gates | `optional` | Environment, supply-chain, and public-release validators are conditional by named ZEN paths. | Declare each additional validator and when it applies; absence is not synthesized by core. |
 | RALPH lifecycle validation | `RALPH default` | Approval/hash checks, state transitions, path authority, repair limits, usage/model/efficiency/resource controls, and Git finalization remain in the controller. | Do not supply or weaken lifecycle gates through host-project validation. |
 | Git capability | `required` | Status, checkpoints, delta binding, commit/push, and final `git diff --check`. | Provide a usable worktree and Git capability for the current lifecycle. |
-| Codex runtime capability | `required` | `codex` CLI/app-server performs planning/execution and usage/model operations. | Provide the locally authorized executable/service capability; credentials remain outside this contract. |
+| Codex runtime capability | `required` | `codex` CLI/app-server performs planning/execution, usage/model-catalog operations, and exposes the reasoning efforts supported by each authenticated model. | Provide the locally authorized executable/service capability, including configured model/reasoning-effort defaults and supported effort metadata; credentials remain outside this contract. |
 | Allowed scopes and protected paths | `required` | Controller and policy restrict protected paths, test changes, and self-hosting. | Declare host path/scope restrictions and test-change policy for every approved step. |
 | Project metadata | `optional` | Branch/upstream, host display wording, and host validator labels appear in snapshots/guidance. | Supply only metadata used for display, audit, or command selection; it cannot grant authority. |
 | Web console | `optional` | `scripts/ralph_web.py` is an operator adapter. | If enabled, provide bind/auth settings and a controller CLI path; it remains non-authoritative. |
@@ -32,7 +32,7 @@ It is not a package manifest, SDK, or plugin contract.
 - Host-project validation is registered through the ZEN profile. It is
   deliberately separate from RALPH lifecycle validation: the profile supplies
   project commands, while the controller retains approval, lifecycle, policy,
-  usage, model, efficiency, resource, and Git authority checks.
+  usage, model/reasoning-effort, efficiency, resource, and Git authority checks.
 - Persisted `zen_*` schema identifiers remain compatibility values. This seam
   change performs no state migration; any rename is separate extraction debt.
 - Git: local status, checkpoint/recovery refs, guarded publication, and an

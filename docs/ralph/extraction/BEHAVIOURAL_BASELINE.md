@@ -33,7 +33,7 @@ top-level commands statically include:
 `reconcile-push`, `usage`, `serve`, and `status`.
 
 `efficiency-policy` has `show`, `set`, `reset`, and `reset-mode` subcommands;
-`model-policy` has `show`, `set`, and `reset`. `serve` starts the local web
+`model-policy` has `show`, `set`, `reset`, `set-effort`, and `reset-effort`. `serve` starts the local web
 console through the existing controller command, defaulting to loopback
 `127.0.0.1:8765`. `scripts/ralph_gate.py` is a separate read-only review CLI
 with normal rendering plus `--json`, `--markdown`, and `--history` modes.
@@ -76,11 +76,13 @@ budget of 6 and preserve emergency runaway ceilings even when ordinary policy
 is off. Policy load/normalization is performed around controller decisions and
 the policy module supports migration of the prior v1 layout.
 
-The model policy is a project-local `zen_ralph_model_policy_v1` JSON record.
-It accepts a single non-whitespace model identifier (or no override), records a
-revision/time, and is reloaded for each new Codex process; lack of an override
-falls back to the user's Codex configuration. The controller also uses Codex
-app-server stdio for model catalog, rate-limit/usage, and reset-credit
+The model policy is a project-local `zen_ralph_model_policy_v2` JSON record.
+It independently accepts a single non-whitespace model identifier and a
+reasoning-effort identifier (or no override for either), records a revision/time,
+and is reloaded for each new Codex process. Legacy v1 policy normalizes into v2
+with no effort override. Missing project overrides fall back independently to
+the user's Codex `model` and `model_reasoning_effort` configuration. The controller also uses Codex
+app-server stdio for model catalog (including supported reasoning efforts), rate-limit/usage, and reset-credit
 operations, persists usage-related records locally, and can pause/admit work
 according to the configured reserve. These are static capabilities; no live
 Codex query occurred.

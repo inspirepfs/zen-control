@@ -1968,6 +1968,7 @@ def codex_command_prefix() -> list[str]:
 def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex") -> dict:
     prefix = codex_command_prefix()
     selected_model = selected_codex_model()
+    selected_effort = selected_codex_effort()
     with tempfile.TemporaryDirectory(prefix="ralph-lite-") as temp_dir:
         schema_path = Path(temp_dir) / "schema.json"
         output_path = Path(temp_dir) / "result.json"
@@ -1975,11 +1976,17 @@ def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex"
         command = [*prefix, "exec"]
         if selected_model:
             command += ["--model", selected_model]
+        if selected_effort:
+            command += ["--config", f'model_reasoning_effort="{selected_effort}"']
         command += [
             "--ephemeral", "--json", "--sandbox", sandbox,
             "--output-schema", str(schema_path), "-o", str(output_path), prompt,
         ]
-        live_write(f"{context} · model={selected_model or 'codex-default'} · sandbox={sandbox} backend=default", "CODEX")
+        live_write(
+            f"{context} · model={selected_model or 'codex-default'} · effort={selected_effort or 'codex-default'} "
+            f"· sandbox={sandbox} backend=default",
+            "CODEX",
+        )
         started = time.monotonic()
         returncode, output, metrics = stream_codex_process(command)
         metrics["codex_seconds"] = time.monotonic() - started
@@ -2442,22 +2449,41 @@ If safe completion requires breaking policy or human judgement, make no speculat
 
 
 
-def configured_codex_model() -> str | None:
-    """Read only the configured model name; never retain other Codex config."""
+def _configured_codex_selection() -> tuple[str | None, str | None]:
+    """Read only model/effort selection from Codex config; retain nothing else."""
     path = Path.home() / ".codex" / "config.toml"
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
-        return None
-    model = data.get("model") if isinstance(data, dict) else None
-    return str(model).strip() if isinstance(model, str) and model.strip() else None
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    model = data.get("model")
+    effort = data.get("model_reasoning_effort")
+    model_value = str(model).strip() if isinstance(model, str) and model.strip() else None
+    effort_value = str(effort).strip().lower() if isinstance(effort, str) and effort.strip() else None
+    return model_value, effort_value
+
+
+def configured_codex_model() -> str | None:
+    return _configured_codex_selection()[0]
+
+
+def configured_codex_effort() -> str | None:
+    return _configured_codex_selection()[1]
 
 
 def selected_codex_model() -> str | None:
-    """Return RALPH's project-local override, otherwise the user's Codex default."""
+    """Return RALPH's project-local model override, otherwise the Codex default."""
     selected = model_policy.load_policy(ROOT).get("model")
     return str(selected).strip() if selected else configured_codex_model()
+
+
+def selected_codex_effort() -> str | None:
+    """Return RALPH's project-local effort override, otherwise the Codex default."""
+    selected = model_policy.load_policy(ROOT).get("reasoning_effort")
+    return str(selected).strip().lower() if selected else configured_codex_effort()
 
 
 def _app_server_send(handle, payload: dict) -> None:
@@ -2592,11 +2618,18 @@ def query_codex_models(*, timeout: float = USAGE_APP_SERVER_TIMEOUT_SECONDS) -> 
                 "description": str(item.get("description") or ""),
                 "is_default": bool(item.get("isDefault")),
                 "reasoning_efforts": efforts,
+                "default_reasoning_effort": (
+                    str(item.get("defaultReasoningEffort")).strip().lower()
+                    if item.get("defaultReasoningEffort") is not None
+                    else None
+                ),
             })
         selected = selected_codex_model()
         return {
             "selected": selected,
+            "selected_effort": selected_codex_effort(),
             "configured_default": configured_codex_model(),
+            "configured_default_effort": configured_codex_effort(),
             "models": models,
             "captured_at": utc_now(),
         }
@@ -3883,6 +3916,15 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _model_supported_efforts(catalog: dict, model_name: str | None) -> list[str]:
+    if not model_name:
+        return []
+    for item in catalog.get("models") or []:
+        if str(item.get("id") or "") == str(model_name):
+            return [str(value).strip().lower() for value in item.get("reasoning_efforts") or [] if str(value).strip()]
+    return []
+
+
 def cmd_model_policy(args: argparse.Namespace) -> int:
     operation = str(getattr(args, "model_action", "show") or "show")
     if operation == "show":
@@ -3895,19 +3937,64 @@ def cmd_model_policy(args: argparse.Namespace) -> int:
         available = {str(item.get("id") or "") for item in catalog.get("models") or []}
         if requested not in available:
             raise RuntimeError(f"model {requested!r} is not in the current authenticated Codex model catalog")
-        policy = model_policy.save_policy(ROOT, requested)
-        live_write(f"model policy updated revision={policy['revision']} model={requested}", "MODEL")
+        current = model_policy.load_policy(ROOT)
+        current_effort = str(current.get("reasoning_effort") or "").strip().lower() or None
+        supported = _model_supported_efforts(catalog, requested)
+        if current_effort and current_effort not in supported:
+            policy = model_policy.save_policy(ROOT, requested, reasoning_effort=None)
+            live_write(
+                f"model policy updated revision={policy['revision']} model={requested}; "
+                f"effort override {current_effort} cleared because the model does not support it",
+                "MODEL",
+            )
+        else:
+            policy = model_policy.save_policy(ROOT, requested)
+            live_write(f"model policy updated revision={policy['revision']} model={requested}", "MODEL")
     elif operation == "reset":
         policy = model_policy.save_policy(ROOT, None)
         live_write(f"model policy reset to Codex configured default revision={policy['revision']}", "MODEL")
+    elif operation == "set-effort":
+        requested_effort = str(getattr(args, "effort", "") or "").strip().lower()
+        if not requested_effort:
+            raise RuntimeError("model-policy set-effort requires --effort")
+        catalog = query_codex_models()
+        effective_model = selected_codex_model()
+        if not effective_model:
+            raise RuntimeError("cannot set reasoning effort because no effective Codex model is available")
+        supported = _model_supported_efforts(catalog, effective_model)
+        if not supported:
+            raise RuntimeError(
+                f"model {effective_model!r} advertises no selectable reasoning efforts in the authenticated Codex catalog"
+            )
+        if requested_effort not in supported:
+            raise RuntimeError(
+                f"effort {requested_effort!r} is not supported by model {effective_model!r}; "
+                f"supported={','.join(supported)}"
+            )
+        policy = model_policy.save_policy(ROOT, reasoning_effort=requested_effort)
+        live_write(
+            f"model effort policy updated revision={policy['revision']} effort={requested_effort}",
+            "MODEL",
+        )
+    elif operation == "reset-effort":
+        policy = model_policy.save_policy(ROOT, reasoning_effort=None)
+        live_write(
+            f"model effort policy reset to Codex configured default revision={policy['revision']}",
+            "MODEL",
+        )
     else:
         raise RuntimeError(f"unsupported model-policy action {operation}")
     effective = policy.get("model") or configured_codex_model()
-    payload = {**policy, "effective_model": effective}
+    effective_effort = policy.get("reasoning_effort") or configured_codex_effort()
+    payload = {**policy, "effective_model": effective, "effective_reasoning_effort": effective_effort}
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        print(f"model={policy.get('model') or 'codex-default'} effective={effective or '-'} revision={policy['revision']}")
+        print(
+            f"model={policy.get('model') or 'codex-default'} effective={effective or '-'} "
+            f"effort={policy.get('reasoning_effort') or 'codex-default'} "
+            f"effective_effort={effective_effort or '-'} revision={policy['revision']}"
+        )
     return 0
 
 
@@ -4486,6 +4573,13 @@ def build_parser() -> argparse.ArgumentParser:
     model_reset = model_sub.add_parser("reset", help="return to the user's configured Codex default model")
     model_reset.add_argument("--json", action="store_true")
     model_reset.set_defaults(func=cmd_model_policy)
+    effort_set = model_sub.add_parser("set-effort", help="set project-local reasoning effort for subsequent Codex turns")
+    effort_set.add_argument("--effort", required=True)
+    effort_set.add_argument("--json", action="store_true")
+    effort_set.set_defaults(func=cmd_model_policy)
+    effort_reset = model_sub.add_parser("reset-effort", help="return to the user's configured Codex reasoning effort")
+    effort_reset.add_argument("--json", action="store_true")
+    effort_reset.set_defaults(func=cmd_model_policy)
     models = sub.add_parser("models", help="show the current authenticated Codex model catalog")
     models.add_argument("--json", action="store_true")
     models.set_defaults(func=cmd_models)

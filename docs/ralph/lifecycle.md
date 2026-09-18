@@ -76,10 +76,10 @@ Efficiency policy is orthogonal to admission. `STRICT`, `NORMAL`, and `RELAXED` 
 The web console deliberately keeps three live-control stores separate from controller authority:
 
 - `.ralph/efficiency-policy.json` — atomically applied resource policy; reread between model turns/decision boundaries;
-- `.ralph/model-policy.json` — optional project-local model override; changes affect the next Codex process, never the in-flight one;
+- `.ralph/model-policy.json` — optional project-local model and reasoning-effort overrides; either can be changed/reset independently and affects the next Codex process, never the in-flight one;
 - `.ralph/usage-stats-reset.json` — local token-report cutoff only; it does not alter provider quota or the append-only usage ledger.
 
-A model selection, efficiency-policy update, or local token-stat reset is allowed while the controller job is active without replacing `web-job.json` or mutating the plan lifecycle state. The usage monitor refreshes immediately after model/reset-account/stat actions so the operator sees the resulting state without waiting for the periodic monitor interval.
+A model or reasoning-effort selection, efficiency-policy update, or local token-stat reset is allowed while the controller job is active without replacing `web-job.json` or mutating the plan lifecycle state. The usage monitor refreshes immediately after model/reset-account/stat actions so the operator sees the resulting state without waiting for the periodic monitor interval.
 
 Banked reset credits are provider/account capability, not plan authority. The web UI renders **Redeem** only when the live supported rate-limit surface reports available credits. The action always requires an operator confirmation dialog; the CLI independently requires `--confirm REDEEM` and the consume call is idempotency-keyed. No controller transition auto-redeems a credit.
 

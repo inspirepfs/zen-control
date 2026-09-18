@@ -13,8 +13,8 @@ future extraction choices auditable.
 | Allowed scopes and test-change policy for an approved step | Human-approved plan plus ZEN policy | Plan/state/policy | Controller | `split` |
 | Python source roots, unittest discovery, UX validation, and optional release validators | ZEN implementation | `qualification_gates()` / final gates | Controller | `adapter-required` |
 | Git worktree, checkpoint/ref, commit/push, branch and upstream operations | Git adapter | Controller Git helpers | Controller, web snapshot | `adapter-required` |
-| Codex executable, app-server usage interface, and global default model | Runtime adapter | Controller helpers and user-local Codex configuration | Controller | `adapter-required` |
-| Project-local efficiency limits and model override | Controller policy helpers under host state root | `efficiency-policy.json`, `model-policy.json` | Controller, web | `review-required` |
+| Codex executable, app-server usage/model catalog, and global default model/reasoning effort | Runtime adapter | Controller helpers and user-local Codex configuration | Controller | `adapter-required` |
+| Project-local efficiency limits and model/reasoning-effort overrides | Controller policy helpers under host state root | `efficiency-policy.json`, `model-policy.json` | Controller, web | `review-required` |
 | Web bind, LAN opt-in, session/auth, CSRF, and executable location | Web adapter with host security policy | `scripts/ralph_web.py` | Web console | `adapter-required` |
 | Gate audience wording and ZEN incident/performance evidence commands | ZEN implementation | `scripts/ralph_gate.py` | Gate utility | `remain` |
 

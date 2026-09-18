@@ -10,7 +10,7 @@
 | Tests | `test_ralph_profile.py`, `test_ralph_profile_boundary.py`, `test_ralph_web_gate_profile_boundary.py`, `test_ralph_web.py`, `test_ralph_web_live_refresh.py`, `test_ralph_gate.py` | retain embedded coverage; classify portable assertions before moving |
 | Validation | `scripts/ux_validate.py`; `app/`, `scripts/`, `tests/`; optional `env_validate.py`, `supply_chain_validate.py`, `public_release_audit.py` | ZEN profile supplies commands; core orchestrates results |
 | State | `.ralph/state.json`, `plan.md`, `journal.md`, `context.json`, `events.jsonl`, `recovery/`, `reports/`, policy/model/usage/web files | retain local root/filenames; split lifecycle schemas from storage |
-| Configuration | `.ralph/policy.md`, efficiency/model policy, root/CLI/guidance profile values | ZEN-local; existing `zen_*` schemas remain readable |
+| Configuration | `.ralph/policy.md`, efficiency/model-and-effort policy, root/CLI/guidance profile values | ZEN-local; existing `zen_*` schemas remain readable |
 | Documentation | `docs/ralph/`, `docs/zen/ralph-integration/`, ADR | deliberate duplication retained for separation |
 
 | Item | Move/remain/break status |
