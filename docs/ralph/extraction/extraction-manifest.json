@@ -47,6 +47,7 @@
     "runtime-state": [
       ".ralph/context.json",
       ".ralph/efficiency-policy.json",
+      ".ralph/model-policy.json",
       ".ralph/events.jsonl",
       ".ralph/ideas.md",
       ".ralph/journal.md",

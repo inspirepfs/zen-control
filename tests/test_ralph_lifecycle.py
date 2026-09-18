@@ -188,7 +188,7 @@ class RecoveryCheckpointTests(unittest.TestCase):
             checkpoint = ralph.create_recovery_checkpoint(state)
             state["recovery_checkpoint"] = checkpoint["id"]
             state["plan_changed_files"] = ["app.py"]
-            with self.assertRaisesRegex(RuntimeError, "pre-existing staged"):
+            with self.assertRaisesRegex(RuntimeError, r"^APPROVAL_BASELINE_RESIDUE_AS_NEW_PLAN: \['app.py'\]$"):
                 ralph._finalization_guard(state)
 
 
@@ -414,7 +414,7 @@ class FinalizationTests(unittest.TestCase):
             (repo.root / "app.py").write_text("value = 4\n", encoding="utf-8")
             (repo.root / "surprise.txt").write_text("external\n", encoding="utf-8")
             state = self.ready_state(checkpoint)
-            with self.assertRaisesRegex(RuntimeError, "unexpected working-tree delta"):
+            with self.assertRaisesRegex(RuntimeError, r"^UNEXPECTED_DELTA: \['surprise.txt'\]$"):
                 ralph._finalization_guard(state)
 
     def test_completion_report_is_commit_ready_summary(self):
@@ -496,6 +496,99 @@ class EndToEndLifecycleTests(unittest.TestCase):
             self.assertIn("READY", report.upper()) if False else None
             self.assertIn("unit-tests=PASS", report)
             self.assertIn("Suggested commit", report)
+
+
+
+    def test_terminal_guard_exception_blocks_with_report_and_no_model_turn(self):
+        with RepoHarness(self) as repo:
+            plan = valid_plan()
+            digest = ralph.plan_hash(plan)
+            state = ralph.default_state()
+            state.update({
+                "status": "APPROVED",
+                "plan_hash": digest,
+                "plan": plan,
+                "current_step": len(plan["steps"]) + 1,
+                "loop_count": 12,
+                "step_results": [
+                    {"step": i, "title": f"Step {i}", "result": "PASS", "summary": "ok", "files": [], "gates": [], "stats": {}}
+                    for i in range(1, len(plan["steps"]) + 1)
+                ],
+            })
+            checkpoint = ralph.create_recovery_checkpoint(state)
+            state["recovery_checkpoint"] = checkpoint["id"]
+            state["plan_changed_files"] = ["app.py"]
+            (repo.root / "app.py").write_text("value = 9\n", encoding="utf-8")
+            ralph.save_state(state)
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            args = type("Args", (), {
+                "max_loops": 10, "wait_for_limits": False, "usage_poll_seconds": 300,
+                "color": "never", "efficiency_mode": None,
+            })()
+            refusal = "APPROVAL_BASELINE_RESIDUE_AS_NEW_PLAN: ['app.py']"
+            with (
+                mock.patch.object(ralph, "run_final_qualification", side_effect=RuntimeError(refusal)),
+                mock.patch.object(ralph, "run_codex") as run_codex,
+            ):
+                rc = ralph.cmd_run(args)
+
+            self.assertEqual(2, rc)
+            run_codex.assert_not_called()
+            blocked = ralph.load_state()
+            self.assertEqual("BLOCKED_HUMAN", blocked["status"])
+            self.assertEqual(len(plan["steps"]) + 1, blocked["current_step"])
+            self.assertEqual("BLOCKED", blocked["final_qualification"]["state"])
+            self.assertEqual("qualification-guard", blocked["final_qualification"]["stage"])
+            self.assertEqual(refusal, blocked["final_qualification"]["error"])
+            self.assertIn(refusal, blocked["block_reason"])
+            report_path = ralph.REPORTS / f"{digest[:16]}-summary.md"
+            self.assertTrue(report_path.exists())
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("State: BLOCKED", report)
+            self.assertIn(refusal, report)
+
+    def test_approved_terminal_sentinel_resumes_finalization_without_model_turn(self):
+        with RepoHarness(self) as repo:
+            plan = valid_plan()
+            digest = ralph.plan_hash(plan)
+            state = ralph.default_state()
+            state.update({
+                "status": "APPROVED",
+                "plan_hash": digest,
+                "plan": plan,
+                "current_step": len(plan["steps"]) + 1,
+                "loop_count": 12,
+                "step_results": [
+                    {"step": i, "title": f"Step {i}", "result": "PASS", "summary": "ok", "files": [], "gates": [], "stats": {}}
+                    for i in range(1, len(plan["steps"]) + 1)
+                ],
+            })
+            checkpoint = ralph.create_recovery_checkpoint(state)
+            state["recovery_checkpoint"] = checkpoint["id"]
+            state["plan_changed_files"] = ["app.py"]
+            (repo.root / "app.py").write_text("value = 10\n", encoding="utf-8")
+            ralph.save_state(state)
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            args = type("Args", (), {
+                "max_loops": 10, "wait_for_limits": False, "usage_poll_seconds": 300,
+                "color": "never", "efficiency_mode": None,
+            })()
+            with (
+                mock.patch.object(ralph, "run_final_qualification", return_value=(True, ["unit-tests=PASS"], {}, "")) as final_qualification,
+                mock.patch.object(ralph, "plan_delta_fingerprint", return_value="bound-terminal-delta"),
+                mock.patch.object(ralph, "query_codex_rate_limits", return_value={}),
+                mock.patch.object(ralph, "run_codex") as run_codex,
+            ):
+                rc = ralph.cmd_run(args)
+
+            self.assertEqual(0, rc)
+            run_codex.assert_not_called()
+            final_qualification.assert_called_once()
+            finished = ralph.load_state()
+            self.assertEqual("READY_TO_COMMIT", finished["status"])
+            self.assertEqual(len(plan["steps"]) + 1, finished["current_step"])
+            self.assertEqual("PASS", finished["final_qualification"]["state"])
+            self.assertEqual("bound-terminal-delta", finished["final_qualification"]["delta_fingerprint"])
 
 
 class RetirePlanTests(unittest.TestCase):
@@ -693,7 +786,7 @@ class ReconciliationTests(unittest.TestCase):
             sha = repo.git("rev-parse", "HEAD").stdout.strip()
             state = self._ready_state(checkpoint, ["app.py"])
             ralph.save_state(state)
-            with self.assertRaisesRegex(RuntimeError, "unexpected paths"):
+            with self.assertRaisesRegex(RuntimeError, r"^manual commit contains unexpected paths outside plan/baseline: \['surprise.txt'\]$"):
                 ralph._verify_reconciled_commit(state, sha)
 
     def test_reconcile_push_requires_recorded_commit_on_upstream(self):

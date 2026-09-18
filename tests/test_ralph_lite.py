@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import tempfile
@@ -55,6 +56,86 @@ class PlanTests(unittest.TestCase):
         rendered = ralph.render_plan(plan)
         self.assertIn(digest, rendered)
         self.assertIn(f"approve {digest}", rendered)
+
+    def test_plan_delta_fingerprint_refuses_unqualified_reconciliation_residue(self):
+        state = {
+            "plan_hash": "plan-123", "recovery_checkpoint": "RP", "retirement_record_id": "RT-test",
+            "plan_changed_files": ["new.py"], "plan_carry_forward_files": [],
+            "carry_forward_candidates": [{"path": "residue.py", "disposition": "PENDING_RECONCILIATION"}],
+        }
+        with (
+            mock.patch.object(ralph, "load_recovery_checkpoint", return_value={"baseline_dirty_paths": [], "baseline_untracked_paths": []}),
+            mock.patch.object(ralph, "reconciliation_snapshot", return_value={"candidates": []}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PENDING_RECONCILIATION: residue.py"):
+                ralph.plan_delta_fingerprint(state)
+
+
+class CodexSelectionTests(unittest.TestCase):
+    def test_run_codex_applies_project_local_model_and_reasoning_effort(self):
+        captured = {}
+
+        def fake_stream(command):
+            captured["command"] = list(command)
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text('{"summary":"ok"}', encoding="utf-8")
+            return 0, "", {}
+
+        with (
+            mock.patch.object(ralph, "codex_command_prefix", return_value=["codex"]),
+            mock.patch.object(ralph, "selected_codex_model", return_value="gpt-5.6-terra"),
+            mock.patch.object(ralph, "selected_codex_effort", return_value="high"),
+            mock.patch.object(ralph, "stream_codex_process", side_effect=fake_stream),
+            mock.patch.object(ralph, "live_write"),
+        ):
+            result = ralph.run_codex("prompt", {"type": "object"}, "workspace-write")
+
+        command = captured["command"]
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-terra")
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertEqual(result["summary"], "ok")
+
+
+    def test_effort_policy_rejects_values_not_advertised_by_effective_model(self):
+        catalog = {
+            "models": [{"id": "gpt-test", "reasoning_efforts": ["medium", "high"]}],
+        }
+        with (
+            mock.patch.object(ralph, "query_codex_models", return_value=catalog),
+            mock.patch.object(ralph, "selected_codex_model", return_value="gpt-test"),
+            mock.patch.object(ralph.model_policy, "save_policy") as save,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not supported"):
+                ralph.cmd_model_policy(argparse.Namespace(model_action="set-effort", effort="ultra", json=False))
+        save.assert_not_called()
+
+    def test_effort_policy_fails_closed_when_catalog_advertises_no_efforts(self):
+        catalog = {"models": [{"id": "gpt-test", "reasoning_efforts": []}]}
+        with (
+            mock.patch.object(ralph, "query_codex_models", return_value=catalog),
+            mock.patch.object(ralph, "selected_codex_model", return_value="gpt-test"),
+            mock.patch.object(ralph.model_policy, "save_policy") as save,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no selectable reasoning efforts"):
+                ralph.cmd_model_policy(argparse.Namespace(model_action="set-effort", effort="high", json=False))
+        save.assert_not_called()
+
+    def test_model_change_clears_effort_override_when_new_model_does_not_advertise_it(self):
+        catalog = {"models": [{"id": "gpt-test", "reasoning_efforts": ["medium"]}]}
+        current = {"reasoning_effort": "high"}
+        saved = {"model": "gpt-test", "reasoning_effort": None, "revision": 3}
+        with (
+            mock.patch.object(ralph, "query_codex_models", return_value=catalog),
+            mock.patch.object(ralph.model_policy, "load_policy", return_value=current),
+            mock.patch.object(ralph.model_policy, "save_policy", return_value=saved) as save,
+            mock.patch.object(ralph, "configured_codex_model", return_value=None),
+            mock.patch.object(ralph, "configured_codex_effort", return_value=None),
+            mock.patch.object(ralph, "live_write"),
+        ):
+            rc = ralph.cmd_model_policy(argparse.Namespace(model_action="set", model="gpt-test", json=False))
+        self.assertEqual(0, rc)
+        save.assert_called_once_with(ralph.ROOT, "gpt-test", reasoning_effort=None)
 
 
 class PolicyTests(unittest.TestCase):

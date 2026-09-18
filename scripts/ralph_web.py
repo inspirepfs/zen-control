@@ -276,6 +276,57 @@ def _test_reconciliation_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     return {"eligible": True, **candidate}
 
 
+def _carry_forward_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    """Expose only the controller's current reconciliation diagnosis.
+
+    A malformed, stale, or otherwise refused state is useful operator feedback,
+    but is never converted into a client-selectable reconciliation target.
+    """
+    if not str(state.get("retirement_record_id") or "").strip():
+        return {"replacement": False}
+    try:
+        value = ralph.reconciliation_snapshot(state)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        return {"replacement": True, "controller_refusal": str(exc), "candidates": []}
+    if not isinstance(value, dict):
+        return {"replacement": True, "controller_refusal": "controller returned an invalid reconciliation snapshot", "candidates": []}
+    return value
+
+
+def _latest_retirement(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the most recent controller-retired record without accepting an ID from the client."""
+    records = state.get("retired_plans")
+    if not isinstance(records, list) or not records or not isinstance(records[-1], dict):
+        return None
+    record = records[-1]
+    record_id = str(record.get("record_id") or "").strip()
+    if not record_id:
+        return None
+    return {
+        "record_id": record_id,
+        "disposition": str(record.get("disposition") or ""),
+        "manifest_sha256": str(record.get("manifest_sha256") or ""),
+        "retired_at": str(record.get("retired_at") or ""),
+    }
+
+
+def _pending_carry_forward_candidate(state: dict[str, Any], requested_path: object) -> dict[str, Any]:
+    """Require an exact current controller candidate; do not normalize client paths."""
+    path = str(requested_path or "").strip()
+    snapshot = _carry_forward_snapshot(state)
+    if snapshot.get("controller_refusal"):
+        raise WebConsoleError(f"controller refused reconciliation state: {snapshot['controller_refusal']}")
+    for candidate in snapshot.get("candidates") or []:
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("path") == path
+            and candidate.get("eligible") is True
+            and candidate.get("disposition") == "PENDING_RECONCILIATION"
+        ):
+            return candidate
+    raise WebConsoleError("selected path is not an exact pending controller reconciliation candidate")
+
+
 def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
     state = _read_json(STATE, {})
     if not isinstance(state, dict):
@@ -328,6 +379,8 @@ def snapshot(usage_report: dict[str, Any] | None = None) -> dict[str, Any]:
         "model_policy": model_selection,
         "gate": _gate_snapshot(state),
         "test_reconciliation": _test_reconciliation_snapshot(state),
+        "reconciliation": _carry_forward_snapshot(state),
+        "latest_retirement": _latest_retirement(state),
         "usage": {
             "model": usage.get("model"),
             "plan_type": usage.get("plan_type"),
@@ -643,7 +696,7 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
         if str(payload.get("confirm") or "") != "RESET":
             raise WebConsoleError("token-stat reset requires confirm=RESET")
         return CommandRequest(["usage-reset-stats", "--confirm", "RESET", "--json"], activity="USAGE_STATS_RESET", allow_while_active=True, track_job=False)
-    if not plan_hash:
+    if not plan_hash and action != "propose_replacement":
         raise WebConsoleError("active plan hash is required")
     if action == "approve":
         return CommandRequest(["approve", plan_hash], activity="APPROVING")
@@ -712,9 +765,61 @@ def command_for_action(payload: dict[str, Any], state: dict[str, Any]) -> Comman
         argv += ["--reason", reason()]
         return CommandRequest(argv, activity="AUTHORIZING")
     if action == "retire":
-        if str(payload.get("confirm") or "") != "RETIRE":
-            raise WebConsoleError("retire requires confirm=RETIRE")
-        return CommandRequest(["retire-plan", plan_hash, "--reason", reason()], confirm="RETIRE", activity="RETIRING")
+        mode = str(payload.get("mode") or "").strip()
+        if mode not in {"rollback-preview", "rollback", "carry-forward"}:
+            raise WebConsoleError("retire mode must be rollback or carry-forward")
+        if mode == "rollback-preview":
+            return CommandRequest(
+                ["retire-plan", plan_hash, "--reason", reason(), "--rollback"],
+                activity="INSPECTING_RECONCILIATION",
+            )
+        expected_confirm = "ROLLBACK" if mode == "rollback" else "CARRY_FORWARD"
+        if str(payload.get("confirm") or "") != expected_confirm:
+            raise WebConsoleError(f"retire {mode} requires confirm={expected_confirm}")
+        argv = ["retire-plan", plan_hash, "--reason", reason(), f"--{mode}"]
+        if mode == "rollback":
+            argv += ["--confirm", "ROLLBACK"]
+        return CommandRequest(argv, confirm=expected_confirm, activity="RETIRING")
+    if action == "propose_replacement":
+        if status != "IDLE":
+            raise WebConsoleError("replacement proposal requires IDLE")
+        retirement = _latest_retirement(state)
+        requested_id = str(payload.get("retirement_record_id") or "").strip()
+        if retirement is None or requested_id != retirement["record_id"]:
+            raise WebConsoleError("retirement record must exactly match the latest controller retirement")
+        if retirement["disposition"] != "RETIRED_WITH_CARRY_FORWARD":
+            raise WebConsoleError("latest controller retirement is not eligible for a carry-forward replacement")
+        return CommandRequest(["propose", "--from-retirement", retirement["record_id"]], background=True, activity="PLANNING")
+    if action == "inspect_carry_forward":
+        if status != "APPROVED":
+            raise WebConsoleError("inspect-carry-forward requires APPROVED")
+        snapshot = _carry_forward_snapshot(state)
+        if snapshot.get("controller_refusal"):
+            raise WebConsoleError(f"controller refused reconciliation state: {snapshot['controller_refusal']}")
+        if snapshot.get("replacement") is not True:
+            raise WebConsoleError("no controller replacement reconciliation is active")
+        return CommandRequest(["inspect-carry-forward", plan_hash], activity="INSPECTING_RECONCILIATION")
+    if action in {"adopt_carry_forward", "leave_carry_forward_outside", "reject_carry_forward"}:
+        if status != "APPROVED":
+            raise WebConsoleError(f"{action} requires APPROVED")
+        candidate = _pending_carry_forward_candidate(state, payload.get("path"))
+        try:
+            step = int(payload.get("step"))
+        except (TypeError, ValueError):
+            raise WebConsoleError("controller claiming step is required") from None
+        if action == "adopt_carry_forward":
+            if str(payload.get("confirm") or "") != "ADOPT":
+                raise WebConsoleError("adopt-carry-forward requires confirm=ADOPT")
+            return CommandRequest(
+                ["adopt-carry-forward", plan_hash, "--path", candidate["path"], "--step", str(step),
+                 "--ownership-basis", "retired-unchanged-content", "--confirm", "ADOPT"],
+                confirm="ADOPT", activity="RECONCILING",
+            )
+        command = "leave-carry-forward-outside" if action == "leave_carry_forward_outside" else "reject-carry-forward"
+        return CommandRequest(
+            [command, plan_hash, "--path", candidate["path"], "--step", str(step), "--reason", reason()],
+            activity="RECONCILING",
+        )
     if action == "report":
         return CommandRequest(["report", plan_hash], activity="REPORTING")
     if action == "requalify":
@@ -837,7 +942,7 @@ PAGE = r'''<!doctype html>
 <section class="card span3"><h2>Git</h2><div id="branch" class="metric">-</div><div id="git" class="kv"></div></section>
 <section class="card span12"><div class="section-title-row"><h2>Usage / Token Economy</h2><div id="usageToolbar" class="compact-actions"></div></div><div id="usageSummary" class="usage-grid"></div><div id="usageWindows" class="usage-windows"></div><h3>Consumption by plan</h3><div id="planUsage" class="plan-usage"></div></section>
 <section class="card span12"><div class="eff-section-head"><h2>Efficiency / Resource Controls</h2><div id="effHeaderControls" class="eff-header-controls"></div><span id="effPolicyState" class="badge">live</span></div><div id="efficiencyControls" class="efficiency-controls"></div></section>
-<section class="card span12"><h2>Human Control</h2><div id="gate"></div><div id="controls"></div><div id="actionResult" class="action-result"></div></section>
+<section class="card span12"><h2>Human Control</h2><div id="gate"></div><div id="retirementReconciliation"></div><div id="controls"></div><div id="actionResult" class="action-result"></div></section>
 <section class="card span12"><h2>Plan Progress</h2><div id="goal" class="notice"></div><div id="steps" class="steps"></div></section>
 <section class="card span9"><h2>Live Activity</h2><div id="events" class="events"></div></section>
 <section class="card span3"><h2>Plan Files</h2><div id="files"></div></section>
@@ -868,7 +973,7 @@ function markdownInline(text){let value=esc(text);value=value.replace(/`([^`]+)`
 function renderMarkdown(text){const lines=String(text??'').replace(/\r\n?/g,'\n').split('\n');let out=[],code=false,list='';const closeList=()=>{if(list){out.push(`</${list}>`);list='';}};for(const raw of lines){if(/^\s*```/.test(raw)){closeList();if(code){out.push('</code></pre>');code=false;}else{out.push('<pre class="md-code"><code>');code=true;}continue;}if(code){out.push(esc(raw)+'\n');continue;}const line=raw.trimEnd();if(!line.trim()){closeList();continue;}let m=line.match(/^(#{1,6})\s+(.+)$/);if(m){closeList();const level=m[1].length;out.push(`<h${level}>${markdownInline(m[2])}</h${level}>`);continue;}if(/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)){closeList();out.push('<hr>');continue;}m=line.match(/^\s*[-*+]\s+(.+)$/);if(m){if(list!=='ul'){closeList();out.push('<ul>');list='ul';}out.push(`<li>${markdownInline(m[1])}</li>`);continue;}m=line.match(/^\s*\d+[.)]\s+(.+)$/);if(m){if(list!=='ol'){closeList();out.push('<ol>');list='ol';}out.push(`<li>${markdownInline(m[1])}</li>`);continue;}m=line.match(/^\s*>\s?(.*)$/);if(m){closeList();out.push(`<blockquote>${markdownInline(m[1])}</blockquote>`);continue;}closeList();out.push(`<p>${markdownInline(line.trim())}</p>`);}closeList();if(code)out.push('</code></pre>');return out.join('')||'<div class="small">No completion report yet.</div>';}
 function setReportMode(mode){reportMode=mode==='markdown'?'markdown':'rendered';const rendered=document.getElementById('reportRendered'),raw=document.getElementById('reportMarkdown'),renderedButton=document.getElementById('reportRenderedButton'),rawButton=document.getElementById('reportMarkdownButton');if(rendered)rendered.hidden=reportMode!=='rendered';if(raw)raw.hidden=reportMode!=='markdown';if(renderedButton)renderedButton.classList.toggle('active',reportMode==='rendered');if(rawButton)rawButton.classList.toggle('active',reportMode==='markdown');}
 function renderReport(report){const text=report?.preview||'No completion report yet.';renderHTML('reportRendered',renderMarkdown(text));renderText('reportMarkdown',text);renderText('reportPath',report?.path?`Source: ${report.path}`:'');setReportMode(reportMode);}
-function actionLabel(action){return ({approve:'Plan approved',reject:'Plan rejected',resume:'Plan resumed',resolve_gate:'Human gate resolved',steer:'Direction submitted',requalify:'Qualified delta revalidated',reconcile_ready_test:'Late test delta adopted for requalification',finalize_review:'Finalization review',finalize_commit:'Qualified delta committed',finalize_push:'Commit pushed',retire:'Plan retired',authorize_self_hosting:'Self-hosting authority granted',efficiency_update:'Efficiency policy updated',efficiency_reset_all:'Efficiency policy reset'})[action]||'Operator action complete';}
+function actionLabel(action){return ({approve:'Plan approved',reject:'Plan rejected',resume:'Plan resumed',resolve_gate:'Human gate resolved',steer:'Direction submitted',requalify:'Qualified delta revalidated',reconcile_ready_test:'Late test delta adopted for requalification',finalize_review:'Finalization review',finalize_commit:'Qualified delta committed',finalize_push:'Commit pushed',retire:'Plan retirement request',propose_replacement:'Replacement plan requested',inspect_carry_forward:'Reconciliation inspected',adopt_carry_forward:'Carry-forward candidate adopted',leave_carry_forward_outside:'Candidate left outside boundary',reject_carry_forward:'Candidate marked externally required',authorize_self_hosting:'Self-hosting authority granted',efficiency_update:'Efficiency policy updated',efficiency_reset_all:'Efficiency policy reset'})[action]||'Operator action complete';}
 function renderActionFeedback(){if(!actionFeedback)return;const feedback=actionFeedback;const heading=feedback.error?`${actionLabel(feedback.action)} failed`:actionLabel(feedback.action);const output=[prettyOutput(feedback.stdout),prettyOutput(feedback.stderr)].filter(Boolean).join('');const granted=feedback.grantedPaths?.length?`<pre class="action-detail">${esc(`Granted authority over named RALPH tooling paths:\n${feedback.grantedPaths.join('\n')}`)}</pre>`:'';const detail=feedback.error?`<pre class="action-detail">${esc(feedback.error)}</pre>`:(output||'<div class="small">Controller accepted the action. Current state is shown above.</div>');renderHTML('actionResult',`<div class="action-title ${feedback.error?'bad':''}">${esc(heading)}</div>${granted}${detail}`);}
 function renderActionResult(action,j,grantedPaths=[]){actionFeedback={action,stdout:j.stdout,stderr:j.stderr,grantedPaths};renderActionFeedback();}
 function renderActionFailure(action,message){actionFeedback={action,error:message||'action failed'};renderActionFeedback();}
@@ -877,7 +982,10 @@ async function post(payload){const r=await fetch('/api/action',{method:'POST',he
 function controlButton(label,action,extra={},cls=''){return `<button class="${cls}" onclick='act(${JSON.stringify(action)},${JSON.stringify(extra)})'>${esc(label)}</button>`;}
 function actionState(action){return ({propose:'PLANNING',approve:'APPROVING',reject:'REJECTING',run:'RUNNING',steer:'STEERING',resume:'RESUMING',resolve_gate:'RESOLVING',retire:'RETIRING',authorize_self_hosting:'AUTHORIZING',requalify:'QUALIFYING',reconcile_ready_test:'RECONCILING',finalize_review:'REVIEWING',finalize_commit:'COMMITTING',finalize_push:'PUSHING'})[action]||'WORKING';}
 function showActionState(action){localActionState=actionState(action);renderText('status',localActionState);renderClass('job','badge info');renderText('job',localActionState.toLowerCase());}
-async function act(action,extra={}){try{let p={action,...extra};if(['reject','resume','resolve_gate','retire'].includes(action)){const reason=prompt('Reason / evidence:');if(!reason)return;p.reason=reason;}if(action==='retire'){if(prompt('Type RETIRE to confirm')!=='RETIRE')return;p.confirm='RETIRE';}if(action==='finalize_commit'){if(prompt('Type COMMIT to confirm')!=='COMMIT')return;p.confirm='COMMIT';}if(action==='finalize_push'){if(prompt('Type PUSH to confirm')!=='PUSH')return;p.confirm='PUSH';}showActionState(action);const j=await post(p);renderActionResult(action,j);await refresh();}catch(e){renderActionFailure(action,e.message);}finally{localActionState=null;}}
+async function act(action,extra={}){try{let p={action,...extra};if(['reject','resume','resolve_gate'].includes(action)){const reason=prompt('Reason / evidence:');if(!reason)return;p.reason=reason;}if(action==='finalize_commit'){if(prompt('Type COMMIT to confirm')!=='COMMIT')return;p.confirm='COMMIT';}if(action==='finalize_push'){if(prompt('Type PUSH to confirm')!=='PUSH')return;p.confirm='PUSH';}showActionState(action);const j=await post(p);renderActionResult(action,j);await refresh();}catch(e){renderActionFailure(action,e.message);}finally{localActionState=null;}}
+async function submitRetirement(mode){const reason=document.getElementById('retirementReason')?.value.trim()||'';if(!reason){renderActionFailure('retire','Operator reason is required.');return;}if(mode==='rollback-preview'){try{showActionState('retire');const j=await post({action:'retire',mode,reason});renderActionResult('retire',j);await refresh();}catch(e){renderActionFailure('retire',e.message);}finally{localActionState=null;}return;}const confirmToken=mode==='rollback'?'ROLLBACK':'CARRY_FORWARD';if(prompt(`Type ${confirmToken} to confirm the controller-selected retirement disposition`)!==confirmToken)return;try{showActionState('retire');const j=await post({action:'retire',mode,confirm:confirmToken,reason});renderActionResult('retire',j);await refresh();}catch(e){renderActionFailure('retire',e.message);}finally{localActionState=null;}}
+async function submitReplacement(recordId){if(String(latestSnapshot?.latest_retirement?.record_id||'')!==String(recordId||'')){renderActionFailure('propose_replacement','The current controller retirement record is no longer available.');return;}try{showActionState('propose_replacement');const j=await post({action:'propose_replacement',retirement_record_id:recordId});renderActionResult('propose_replacement',j);await refresh();}catch(e){renderActionFailure('propose_replacement',e.message);}finally{localActionState=null;}}
+async function submitCarryForward(action,path){const reconciliation=latestSnapshot?.reconciliation;const candidate=(reconciliation?.candidates||[]).find(x=>String(x?.path||'')===String(path||'')&&x?.eligible===true&&x?.disposition==='PENDING_RECONCILIATION');if(!candidate){renderActionFailure(action,'The exact controller reconciliation candidate is no longer pending.');return;}const step=prompt('Controller claiming step number:');if(!step)return;const reason=action==='adopt_carry_forward'?'':prompt('Operator reason / evidence:');if(action==='adopt_carry_forward'&&prompt('Type ADOPT to confirm this exact controller candidate')!=='ADOPT')return;if(action!=='adopt_carry_forward'&&!reason)return;try{showActionState(action);const payload={action,path:String(candidate.path),step:Number(step)};if(action==='adopt_carry_forward')payload.confirm='ADOPT';else payload.reason=reason;const j=await post(payload);renderActionResult(action,j,[String(candidate.path)]);await refresh();}catch(e){renderActionFailure(action,e.message);}finally{localActionState=null;}}
 async function submitGoal(){const goal=document.getElementById('goalInput').value.trim();if(!goal)return;try{showActionState('propose');await post({action:'propose',goal});await refresh();}catch(e){renderActionFailure('propose',e.message);}finally{localActionState=null;}}
 async function submitRun(){try{showActionState('run');const j=await post({action:'run',max_loops:40});renderActionResult('run',j);await refresh();}catch(e){renderActionFailure('run',e.message);}finally{localActionState=null;}}
 async function submitSteer(){const direction=document.getElementById('steerInput').value.trim();const gate=document.getElementById('gateId').textContent.trim();if(!direction)return;try{await post({action:'steer',gate,direction});await refresh();}catch(e){showError(e.message);}}
@@ -886,7 +994,9 @@ async function submitReadyTestReconciliation(){const candidate=latestSnapshot?.t
 async function logout(){try{await fetch('/api/logout',{method:'POST',headers:{'X-RALPH-CSRF':CSRF}});}finally{location.reload();}}
 function showError(msg){renderHTML('error',`<div class="notice errorbox">${esc(msg)}</div>`);}
 function renderReadyTestReconciliation(s){const reconciliation=s.test_reconciliation;const candidate=s.controller.status==='READY_TO_COMMIT'&&reconciliation?.eligible&&String(reconciliation.path||'')?{path:String(reconciliation.path),delta_kind:String(reconciliation.delta_kind||'')}:null;const identity=JSON.stringify(candidate);const target=document.getElementById('readyTestReconciliation');if(!target||identity===renderedReadyTestReconciliationIdentity)return;renderedReadyTestReconciliationIdentity=identity;const out=candidate?`<div class="form"><div class="small">Controller-authorized late test candidate (exact path):</div><textarea id="testReconciliationPath" readonly aria-label="Controller-authorized late test candidate">${esc(candidate.path)}</textarea><textarea id="testReconciliationReason" placeholder="Operator reason for adopting this exact candidate..."></textarea><button id="testReconciliationButton" class="good" onclick="submitReadyTestReconciliation()">Adopt exact candidate (ADOPT)</button></div>`:'';renderedValues.delete(target);renderHTML('readyTestReconciliation',out);}
-function renderControls(s){const c=s.controller,g=s.gate;let out='';const st=c.status;const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);renderReadyTestReconciliation(s);if(identity===renderedControlsIdentity)return;renderedControlsIdentity=identity;if(['PLANNING','APPROVING','REJECTING','STEERING','RESUMING','RESOLVING','RETIRING','AUTHORIZING','QUALIFYING','REVIEWING','COMMITTING','PUSHING','RECONCILING','REPORTING','WORKING'].includes(st)){out=`<div class="notice"><b>${esc(st)}</b><br><span class="small">Controller action in progress. Controls will return when the authoritative operation completes.</span></div>`;}else if(['IDLE','PLAN_COMPLETE','PUSHED'].includes(st)){out=`<div class="form"><textarea id="goalInput" placeholder="Describe the bounded engineering goal..."></textarea><button class="good" onclick="submitGoal()">Propose plan</button></div>`;}else if(st==='AWAITING_APPROVAL'){out=`<div class="notice"><b>Approval review</b><br><span class="small">Read every proposed step, objective, acceptance criterion and test-change policy before granting execution authority.</span></div><div class="actions">${controlButton('Approve plan','approve',{},'good')}${controlButton('Reject','reject',{},'danger')}</div>`;}else if(['APPROVED','RUNNING','PAUSED_USAGE_LIMIT'].includes(st)){out=`<div class="form"><div class="small">Live efficiency/resource policy is controlled in the panel above. Current mode: <b>${esc(c.efficiency_mode||'NORMAL')}</b>.</div><button class="good" onclick="submitRun()">Run approved plan</button></div>`;}else if(st==='BLOCKED_HUMAN'){const authority=g?.authority_block;if(authority){const pathRows=(authority.paths||[]).map(path=>`<label><input type="checkbox" data-self-host-path value="${esc(path)}" checked> <span class="file">${esc(path)}</span></label>`).join('');const reviewText=`Controller self-hosting authority block\nPlan hash: ${authority.plan_hash}\nStep: ${authority.step}\nGate: ${authority.gate_id}\nCandidate paths:\n${(authority.paths||[]).join('\n')}`;out=`<div class="notice gate"><b>Supervised self-hosting authority</b><br><span class="small">Controller-reported context only; the controller decides eligibility and grant validity.</span></div><div class="form"><textarea id="selfHostingContext" readonly aria-label="Controller self-hosting authority block">${esc(reviewText)}</textarea>${pathRows}<textarea id="selfHostingReason" placeholder="Operator reason for this exact self-hosting grant..."></textarea><button id="selfHostingButton" class="good" onclick="submitSelfHosting()">Authorize Self-Hosting</button><div class="actions">${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}else{out=`<div class="form"><textarea id="steerInput" placeholder="Bounded human direction for this exact gate..."></textarea><button onclick="submitSteer()">Steer & retry</button><div class="actions">${controlButton('Resume retry','resume')}${controlButton('Resolve delegated gate','resolve_gate',{gate:g?.id||''},'good')}${controlButton('Retire plan','retire',{},'danger')}</div></div>`;}}else if(st==='READY_TO_COMMIT'){out=`<div class="actions">${controlButton('Requalify delta','requalify')}${controlButton('Finalization review','finalize_review')}${controlButton('Commit qualified delta','finalize_commit',{},'good')}</div><div id="readyTestReconciliation"></div>`;}else if(st==='COMMITTED'){out=`<div class="actions">${controlButton('Push to configured upstream','finalize_push',{},'good')}</div>`;}else{out=`<div class="small">No web action for state ${esc(st)}. Use the CLI for exceptional recovery.</div>`;}const controls=document.getElementById('controls');renderedValues.delete(controls);renderHTML('controls',out);renderedReadyTestReconciliationIdentity=null;renderReadyTestReconciliation(s);}
+function renderRetirementAndReconciliation(s){const retirement=s.latest_retirement||null,reconciliation=s.reconciliation||{},refusal=String(reconciliation.controller_refusal||''),candidates=Array.isArray(reconciliation.candidates)?reconciliation.candidates:[],pending=candidates.filter(x=>x?.eligible===true&&x?.disposition==='PENDING_RECONCILIATION'),target=document.getElementById('retirementReconciliation');if(!target)return;const record=retirement?`<div class="notice"><b>Retirement provenance · ${esc(retirement.record_id)}</b><br><span class="small">Disposition: ${esc(retirement.disposition)} · manifest SHA-256: ${esc(retirement.manifest_sha256||'controller did not provide a digest')} · retired: ${esc(retirement.retired_at||'controller did not provide a timestamp')}</span>${retirement.disposition==='RETIRED_WITH_CARRY_FORWARD'?`<div class="actions"><button class="good" onclick='submitReplacement(${JSON.stringify(retirement.record_id)})'>Start replacement plan from ${esc(retirement.record_id)}</button></div>`:`<div class="small">No replacement plan is available for this controller disposition.</div>`}</div>`:'';const rows=candidates.map(x=>{const path=String(x?.path||''),enabled=x?.eligible===true&&x?.disposition==='PENDING_RECONCILIATION';const actions=enabled?`<div class="actions"><button class="good" onclick='submitCarryForward("adopt_carry_forward",${JSON.stringify(path)})'>Adopt exact candidate (ADOPT)</button><button onclick='submitCarryForward("leave_carry_forward_outside",${JSON.stringify(path)})'>Leave outside boundary</button><button class="danger" onclick='submitCarryForward("reject_carry_forward",${JSON.stringify(path)})'>Mark externally required</button></div>`:`<div class="small">Controller classification is display-only; no action is available.</div>`;return `<div class="notice"><b>${esc(path||'invalid controller path')}</b><br><span class="small">Classification: ${esc(x?.classification||'controller did not provide classification')} · disposition: ${esc(x?.disposition||'controller did not provide disposition')} · evidence: ${esc(x?.evidence_status||x?.evidence_error||'controller-provided')} · claiming step: ${esc(x?.claiming_step??'not claimed')} · qualification: ${esc(x?.qualification_impact||'controller-provided')}</span>${actions}</div>`;}).join('');const reconcile=reconciliation.replacement?`<h3>Per-path reconciliation</h3>${refusal?`<div class="notice errorbox"><b>Controller refused reconciliation state</b><br>${esc(refusal)}<br><span class="small">All reconciliation actions are disabled until the controller provides a current state.</span></div>`:''}${rows||'<div class="small">Controller reports no reconciliation paths.</div>'}`:'';const ready=s.controller.status==='READY_TO_COMMIT'?`<div class="notice ${refusal||pending.length?'errorbox':''}"><b>READY_TO_COMMIT provenance blockers</b><br><span class="small">${refusal?`Blocking controller refusal: ${esc(refusal)}`:pending.length?`Blocking unresolved controller reconciliation paths: ${esc(pending.map(x=>x.path).join(', '))}`:s.controller.block_reason?`Blocking controller provenance message: ${esc(s.controller.block_reason)}`:'No unresolved provenance blocker was supplied by the controller.'}</span></div>`:'';renderedValues.delete(target);renderHTML('retirementReconciliation',record+reconcile+ready);}
+function retirementForm(){return `<div class="form"><div class="small">Retirement disposition is an explicit operator choice. The controller previews and validates exact paths; this page never derives them.</div><textarea id="retirementReason" placeholder="Reason / evidence for retirement..."></textarea><div class="actions"><button onclick="submitRetirement('rollback-preview')">Preview exact rollback paths</button><button class="danger" onclick="submitRetirement('rollback')">Confirm rollback (ROLLBACK)</button><button onclick="submitRetirement('carry-forward')">Confirm carry-forward (CARRY_FORWARD)</button></div></div>`;}
+function renderControls(s){const c=s.controller,g=s.gate;let out='';const st=c.status;const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);renderRetirementAndReconciliation(s);renderReadyTestReconciliation(s);if(identity===renderedControlsIdentity)return;renderedControlsIdentity=identity;if(['PLANNING','APPROVING','REJECTING','STEERING','RESUMING','RESOLVING','RETIRING','AUTHORIZING','QUALIFYING','REVIEWING','COMMITTING','PUSHING','RECONCILING','REPORTING','WORKING'].includes(st)){out=`<div class="notice"><b>${esc(st)}</b><br><span class="small">Controller action in progress. Controls will return when the authoritative operation completes.</span></div>`;}else if(['IDLE','PLAN_COMPLETE','PUSHED'].includes(st)){out=`<div class="form"><textarea id="goalInput" placeholder="Describe the bounded engineering goal..."></textarea><button class="good" onclick="submitGoal()">Propose plan</button></div>`;}else if(st==='AWAITING_APPROVAL'){out=`<div class="notice"><b>Approval review</b><br><span class="small">Read every proposed step, objective, acceptance criterion and test-change policy before granting execution authority.</span></div><div class="actions">${controlButton('Approve plan','approve',{},'good')}${controlButton('Reject','reject',{},'danger')}</div>`;}else if(['APPROVED','RUNNING','PAUSED_USAGE_LIMIT'].includes(st)){out=`<div class="form"><div class="small">Live efficiency/resource policy is controlled in the panel above. Current mode: <b>${esc(c.efficiency_mode||'NORMAL')}</b>.</div><button class="good" onclick="submitRun()">Run approved plan</button></div>`;}else if(st==='BLOCKED_HUMAN'){const authority=g?.authority_block;if(authority){const pathRows=(authority.paths||[]).map(path=>`<label><input type="checkbox" data-self-host-path value="${esc(path)}" checked> <span class="file">${esc(path)}</span></label>`).join('');const reviewText=`Controller self-hosting authority block\nPlan hash: ${authority.plan_hash}\nStep: ${authority.step}\nGate: ${authority.gate_id}\nCandidate paths:\n${(authority.paths||[]).join('\n')}`;out=`<div class="notice gate"><b>Supervised self-hosting authority</b><br><span class="small">Controller-reported context only; the controller decides eligibility and grant validity.</span></div><div class="form"><textarea id="selfHostingContext" readonly aria-label="Controller self-hosting authority block">${esc(reviewText)}</textarea>${pathRows}<textarea id="selfHostingReason" placeholder="Operator reason for this exact self-hosting grant..."></textarea><button id="selfHostingButton" class="good" onclick="submitSelfHosting()">Authorize Self-Hosting</button>${retirementForm()}</div>`;}else{out=`<div class="form"><textarea id="steerInput" placeholder="Bounded human direction for this exact gate..."></textarea><button onclick="submitSteer()">Steer & retry</button><div class="actions">${controlButton('Resume retry','resume')}${controlButton('Resolve delegated gate','resolve_gate',{gate:g?.id||''},'good')}</div>${retirementForm()}</div>`;}}else if(st==='READY_TO_COMMIT'){out=`<div class="actions">${controlButton('Requalify delta','requalify')}${controlButton('Finalization review','finalize_review')}${controlButton('Commit qualified delta','finalize_commit',{},'good')}</div><div id="readyTestReconciliation"></div>${retirementForm()}`;}else if(st==='COMMITTED'){out=`<div class="actions">${controlButton('Push to configured upstream','finalize_push',{},'good')}</div>`;}else{out=`<div class="small">No web action for state ${esc(st)}. Use the CLI for exceptional recovery.</div>`;}const controls=document.getElementById('controls');renderedValues.delete(controls);renderHTML('controls',out);renderedReadyTestReconciliationIdentity=null;renderReadyTestReconciliation(s);}
 function efficiencyElement(key){return document.querySelector(`[data-eff-key="${key}"]`);}
 function markEfficiencyDirty(){efficiencyDirty=true;renderText('effPolicyState','changes pending');renderClass('effPolicyState','badge warn');syncEfficiencyResetIcons();syncEfficiencyModePanels();}
 function syncEfficiencyResetIcons(){const defs=latestSnapshot?.efficiency_defaults||{};document.querySelectorAll('[data-eff-key]').forEach(el=>{const key=el.dataset.effKey;const button=document.querySelector(`[data-eff-reset="${key}"]`);if(!button)return;let changed;if(key==='mode')changed=String(el.value).toUpperCase()!==String(defs[key]||'NORMAL').toUpperCase();else changed=Number(el.value)!==Number(defs[key]);button.style.visibility=changed?'visible':'hidden';});}

@@ -254,6 +254,13 @@ class FinalizationSelfHostingTests(unittest.TestCase):
         with mock.patch.object(ralph, "plan_delta_fingerprint", return_value="changed"):
             self.assertIn("changed after final qualification", ralph.qualified_delta_matches(state)[1])
 
+    def test_qualified_delta_refuses_stale_reconciled_provenance(self):
+        state = self.state()
+        with mock.patch.object(ralph, "plan_delta_fingerprint", side_effect=RuntimeError("ALTERED_ADOPTED_CARRY_FORWARD: kept.py")):
+            ok, reason = ralph.qualified_delta_matches(state)
+        self.assertFalse(ok)
+        self.assertIn("ALTERED_ADOPTED_CARRY_FORWARD: kept.py", reason)
+
     def test_finalization_guard_allows_authorized_tooling_and_rejects_ungranted_tooling(self):
         state = self.state()
         checkpoint = {"baseline_dirty_paths": [], "baseline_staged_paths": []}
@@ -262,14 +269,14 @@ class FinalizationSelfHostingTests(unittest.TestCase):
         with (
             mock.patch.object(ralph, "qualified_delta_matches", return_value=(True, "ok")),
             mock.patch.object(ralph, "load_recovery_checkpoint", return_value=checkpoint),
-            mock.patch.object(ralph, "git_changed_paths", return_value=sorted(current)),
+            mock.patch.object(ralph, "git_changed_paths", side_effect=lambda: sorted(state["plan_changed_files"])),
             mock.patch.object(ralph, "_git", return_value=ok),
             mock.patch.object(ralph, "run_process", return_value=ok),
         ):
             planned, _ = ralph._finalization_guard(state)
             self.assertEqual(set(planned), current)
             state["plan_changed_files"].append("scripts/ralph_web.py")
-            with self.assertRaisesRegex(RuntimeError, "without same-plan self-hosting authority"):
+            with self.assertRaisesRegex(RuntimeError, r"^UNAUTHORIZED_TOOLING_NEW_PLAN_PATH: \['scripts/ralph_web.py'\]$"):
                 ralph._finalization_guard(state)
 
     def test_requalify_records_delta_binding_and_keeps_ready_state(self):

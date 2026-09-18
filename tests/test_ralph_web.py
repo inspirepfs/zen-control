@@ -212,6 +212,28 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(snap["controller"]["durable_status"], "READY_TO_COMMIT")
             self.assertEqual(snap["job"]["activity"], "COMMITTING")
 
+    def test_snapshot_exposes_controller_reconciliation_without_web_reclassification(self):
+        with WebHarness() as h:
+            h.state(retirement_record_id="RT-1", carry_forward_candidates=[])
+            controller_snapshot = {
+                "replacement": True, "retirement_record_id": "RT-1", "retirement_manifest_sha256": "f" * 64,
+                "candidates": [{"path": "kept.py", "classification": "MANIFEST_BOUND_UNCHANGED",
+                                "eligible": True, "disposition": "PENDING_RECONCILIATION",
+                                "evidence_status": "pending", "claiming_step": None,
+                                "qualification_impact": "BLOCKS_EXECUTION"}],
+            }
+            with mock.patch.object(web.ralph, "reconciliation_snapshot", return_value=controller_snapshot):
+                snap = web.snapshot()
+            self.assertEqual(snap["reconciliation"], controller_snapshot)
+
+    def test_snapshot_surfaces_controller_reconciliation_refusal(self):
+        with WebHarness() as h:
+            h.state(retirement_record_id="RT-1", carry_forward_candidates=[])
+            with mock.patch.object(web.ralph, "reconciliation_snapshot", side_effect=RuntimeError("action hash is malformed or stale")):
+                snap = web.snapshot()
+            self.assertEqual(snap["reconciliation"]["controller_refusal"], "action hash is malformed or stale")
+            self.assertEqual(snap["reconciliation"]["candidates"], [])
+
     def test_event_tail_is_bounded(self):
         with WebHarness() as h:
             h.state()
@@ -345,8 +367,55 @@ class ActionAuthorityTests(unittest.TestCase):
         self.assertIn("--commit", req.argv)
         with self.assertRaisesRegex(web.WebConsoleError, "confirm=PUSH"):
             web.command_for_action({"action": "finalize_push"}, self.base_state("COMMITTED"))
-        with self.assertRaisesRegex(web.WebConsoleError, "confirm=RETIRE"):
+        with self.assertRaisesRegex(web.WebConsoleError, "retire mode"):
             web.command_for_action({"action": "retire", "reason": "obsolete"}, self.base_state("BLOCKED_HUMAN"))
+
+    def reconciliation_state(self):
+        return {
+            "status": "APPROVED", "plan_hash": "b" * 64, "retirement_record_id": "RT-1",
+            "carry_forward_candidates": [],
+        }
+
+    def test_retirement_modes_are_exactly_confirmed_and_forwarded(self):
+        state = self.base_state("BLOCKED_HUMAN")
+        with self.assertRaisesRegex(web.WebConsoleError, "confirm=ROLLBACK"):
+            web.command_for_action({"action": "retire", "mode": "rollback", "confirm": "RETIRE", "reason": "obsolete"}, state)
+        rollback = web.command_for_action({"action": "retire", "mode": "rollback", "confirm": "ROLLBACK", "reason": "obsolete"}, state)
+        self.assertEqual(rollback.argv, ["retire-plan", "b" * 64, "--reason", "obsolete", "--rollback", "--confirm", "ROLLBACK"])
+        carry = web.command_for_action({"action": "retire", "mode": "carry-forward", "confirm": "CARRY_FORWARD", "reason": "obsolete"}, state)
+        self.assertEqual(carry.argv, ["retire-plan", "b" * 64, "--reason", "obsolete", "--carry-forward"])
+        with self.assertRaisesRegex(web.WebConsoleError, "mode must"):
+            web.command_for_action({"action": "retire", "mode": "forged", "confirm": "CARRY_FORWARD", "reason": "obsolete"}, state)
+
+    def test_replacement_proposal_only_forwards_latest_controller_retirement(self):
+        state = {"status": "IDLE", "retired_plans": [{"record_id": "RT-new", "disposition": "RETIRED_WITH_CARRY_FORWARD", "manifest_sha256": "a" * 64}]}
+        request = web.command_for_action({"action": "propose_replacement", "retirement_record_id": "RT-new"}, state)
+        self.assertEqual(request.argv, ["propose", "--from-retirement", "RT-new"])
+        with self.assertRaisesRegex(web.WebConsoleError, "exactly match"):
+            web.command_for_action({"action": "propose_replacement", "retirement_record_id": "RT-forged"}, state)
+
+    def test_reconciliation_actions_require_current_controller_candidate_and_confirmation(self):
+        state = self.reconciliation_state()
+        controller_snapshot = {"replacement": True, "candidates": [{"path": "kept.py", "eligible": True, "disposition": "PENDING_RECONCILIATION"}]}
+        with mock.patch.object(web.ralph, "reconciliation_snapshot", return_value=controller_snapshot):
+            adopt = web.command_for_action({"action": "adopt_carry_forward", "path": "kept.py", "step": 2, "confirm": "ADOPT"}, state)
+            leave = web.command_for_action({"action": "leave_carry_forward_outside", "path": "kept.py", "step": 2, "reason": "outside scope"}, state)
+            reject = web.command_for_action({"action": "reject_carry_forward", "path": "kept.py", "step": 2, "reason": "external repair"}, state)
+        self.assertEqual(adopt.argv, ["adopt-carry-forward", "b" * 64, "--path", "kept.py", "--step", "2", "--ownership-basis", "retired-unchanged-content", "--confirm", "ADOPT"])
+        self.assertEqual(leave.argv[:2], ["leave-carry-forward-outside", "b" * 64])
+        self.assertEqual(reject.argv[:2], ["reject-carry-forward", "b" * 64])
+        with mock.patch.object(web.ralph, "reconciliation_snapshot", side_effect=RuntimeError("stale state")):
+            with self.assertRaisesRegex(web.WebConsoleError, "controller refused"):
+                web.command_for_action({"action": "adopt_carry_forward", "path": "kept.py", "step": 2, "confirm": "ADOPT"}, state)
+        with mock.patch.object(web.ralph, "reconciliation_snapshot", return_value=controller_snapshot):
+            with self.assertRaisesRegex(web.WebConsoleError, "exact pending"):
+                web.command_for_action({"action": "adopt_carry_forward", "path": "../kept.py", "step": 2, "confirm": "ADOPT"}, state)
+
+    def test_reconciliation_inspection_preserves_controller_refusal(self):
+        state = self.reconciliation_state()
+        with mock.patch.object(web.ralph, "reconciliation_snapshot", side_effect=RuntimeError("stale action hash")):
+            with self.assertRaisesRegex(web.WebConsoleError, "controller refused"):
+                web.command_for_action({"action": "inspect_carry_forward"}, state)
 
     def test_steer_preserves_exact_gate_and_direction(self):
         req = web.command_for_action({

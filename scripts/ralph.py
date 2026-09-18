@@ -46,6 +46,9 @@ CONTEXT = ZEN_PROFILE.artifact(ROOT, "context")
 EVENTS = ZEN_PROFILE.artifact(ROOT, "events")
 RECOVERY = ZEN_PROFILE.artifact(ROOT, "recovery")
 REPORTS = ZEN_PROFILE.artifact(ROOT, "reports")
+# Retirement manifests are controller artifacts but intentionally outside the
+# profile's mutable artifact map: records are append-only and self-validating.
+RETIREMENTS = RALPH / "retirements"
 USAGE_LEDGER = ZEN_PROFILE.artifact(ROOT, "usage_ledger")
 USAGE_STATS_RESET = ZEN_PROFILE.artifact(ROOT, "usage_stats_reset")
 
@@ -196,10 +199,13 @@ def default_state() -> dict:
         "step_results": [],
         "final_qualification": None,
         "commit_sha": None,
+        "commit_message": None,
         "commit_reconciled": False,
         "commit_reconcile_note": None,
+        "commit_reconciled_at": None,
         "push_upstream": None,
         "push_reconciled": False,
+        "pushed_at": None,
         "completion_changes": None,
         "efficiency_mode": "NORMAL",
         "efficiency_recommendation": None,
@@ -498,11 +504,34 @@ def plan_owned_path(state: dict, path: str) -> bool:
     return str(path) in set(state.get("plan_owned_files") or [])
 
 
+def approval_baseline_residue_paths(state: dict) -> set[str]:
+    """Return paths that were already dirty/untracked when this plan was approved."""
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint:
+        return set()
+    return {
+        _normalize_repo_path(str(path))
+        for path in [
+            *(checkpoint.get("baseline_dirty_paths") or []),
+            *(checkpoint.get("baseline_untracked_paths") or []),
+        ]
+        if str(path).strip()
+    }
+
+
 def remember_plan_files(state: dict, paths: Iterable[str]) -> None:
     current = list(state.get("plan_changed_files") or [])
     owned = list(state.get("plan_owned_files") or [])
-    for path in paths:
+    replacement_baseline = approval_baseline_residue_paths(state) if state.get("retirement_record_id") else set()
+    for raw_path in paths:
+        path = _normalize_repo_path(str(raw_path or ""))
         if not path:
+            continue
+        # A replacement plan may inspect or even attempt to touch approval-time
+        # residue, but that path must never silently become new-plan delta.  Its
+        # retirement/candidate evidence remains authoritative and qualification
+        # will fail closed if the retained content changed or lacks disposition.
+        if path in replacement_baseline:
             continue
         if path not in current:
             current.append(path)
@@ -510,6 +539,277 @@ def remember_plan_files(state: dict, paths: Iterable[str]) -> None:
             owned.append(path)
     state["plan_changed_files"] = sorted(current)
     state["plan_owned_files"] = sorted(owned)
+
+
+_CARRY_FORWARD_PENDING = "PENDING_RECONCILIATION"
+_CARRY_FORWARD_ADOPTED = "ADOPTED_PLAN_CARRY_FORWARD"
+_CARRY_FORWARD_OUTSIDE = "LEFT_OUTSIDE_PLAN_BOUNDARY"
+_CARRY_FORWARD_REJECTED = "REJECTED_EXTERNAL_RECONCILIATION_REQUIRED"
+
+
+def _carry_forward_manifest(state: dict) -> dict:
+    record_id = str(state.get("retirement_record_id") or "")
+    if not record_id:
+        raise RuntimeError("carry-forward reconciliation requires a replacement retirement record")
+    return load_retirement_manifest(record_id, retirement_record_digest(state, record_id))
+
+
+def _carry_forward_candidate(state: dict, path: str) -> tuple[dict, dict]:
+    rel = _retirement_path(path)
+    candidates = state.get("carry_forward_candidates") if isinstance(state.get("carry_forward_candidates"), list) else []
+    matches = [item for item in candidates if isinstance(item, dict) and item.get("path") == rel]
+    if len(matches) != 1:
+        raise RuntimeError("carry-forward reconciliation requires one known candidate path")
+    candidate = matches[0]
+    manifest = _carry_forward_manifest(state)
+    source = [item for item in manifest["paths"] if item["path"] == rel]
+    if len(source) != 1 or str(candidate.get("retirement_record_id") or "") != manifest["id"]:
+        raise RuntimeError("carry-forward candidate is forged or no longer bound to retirement evidence")
+    evidence = source[0]["evidence"]
+    if candidate.get("inherited_fingerprint") != evidence.get("fingerprint") or candidate.get("source_kind") != source[0]["current"]:
+        raise RuntimeError("carry-forward candidate inherited evidence is forged or mismatched")
+    if not retirement_fingerprint_matches(evidence):
+        raise RuntimeError(f"carry-forward candidate changed since retirement: {rel}")
+    return candidate, source[0]
+
+
+def _carry_forward_step(state: dict, step_no: int) -> dict:
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    if not (1 <= step_no <= len(steps)):
+        raise RuntimeError("carry-forward adoption must claim an approved plan step")
+    return steps[step_no - 1]
+
+
+def _current_carry_forward_step(state: dict, step_no: int) -> dict:
+    """Require reconciliation to be claimed by the live approved plan step."""
+    if state.get("status") != "APPROVED":
+        raise RuntimeError(f"carry-forward reconciliation requires current APPROVED plan, found {state.get('status')}")
+    if int(state.get("current_step") or 0) != int(step_no):
+        raise RuntimeError("carry-forward reconciliation must claim the current approved plan step")
+    return _carry_forward_step(state, step_no)
+
+
+def _validate_carry_forward_action_scope(state: dict, path: str, step_no: int) -> dict:
+    step = _current_carry_forward_step(state, step_no)
+    if path == "tests" or path.startswith("tests/"):
+        policy = str(step.get("test_change_policy") or "none")
+        # Carried-forward tests are retained evidence, not a modification of an
+        # existing test.  The active step must nevertheless explicitly permit
+        # test content, including the add-only policy.
+        if policy not in {"add-only", "modify"}:
+            raise RuntimeError(f"carry-forward reconciliation violates test policy {policy}: {path}")
+    if is_tooling_path(path):
+        allowed, reason = self_hosting_grant_allows(state, step_no, [path])
+        if not allowed:
+            raise RuntimeError(f"carry-forward reconciliation lacks current self-hosting authority: {reason}")
+    return step
+
+
+def _invalidate_carry_forward_qualification(state: dict, action_hash: str) -> None:
+    """Never let a reconciliation action inherit an earlier qualification."""
+    qualification = state.get("final_qualification")
+    if not isinstance(qualification, dict):
+        return
+    state["final_qualification"] = {
+        "state": "STALE",
+        "invalidated_by": "carry-forward-reconciliation",
+        "action_hash": action_hash,
+        "prior_delta_fingerprint": qualification.get("delta_fingerprint"),
+        "invalidated_at": utc_now(),
+    }
+
+
+def reconciliation_snapshot(state: dict) -> dict:
+    """Return controller-derived reconciliation data; persisted records grant no authority."""
+    record_id = str(state.get("retirement_record_id") or "")
+    if not record_id:
+        return {"replacement": False}
+    manifest = _carry_forward_manifest(state)
+    candidates = state.get("carry_forward_candidates")
+    if not isinstance(candidates, list):
+        raise RuntimeError("replacement reconciliation state lacks a candidate inventory")
+    sources = {item["path"]: item for item in manifest["paths"]}
+    snapshot: list[dict] = []
+    seen: set[str] = set()
+    final = {_CARRY_FORWARD_ADOPTED, _CARRY_FORWARD_OUTSIDE, _CARRY_FORWARD_REJECTED}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise RuntimeError("replacement reconciliation state contains a malformed candidate")
+        raw_path = str(candidate.get("path") or "")
+        normalized = _normalize_repo_path(raw_path)
+        path_parts = Path(normalized)
+        malformed = (
+            not normalized
+            or path_parts.is_absolute()
+            or any(part in {"", ".", ".."} for part in path_parts.parts)
+        )
+        # The inventory deliberately records controller/protected residue without
+        # reading it.  It must remain visible to inspection and qualification,
+        # but can never become an adoption target or gain authority from state.
+        if malformed:
+            raise RuntimeError(f"replacement reconciliation state contains an ambiguous candidate path: {raw_path!r}")
+        path = path_parts.as_posix()
+        if path in seen:
+            raise RuntimeError("replacement reconciliation state contains duplicate candidate paths")
+        seen.add(path)
+        disposition = str(candidate.get("disposition") or "")
+        if disposition not in final | {_CARRY_FORWARD_PENDING}:
+            raise RuntimeError("replacement reconciliation state contains an invalid disposition")
+        item = {"path": path, "classification": str(candidate.get("classification") or "INVALID"),
+                "eligible": candidate.get("eligible") is True, "disposition": disposition,
+                "reason": str(candidate.get("reason") or candidate.get("evidence_error") or ""),
+                "claiming_step": None,
+                "evidence_status": "controller-rejected" if candidate.get("eligible") is False else "pending",
+                "qualification_impact": "STALE" if disposition != _CARRY_FORWARD_PENDING else "BLOCKS_EXECUTION"}
+        source = sources.get(path)
+        if is_protected_path(path) or _is_runtime_authority_path(path):
+            if candidate.get("eligible") is not False or disposition != _CARRY_FORWARD_REJECTED or source is not None:
+                raise RuntimeError("replacement reconciliation state grants protected or runtime path authority")
+            snapshot.append(item)
+            continue
+        _retirement_path(path)
+        record = candidate.get("adoption") if disposition == _CARRY_FORWARD_ADOPTED else candidate.get("reconciliation")
+        if disposition in {_CARRY_FORWARD_ADOPTED, _CARRY_FORWARD_OUTSIDE}:
+            if not isinstance(source, dict) or not isinstance(record, dict):
+                raise RuntimeError("replacement reconciliation state lacks manifest-bound action evidence")
+            # Diagnose an action against the live approved policy before its
+            # integrity check.  A persisted action can never preserve policy
+            # authority after the plan context changes; the hash check below
+            # still rejects any corresponding record mutation.
+            step_no = int(record.get("claiming_step") or 0)
+            step = _carry_forward_step(state, step_no)
+            if record.get("test_change_policy") != step.get("test_change_policy"):
+                raise RuntimeError("replacement reconciliation action policy context is stale")
+            provided_hash = str(record.get("action_hash") or "")
+            canonical = {key: value for key, value in record.items() if key != "action_hash"}
+            actual_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if not re.fullmatch(r"[0-9a-f]{64}", provided_hash) or not secrets.compare_digest(provided_hash, actual_hash):
+                raise RuntimeError("replacement reconciliation action hash is malformed or stale")
+            if (record.get("plan_hash") != state.get("plan_hash") or record.get("retirement_record_id") != record_id
+                    or record.get("path") != path or record.get("disposition") != disposition
+                    or record.get("retirement_evidence") != source.get("evidence")):
+                raise RuntimeError("replacement reconciliation action is not bound to current immutable provenance")
+            authority = record.get("self_hosting_authority")
+            if authority is not None and (not isinstance(authority, dict) or authority.get("plan_hash") != state.get("plan_hash")):
+                raise RuntimeError("replacement reconciliation action authority evidence is stale")
+            item.update({"claiming_step": step_no, "evidence_status": "manifest-bound-unchanged",
+                         "qualification_impact": "REQUIRES_REQUALIFICATION", "action_hash": provided_hash,
+                         "authority_evidence": authority})
+        elif disposition == _CARRY_FORWARD_REJECTED and source is not None and record is not None:
+            item["evidence_status"] = "manifest-bound-rejected"
+        snapshot.append(item)
+    return {"replacement": True, "retirement_record_id": record_id,
+            "retirement_manifest_sha256": retirement_record_digest(state, record_id),
+            "candidates": sorted(
+                snapshot,
+                key=lambda item: (
+                    0 if item["classification"] == "MANIFEST_BOUND_UNCHANGED" else 1,
+                    item["path"],
+                ),
+            )}
+
+
+def _carry_forward_action(state: dict, candidate: dict, source: dict, *, disposition: str, step: dict, ownership_basis: str, reason: str | None = None) -> dict:
+    """Create an immutable-style, plan-bound record for one disposition."""
+    action = {
+        "schema": "zen_ralph_carry_forward_reconciliation_v3",
+        "plan_hash": state["plan_hash"],
+        "retirement_record_id": state["retirement_record_id"],
+        "path": candidate["path"],
+        "disposition": disposition,
+        "claiming_step": int(step["id"]),
+        "ownership_basis": ownership_basis,
+        "retirement_evidence": source["evidence"],
+        "inherited_fingerprint": source["evidence"]["fingerprint"],
+        "source_kind": source["current"],
+        "test_change_policy": step.get("test_change_policy"),
+        "self_hosting_authority": state.get("self_hosting_grant") if is_tooling_path(candidate["path"]) else None,
+        "reason": reason,
+        "recorded_at": utc_now(),
+    }
+    action["action_hash"] = hashlib.sha256(json.dumps(action, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return action
+
+
+def _validate_carry_forward_adoption(state: dict, path: str, step_no: int) -> tuple[dict, dict]:
+    candidate, source = _carry_forward_candidate(state, path)
+    if candidate.get("disposition") != _CARRY_FORWARD_PENDING:
+        raise RuntimeError("carry-forward candidate already has a durable disposition")
+    if candidate.get("owned") is not False or path in set(state.get("plan_changed_files") or []):
+        raise RuntimeError("carry-forward candidate is duplicate or already absorbed by the plan")
+    if is_protected_path(path) or _is_runtime_authority_path(path):
+        raise RuntimeError("carry-forward adoption refuses protected or runtime paths")
+    _validate_carry_forward_action_scope(state, path, step_no)
+    return candidate, source
+
+
+def cmd_inspect_carry_forward(args: argparse.Namespace) -> int:
+    init_files()
+    state = load_state()
+    if not secrets.compare_digest(str(args.plan_hash or ""), str(state.get("plan_hash") or "")):
+        raise RuntimeError("inspect-carry-forward hash does not match the current plan")
+    if state.get("status") != "APPROVED":
+        raise RuntimeError(f"inspect-carry-forward requires current APPROVED plan, found {state.get('status')}")
+    print(json.dumps(reconciliation_snapshot(state), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_adopt_carry_forward(args: argparse.Namespace) -> int:
+    init_files()
+    state = load_state()
+    if not secrets.compare_digest(str(args.plan_hash or ""), str(state.get("plan_hash") or "")):
+        raise RuntimeError("adopt-carry-forward hash does not match the current plan")
+    if str(args.confirm or "") != "ADOPT":
+        raise RuntimeError("adopt-carry-forward requires --confirm ADOPT")
+    path = _retirement_path(str(args.path or ""))
+    step_no = int(args.step or 0)
+    basis = " ".join(str(args.ownership_basis or "").split())
+    if basis != "retired-unchanged-content":
+        raise RuntimeError("adopt-carry-forward requires --ownership-basis retired-unchanged-content")
+    candidate, source = _validate_carry_forward_adoption(state, path, step_no)
+    step = _current_carry_forward_step(state, step_no)
+    action = _carry_forward_action(state, candidate, source, disposition=_CARRY_FORWARD_ADOPTED, step=step, ownership_basis=basis)
+    candidate.update({"disposition": _CARRY_FORWARD_ADOPTED, "owned": True, "adoption": action})
+    # Retained content is controller-owned plan context, not a newly produced
+    # working-tree delta.  In particular, it must never enter the staging,
+    # qualification, or commit path reserved for newly changed plan files.
+    state["plan_carry_forward_files"] = sorted(set(state.get("plan_carry_forward_files") or []) | {path})
+    _invalidate_carry_forward_qualification(state, action["action_hash"])
+    save_state(state)
+    print(f"CARRY_FORWARD_ADOPTED plan={state['plan_hash']} path={path} step={step_no}")
+    return 0
+
+
+def _cmd_dispose_carry_forward(args: argparse.Namespace, disposition: str, action: str) -> int:
+    init_files()
+    state = load_state()
+    if not secrets.compare_digest(str(args.plan_hash or ""), str(state.get("plan_hash") or "")):
+        raise RuntimeError(f"{action} hash does not match the current plan")
+    path = _retirement_path(str(args.path or ""))
+    step_no = int(getattr(args, "step", state.get("current_step") or 0) or 0)
+    candidate, source = _carry_forward_candidate(state, path)
+    if candidate.get("disposition") != _CARRY_FORWARD_PENDING:
+        raise RuntimeError("carry-forward candidate already has a durable disposition")
+    reason = " ".join(str(args.reason or "").split())
+    if not reason:
+        raise RuntimeError(f"{action} requires a non-empty --reason")
+    step = _validate_carry_forward_action_scope(state, path, step_no)
+    basis = "outside-plan-boundary" if disposition == _CARRY_FORWARD_OUTSIDE else "external-reconciliation-required"
+    record = _carry_forward_action(state, candidate, source, disposition=disposition, step=step, ownership_basis=basis, reason=reason[:1200])
+    candidate.update({"disposition": disposition, "owned": False, "reason": reason[:1200], "disposed_at": record["recorded_at"], "reconciliation": record})
+    _invalidate_carry_forward_qualification(state, record["action_hash"])
+    save_state(state)
+    print(f"{disposition} plan={state['plan_hash']} path={path}")
+    return 0
+
+
+def cmd_leave_carry_forward_outside(args: argparse.Namespace) -> int:
+    return _cmd_dispose_carry_forward(args, _CARRY_FORWARD_OUTSIDE, "leave-carry-forward-outside")
+
+
+def _cmd_reject_carry_forward(args: argparse.Namespace) -> int:
+    return _cmd_dispose_carry_forward(args, _CARRY_FORWARD_REJECTED, "reject-carry-forward")
 
 
 def steering_for_step(state: dict, step_no: int) -> list[dict]:
@@ -793,6 +1093,19 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         for key in token_totals:
             token_totals[key] += int(stats.get(key) or 0)
 
+    qualification_record = state.get("final_qualification") if isinstance(state.get("final_qualification"), dict) else {}
+    try:
+        replacement_snapshot = reconciliation_snapshot(state)
+    except RuntimeError as exc:
+        # Reports are evidence only and must never turn malformed reconciliation
+        # state into authority.  Preserve the exact controller refusal so a
+        # terminal block can still produce an operator-visible report.
+        replacement_snapshot = {
+            "replacement": bool(state.get("retirement_record_id")),
+            "retirement_record_id": state.get("retirement_record_id"),
+            "error": str(exc),
+        }
+
     report = {
         "schema": "zen_ralph_completion_v1",
         "generated_at": utc_now(),
@@ -810,7 +1123,12 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
             "human_gates": len(state.get("human_gate_resolutions") or []),
             "human_steers": len(state.get("human_steering") or []),
         },
-        "qualification": {"state": str((state.get("final_qualification") or {}).get("state") or "UNKNOWN"), "gates": final_gates},
+        "qualification": {
+            "state": str(qualification_record.get("state") or "UNKNOWN"),
+            "stage": qualification_record.get("stage"),
+            "error": qualification_record.get("error"),
+            "gates": final_gates,
+        },
         "changes": {"files": len(entries), "added": added, "removed": removed, "entries": entries},
         "step_results": step_results,
         "recovery_checkpoint": state.get("recovery_checkpoint"),
@@ -829,6 +1147,7 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
             "commit_adopted": bool(state.get("commit_reconciled")),
             "push_adopted": bool(state.get("push_reconciled")),
             "commit_note": state.get("commit_reconcile_note"),
+            "replacement_snapshot": replacement_snapshot,
         },
     }
     REPORTS.mkdir(parents=True, exist_ok=True)
@@ -853,6 +1172,9 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         f"- Human steering decisions: {len(state.get('human_steering') or [])}",
         f"- Recovery checkpoint: `{state.get('recovery_checkpoint') or '-'}`", "",
         "## Final qualification", "",
+        f"- State: {report['qualification']['state']}",
+        *([f"- Stage: {report['qualification']['stage']}"] if report['qualification'].get('stage') else []),
+        *([f"- Error: {report['qualification']['error']}"] if report['qualification'].get('error') else []),
         *[f"- {gate}" for gate in final_gates], "",
         "## Changes", "",
         f"- Files: {len(entries)}", f"- Lines: +{added}/-{removed}",
@@ -864,6 +1186,16 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
     lines += ["", "## Step results", ""]
     for item in step_results:
         lines.append(f"- Step {item.get('step')}: **{item.get('result')}** — {item.get('title')} — {item.get('summary') or '-'}")
+    replacement = report["reconciliation"]["replacement_snapshot"]
+    if replacement.get("replacement"):
+        lines += ["", "## Replacement reconciliation", "",
+                  f"- Retirement record: `{replacement.get('retirement_record_id') or '-'}`"]
+        if replacement.get("error"):
+            lines.append(f"- Controller refusal: {replacement['error']}")
+        else:
+            lines.append(f"- Immutable manifest digest: `{replacement['retirement_manifest_sha256']}`")
+            for item in replacement["candidates"]:
+                lines.append(f"- `{item['path']}` — {item['classification']}; {item['disposition']}; step={item['claiming_step'] or '-'}; evidence={item['evidence_status']}; qualification={item['qualification_impact']}; reason={item['reason'] or '-'}")
     lines += [
         "", "## Authority", "",
         f"- RALPH tooling changed by plan: {'YES' if report['authority']['ralph_tooling_changed'] else 'NO'}",
@@ -914,13 +1246,23 @@ def authorized_self_hosting_paths(state: dict) -> set[str]:
 
 def plan_delta_fingerprint(state: dict) -> str:
     """Bind qualification to the exact recorded plan delta currently on disk."""
-    planned = sorted({_normalize_repo_path(str(path)) for path in state.get("plan_changed_files") or [] if str(path).strip()})
+    # Validate reconciliation action context before checking whether a current
+    # new-plan delta exists.  This keeps a stale adoption record diagnosable
+    # even when its replacement plan has already consumed the original delta.
+    if state.get("retirement_record_id"):
+        reconciliation_snapshot(state)
+    provenance = _reconciled_provenance_guard(state, "fingerprint")
+    planned = provenance["new_plan_paths"]
     if not planned:
         raise RuntimeError("plan has no recorded changed files")
     digest = hashlib.sha256()
     digest.update(str(state.get("plan_hash") or "").encode())
     digest.update(b"\0")
     digest.update(str(state.get("recovery_checkpoint") or "").encode())
+    digest.update(b"\0RECONCILIATION\0")
+    digest.update(json.dumps(reconciliation_snapshot(state), sort_keys=True, separators=(",", ":")).encode())
+    digest.update(b"\0PROVENANCE\0")
+    digest.update(json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode())
     for path in planned:
         digest.update(b"\0PATH\0" + path.encode())
         status = _git(["status", "--porcelain=v1", "--", path], check=False).stdout
@@ -938,6 +1280,470 @@ def plan_delta_fingerprint(state: dict) -> str:
     return digest.hexdigest()
 
 
+def _reconciled_provenance_guard(
+    state: dict, phase: str, *, require_new_plan_delta: bool = True,
+) -> dict:
+    """Derive the only worktree provenance eligible for qualification.
+
+    Carry-forward content remains approval-time residue: it is revalidated and
+    fingerprinted as evidence, but is never returned as new-plan staging scope.
+    """
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint:
+        raise RuntimeError(f"{phase} requires a recovery checkpoint")
+    baseline = {
+        _normalize_repo_path(str(path)) for path in checkpoint.get("baseline_dirty_paths") or []
+    } | {
+        _normalize_repo_path(str(path)) for path in checkpoint.get("baseline_untracked_paths") or []
+    }
+    new_paths = {_normalize_repo_path(str(path)) for path in state.get("plan_changed_files") or [] if str(path).strip()}
+    adopted_paths = {_normalize_repo_path(str(path)) for path in state.get("plan_carry_forward_files") or [] if str(path).strip()}
+    overlap = sorted((new_paths & baseline) | (new_paths & adopted_paths))
+    if overlap:
+        raise RuntimeError(f"APPROVAL_BASELINE_RESIDUE_AS_NEW_PLAN: {overlap}")
+    if not new_paths:
+        raise RuntimeError(f"{phase} requires recorded new-plan changes")
+    candidates = state.get("carry_forward_candidates")
+    if state.get("retirement_record_id"):
+        # Re-derive and validate the durable action records before trusting any
+        # state-owned list.  The snapshot itself grants no ownership.
+        reconciliation_snapshot(state)
+        if not isinstance(candidates, list):
+            raise RuntimeError("MALFORMED_RECONCILIATION_INVENTORY")
+        by_path = {str(item.get("path") or ""): item for item in candidates if isinstance(item, dict)}
+        for path, candidate in sorted(by_path.items()):
+            disposition = str(candidate.get("disposition") or "")
+            if disposition == _CARRY_FORWARD_PENDING:
+                raise RuntimeError(f"PENDING_RECONCILIATION: {path}")
+            if disposition == _CARRY_FORWARD_REJECTED:
+                raise RuntimeError(f"REJECTED_EXTERNAL_RECONCILIATION_REQUIRED: {path}")
+            if disposition == _CARRY_FORWARD_OUTSIDE:
+                raise RuntimeError(f"OUTSIDE_BOUNDARY_RECONCILIATION: {path}")
+            if disposition != _CARRY_FORWARD_ADOPTED:
+                raise RuntimeError(f"INVALID_RECONCILIATION_DISPOSITION: {path}")
+            if path not in adopted_paths:
+                raise RuntimeError(f"ADOPTED_CARRY_FORWARD_NOT_IN_PROVENANCE: {path}")
+            evidence = candidate.get("retirement_evidence")
+            if not isinstance(evidence, dict) or not retirement_fingerprint_matches(evidence):
+                raise RuntimeError(f"ALTERED_ADOPTED_CARRY_FORWARD: {path}")
+        unrecorded = sorted(adopted_paths - set(by_path))
+        if unrecorded:
+            raise RuntimeError(f"UNRECORDED_ADOPTED_CARRY_FORWARD: {unrecorded}")
+    elif adopted_paths:
+        raise RuntimeError(f"CARRY_FORWARD_WITHOUT_RECONCILIATION: {sorted(adopted_paths)}")
+    current = {_normalize_repo_path(path) for path in git_changed_paths() if not path.startswith(".ralph/")}
+    missing_new = sorted(new_paths - current)
+    if require_new_plan_delta and missing_new:
+        raise RuntimeError(f"MISSING_NEW_PLAN_DELTA: {missing_new}")
+    unexpected = sorted(current - baseline - new_paths)
+    if unexpected:
+        raise RuntimeError(f"UNEXPECTED_DELTA: {unexpected}")
+    untracked_residue = sorted((current & baseline) - adopted_paths - (baseline - current))
+    # Approval-time residue is allowed to remain outside the commit, but an
+    # untracked baseline path cannot silently be absorbed or disappear.
+    baseline_untracked = {_normalize_repo_path(str(path)) for path in checkpoint.get("baseline_untracked_paths") or []}
+    exposed_untracked = sorted((current & baseline_untracked) - adopted_paths)
+    if exposed_untracked:
+        raise RuntimeError(f"UNTRACKED_APPROVAL_RESIDUE: {exposed_untracked}")
+    protected = sorted(path for path in new_paths if is_protected_path(path) or _is_runtime_authority_path(path))
+    if protected:
+        raise RuntimeError(f"PROTECTED_NEW_PLAN_PATH: {protected}")
+    tooling = sorted(path for path in new_paths if is_tooling_path(path))
+    unauthorized = sorted(set(tooling) - authorized_self_hosting_paths(state))
+    if unauthorized:
+        raise RuntimeError(f"UNAUTHORIZED_TOOLING_NEW_PLAN_PATH: {unauthorized}")
+    adopted_evidence = {
+        path: retirement_path_fingerprint(path) for path in sorted(adopted_paths)
+    }
+    return {"new_plan_paths": sorted(new_paths), "adopted_carry_forward_paths": sorted(adopted_paths),
+            "approval_baseline_paths": sorted(baseline), "adopted_evidence": adopted_evidence,
+            "untracked_residue": untracked_residue}
+
+
+RETIREMENT_MANIFEST_SCHEMA = "zen_ralph_retirement_v3"
+_RETIREMENT_ID_RE = re.compile(r"^RT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+_RETIREMENT_PATH_KINDS = {"tracked", "untracked", "missing"}
+
+
+def retirement_record_id() -> str:
+    """Return an opaque, sortable identifier for one immutable retirement record."""
+    return f"RT-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:12]}"
+
+
+def _retirement_path(path: str) -> str:
+    """Canonicalize an artifact path, refusing protected or ambiguous targets."""
+    value = _normalize_repo_path(path)
+    candidate = Path(value)
+    if (
+        not value
+        or candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+        or is_protected_path(value)
+        or _is_runtime_authority_path(value)
+    ):
+        raise RuntimeError(f"retirement record rejects protected or ambiguous path: {path!r}")
+    return candidate.as_posix()
+
+
+def _retirement_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def retirement_path_fingerprint(path: str) -> dict:
+    """Capture canonical Git status plus content and HEAD-delta evidence for one path.
+
+    A missing path is a legitimate, distinct state.  Directories and symlinks are
+    deliberately rejected: neither provides unambiguous file-content ownership.
+    """
+    rel = _retirement_path(path)
+    full = ROOT / rel
+    tracked = _git(["ls-files", "--error-unmatch", "--", rel], check=False).returncode == 0
+    status_proc = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", rel], check=False)
+    if status_proc.returncode != 0:
+        raise RuntimeError(f"cannot determine Git status for retirement path {rel!r}")
+    status = status_proc.stdout
+    if full.is_symlink() or (full.exists() and not full.is_file()):
+        raise RuntimeError(f"retirement record rejects non-regular path: {rel}")
+    if full.exists():
+        try:
+            content = full.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"cannot read retirement path {rel!r}: {exc}") from exc
+        kind = "tracked" if tracked else "untracked"
+        content_sha256: str | None = _retirement_sha256(content)
+    else:
+        kind = "missing"
+        content_sha256 = None
+    delta = _git(["diff", "--binary", "HEAD", "--", rel], check=False)
+    if delta.returncode != 0:
+        raise RuntimeError(f"cannot determine Git delta for retirement path {rel!r}")
+    record = {
+        "path": rel,
+        "kind": kind,
+        "git_status": status,
+        "content_sha256": content_sha256,
+        "delta_sha256": _retirement_sha256(delta.stdout.encode("utf-8")),
+    }
+    record["fingerprint"] = _retirement_sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return record
+
+
+def retirement_fingerprint_matches(record: dict) -> bool:
+    """Return whether a recorded path still has exactly its captured evidence."""
+    try:
+        path = record["path"]
+        expected = str(record["fingerprint"])
+        if not expected:
+            return False
+        return retirement_path_fingerprint(path) == record
+    except (KeyError, TypeError, RuntimeError):
+        return False
+
+
+def replacement_dirty_inventory(manifest: dict) -> list[dict]:
+    """Record a fail-closed disposition for every current dirty worktree path.
+
+    Retirement evidence can prove that a path is retained, but the repository
+    snapshot is only audit context: it never grants replacement-plan ownership.
+    Protected and malformed paths deliberately receive status-only evidence so
+    the controller does not read their content while still making them visible.
+    """
+    dirty, untracked = _status_sets()
+    manifest_paths = manifest.get("paths") if isinstance(manifest.get("paths"), list) else []
+    snapshot = manifest.get("repository_after") if isinstance(manifest.get("repository_after"), dict) else {}
+    by_path: dict[str, list[dict]] = {}
+    for item in manifest_paths:
+        if isinstance(item, dict) and isinstance(item.get("path"), str):
+            by_path.setdefault(item["path"], []).append(item)
+    inventory: list[dict] = []
+    retained = {item["path"] for item in manifest_paths if isinstance(item, dict) and item.get("current") != "missing" and isinstance(item.get("path"), str)}
+    # Include unchanged retained records as well: they remain explicit adoption
+    # candidates, while the dirty set is still exhaustively inventoried.
+    for raw_path in sorted(set(dirty) | set(untracked) | retained):
+        source_kind = "untracked" if raw_path in untracked else "modified"
+        status = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", raw_path], check=False)
+        base = {"path": raw_path, "source_kind": source_kind, "owned": False,
+                "retirement_record_id": manifest.get("id"), "current_status": status.stdout}
+        normalized = _normalize_repo_path(raw_path)
+        candidate = Path(normalized)
+        if (not normalized or candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts)):
+            inventory.append(base | {"classification": "MALFORMED_NON_ADOPTABLE", "eligible": False,
+                                     "disposition": _CARRY_FORWARD_REJECTED, "evidence_error": "ambiguous path"})
+            continue
+        path = candidate.as_posix()
+        base["path"] = path
+        if is_protected_path(path):
+            inventory.append(base | {"classification": "PROTECTED_NON_ADOPTABLE", "eligible": False,
+                                     "disposition": _CARRY_FORWARD_REJECTED, "evidence_error": "protected path content not read"})
+            continue
+        if _is_runtime_authority_path(path):
+            inventory.append(base | {"classification": "RUNTIME_AUTHORITY_NON_ADOPTABLE", "eligible": False,
+                                     "disposition": _CARRY_FORWARD_REJECTED, "evidence_error": "runtime authority path"})
+            continue
+        sources = by_path.get(path, [])
+        if len(sources) > 1:
+            inventory.append(base | {"classification": "DUPLICATE_MANIFEST_EVIDENCE_NON_ADOPTABLE", "eligible": False,
+                                     "disposition": _CARRY_FORWARD_REJECTED, "evidence_error": "duplicate retirement path evidence"})
+            continue
+        try:
+            evidence = retirement_path_fingerprint(path)
+        except RuntimeError as exc:
+            inventory.append(base | {"classification": "UNREADABLE_NON_ADOPTABLE", "eligible": False,
+                                     "disposition": _CARRY_FORWARD_REJECTED, "evidence_error": str(exc)})
+            continue
+        base["current_evidence"] = evidence
+        if len(sources) == 1:
+            source = sources[0]
+            recorded = source.get("evidence")
+            if not isinstance(recorded, dict) or not retirement_fingerprint_matches(recorded):
+                inventory.append(base | {"classification": "MANIFEST_BOUND_CHANGED_NON_ADOPTABLE", "eligible": False,
+                                         "disposition": _CARRY_FORWARD_REJECTED, "retirement_evidence": recorded})
+                continue
+            inventory.append(base | {"classification": "MANIFEST_BOUND_UNCHANGED", "eligible": True,
+                                     "disposition": _CARRY_FORWARD_PENDING, "baseline": source.get("baseline"),
+                                     "current": source.get("current"), "source_kind": source.get("current"), "inherited_fingerprint": recorded.get("fingerprint"),
+                                     "retirement_evidence": recorded})
+            continue
+        if path in snapshot:
+            inventory.append(base | {"classification": "SNAPSHOT_ONLY_EXTERNAL_RECONCILIATION", "eligible": False,
+                                     "disposition": _CARRY_FORWARD_REJECTED,
+                                     "repository_after_fingerprint": snapshot[path]})
+        else:
+            inventory.append(base | {"classification": "UNKNOWN_NON_ADOPTABLE", "eligible": False,
+                                     "disposition": _CARRY_FORWARD_REJECTED})
+    # Keep the complete inventory visible, but put manifest-bound evidence
+    # first. Controller runtime residue remains recorded and fail-closed, but
+    # must not obscure the exact candidate reconciled from retirement evidence.
+    return sorted(
+        inventory,
+        key=lambda item: (
+            0 if item.get("classification") == "MANIFEST_BOUND_UNCHANGED" else 1,
+            str(item.get("path") or ""),
+        ),
+    )
+
+
+def replacement_inventory_binding(candidate: dict) -> dict:
+    """Return the immutable evidence portion of one replacement candidate."""
+    if not isinstance(candidate, dict):
+        return {"invalid_candidate": True}
+    mutable = {"disposition", "owned", "reason", "disposed_at", "adoption"}
+    return {key: value for key, value in candidate.items() if key not in mutable}
+
+
+def refresh_replacement_dirty_inventory(state: dict) -> bool:
+    """Refresh inventory evidence, retaining new fail-closed records on mismatch."""
+    record_id = str(state.get("retirement_record_id") or "")
+    if not record_id:
+        return True
+    manifest, _ = replacement_retirement_context(record_id, retirement_record_digest(state, record_id))
+    current = replacement_dirty_inventory(manifest)
+    recorded = state.get("carry_forward_candidates")
+    if not isinstance(recorded, list):
+        state["carry_forward_candidates"] = current
+        return False
+    expected = [replacement_inventory_binding(item) for item in recorded]
+    actual = [replacement_inventory_binding(item) for item in current]
+    if expected != actual:
+        state["carry_forward_candidates"] = current
+        return False
+    return True
+
+
+def unresolved_replacement_dispositions(state: dict) -> list[str]:
+    """Return manifest-bound candidates not explicitly disposed by an operator.
+
+    Inventory records are durable evidence, but PENDING_RECONCILIATION is not a
+    final disposition and cannot authorize execution.  This deliberately makes
+    adoption, outside-boundary treatment, or external reconciliation explicit.
+    """
+    candidates = state.get("carry_forward_candidates")
+    if not isinstance(candidates, list):
+        return ["<inventory-missing>"]
+    return sorted(
+        str(item.get("path") or "<invalid-candidate>")
+        for item in candidates
+        if not isinstance(item, dict) or item.get("disposition") == _CARRY_FORWARD_PENDING
+    )
+
+
+def retirement_path_records(state: dict, paths: Iterable[str]) -> list[dict]:
+    """Bind paths to baseline, explicit plan ownership, current state, and surprise."""
+    explicit_owned = {_retirement_path(str(item)) for item in state.get("plan_owned_files") or []}
+    records: list[dict] = []
+    for raw in sorted({_retirement_path(str(item)) for item in paths}):
+        baseline = plan_baseline_path_kind(state, raw)
+        fingerprint = retirement_path_fingerprint(raw)
+        current = fingerprint["kind"]
+        # Ownership is exclusively the controller's explicit plan-owned record;
+        # neither a current pathname nor a clean Git state confers ownership.
+        plan_owned = raw in explicit_owned
+        unexpected = current != "missing" and baseline == "absent" and not plan_owned
+        records.append({
+            "path": raw,
+            "baseline": baseline,
+            "plan_owned": plan_owned,
+            "current": current,
+            "unexpected": unexpected,
+            "evidence": fingerprint,
+        })
+    return records
+
+
+def validate_retirement_manifest(manifest: dict) -> dict:
+    """Validate the complete immutable retirement-artifact schema, fail closed."""
+    if not isinstance(manifest, dict):
+        raise RuntimeError("retirement manifest must be an object")
+    required = {"schema", "id", "created_at", "plan_hash", "status_before", "reason", "disposition", "checkpoint", "step", "step_count", "loop_count", "paths", "operations", "repository_before", "repository_after", "planning_context"}
+    if set(manifest) != required or manifest.get("schema") != RETIREMENT_MANIFEST_SCHEMA:
+        raise RuntimeError("retirement manifest schema is invalid")
+    if not _RETIREMENT_ID_RE.fullmatch(str(manifest["id"])):
+        raise RuntimeError("retirement manifest identifier is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(manifest["plan_hash"])):
+        raise RuntimeError("retirement manifest plan hash is invalid")
+    if not all(isinstance(manifest[key], str) and manifest[key].strip() for key in ("created_at", "status_before", "reason", "checkpoint")):
+        raise RuntimeError("retirement manifest metadata is invalid")
+    if manifest["disposition"] not in {"ROLLED_BACK", "RETIRED_WITH_CARRY_FORWARD"}:
+        raise RuntimeError("retirement manifest disposition is invalid")
+    if not all(isinstance(manifest[key], int) and manifest[key] >= 0 for key in ("step", "step_count", "loop_count")):
+        raise RuntimeError("retirement manifest lifecycle audit fields are invalid")
+    if not isinstance(manifest["operations"], dict) or set(manifest["operations"]) != {"restore", "delete", "preserved"} or not all(isinstance(manifest["operations"][key], list) for key in ("restore", "delete", "preserved")):
+        raise RuntimeError("retirement manifest operations are invalid")
+    if not all(isinstance(manifest[key], dict) for key in ("repository_before", "repository_after")):
+        raise RuntimeError("retirement manifest repository audit state is invalid")
+    planning = manifest["planning_context"]
+    required_planning = {"goal", "blockers", "prior_steps", "policies", "review_evidence"}
+    if not isinstance(planning, dict) or set(planning) != required_planning:
+        raise RuntimeError("retirement manifest planning context is invalid")
+    if not isinstance(planning["goal"], str) or not planning["goal"].strip():
+        raise RuntimeError("retirement manifest planning goal is invalid")
+    if not isinstance(planning["blockers"], list) or not isinstance(planning["prior_steps"], list):
+        raise RuntimeError("retirement manifest planning history is invalid")
+    if not isinstance(planning["policies"], dict) or not isinstance(planning["review_evidence"], dict):
+        raise RuntimeError("retirement manifest planning evidence is invalid")
+    paths = manifest["paths"]
+    if not isinstance(paths, list):
+        raise RuntimeError("retirement manifest requires path evidence")
+    seen: set[str] = set()
+    for item in paths:
+        if not isinstance(item, dict) or set(item) != {"path", "baseline", "plan_owned", "current", "unexpected", "evidence"}:
+            raise RuntimeError("retirement manifest path record is invalid")
+        path = _retirement_path(str(item.get("path") or ""))
+        if path in seen or item["baseline"] not in {"tracked", "preexisting-untracked", "preexisting-dirty", "absent", "unknown"}:
+            raise RuntimeError("retirement manifest path classification is invalid")
+        seen.add(path)
+        if not isinstance(item["plan_owned"], bool) or not isinstance(item["unexpected"], bool) or item["current"] not in _RETIREMENT_PATH_KINDS:
+            raise RuntimeError("retirement manifest ownership classification is invalid")
+        evidence = item["evidence"]
+        if not isinstance(evidence, dict) or set(evidence) != {"path", "kind", "git_status", "content_sha256", "delta_sha256", "fingerprint"}:
+            raise RuntimeError("retirement manifest fingerprint evidence is invalid")
+        canonical = dict(evidence)
+        if canonical["path"] != path or canonical["kind"] != item["current"] or not isinstance(canonical["git_status"], str):
+            raise RuntimeError("retirement manifest fingerprint does not bind its path")
+        if canonical["kind"] == "missing":
+            if canonical["content_sha256"] is not None:
+                raise RuntimeError("missing retirement path has content evidence")
+        elif not isinstance(canonical["content_sha256"], str):
+            raise RuntimeError("retirement path lacks content evidence")
+        expected = canonical.pop("fingerprint")
+        if not all(isinstance(canonical[key], str) and re.fullmatch(r"[0-9a-f]{64}", canonical[key]) for key in ("delta_sha256",)) or (canonical["content_sha256"] is not None and not re.fullmatch(r"[0-9a-f]{64}", canonical["content_sha256"])):
+            raise RuntimeError("retirement manifest digest evidence is invalid")
+        actual = _retirement_sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        if not isinstance(expected, str) or expected != actual:
+            raise RuntimeError("retirement manifest fingerprint integrity check failed")
+    return manifest
+
+
+def retirement_planning_context(state: dict) -> dict:
+    """Capture only review/planning evidence; execution authority never retires forward."""
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    results = state.get("step_results") if isinstance(state.get("step_results"), list) else []
+    return {
+        "goal": str(plan.get("goal") or "").strip(),
+        "blockers": [str(state.get("block_reason") or "").strip()] if state.get("block_reason") else [],
+        "prior_steps": [
+            {"id": step.get("id"), "title": step.get("title"), "objective": step.get("objective"),
+             "acceptance": step.get("acceptance"), "test_change_policy": step.get("test_change_policy"),
+             "outcome": next((item.get("result") for item in results if isinstance(item, dict) and item.get("step") == step.get("id")), None)}
+            for step in steps
+        ],
+        "policies": {"test_change_policies": [step.get("test_change_policy") for step in steps]},
+        "review_evidence": {"final_qualification": state.get("final_qualification"), "recovery_checkpoint": state.get("recovery_checkpoint")},
+    }
+
+
+def retirement_record_digest(state: dict, record_id: str) -> str:
+    """Return the controller-bound digest for one known retirement artifact."""
+    records = state.get("retired_plans") if isinstance(state.get("retired_plans"), list) else []
+    matches = [item for item in records if isinstance(item, dict) and item.get("record_id") == record_id]
+    if len(matches) != 1:
+        raise RuntimeError("replacement proposal requires a known retirement record")
+    digest = str(matches[0].get("manifest_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise RuntimeError("retirement record lacks immutable digest evidence")
+    return digest
+
+
+def replacement_retirement_context(record_id: str, expected_digest: str) -> tuple[dict, dict]:
+    """Load current retirement evidence plus historical planning context only."""
+    manifest = load_retirement_manifest(record_id, expected_digest)
+    if manifest["disposition"] != "RETIRED_WITH_CARRY_FORWARD":
+        raise RuntimeError("replacement proposal requires a carry-forward retirement record")
+    return manifest, {
+        "current_retirement_record_id": manifest["id"],
+        "current_retirement_reason": manifest["reason"],
+        "source_plan_hash": manifest["plan_hash"],
+        "source_status": manifest["status_before"],
+        "source_step": manifest["step"],
+        "source_step_count": manifest["step_count"],
+        "historical_planning_context": manifest["planning_context"],
+    }
+
+
+def replacement_plan_goal(manifest: dict) -> str:
+    """Derive a replacement objective from the newest retirement, never an ancestor goal."""
+    record_id = str(manifest.get("id") or "").strip()
+    reason = " ".join(str(manifest.get("reason") or "").split())
+    if not record_id or not reason:
+        raise RuntimeError("retirement manifest lacks current replacement objective evidence")
+    return f"Continue from {record_id} to resolve the retirement condition: {reason}"
+
+
+def load_retirement_manifest(record_id: str, expected_digest: str | None = None) -> dict:
+    """Load an existing immutable artifact; absent or malformed records are errors."""
+    if not _RETIREMENT_ID_RE.fullmatch(str(record_id or "")):
+        raise RuntimeError("retirement manifest identifier is invalid")
+    path = RALPH / "retirements" / f"{record_id}.json"
+    try:
+        raw = path.read_bytes()
+        if expected_digest is not None and not secrets.compare_digest(_retirement_sha256(raw), expected_digest):
+            raise RuntimeError("retirement manifest immutable digest does not match")
+        manifest = json.loads(raw.decode("utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load retirement manifest {record_id!r}") from exc
+    manifest = validate_retirement_manifest(manifest)
+    if manifest["id"] != record_id:
+        raise RuntimeError("retirement manifest filename and identifier disagree")
+    return manifest
+
+
+def write_retirement_manifest(manifest: dict) -> Path:
+    """Create one manifest without ever replacing an existing retirement artifact."""
+    manifest = validate_retirement_manifest(manifest)
+    retirements = RALPH / "retirements"
+    retirements.mkdir(parents=True, exist_ok=True)
+    path = retirements / f"{manifest['id']}.json"
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    except FileExistsError as exc:
+        raise RuntimeError(f"retirement manifest already exists: {manifest['id']}") from exc
+    return path
+
+
 def qualified_delta_matches(state: dict) -> tuple[bool, str]:
     qualification = state.get("final_qualification") if isinstance(state.get("final_qualification"), dict) else {}
     if str(qualification.get("state") or "") != "PASS":
@@ -949,13 +1755,21 @@ def qualified_delta_matches(state: dict) -> tuple[bool, str]:
         if self_hosted:
             return False, "self-hosting final qualification predates delta binding; requalification is required"
         return True, "legacy non-self-hosting qualification has no delta fingerprint"
-    actual = plan_delta_fingerprint(state)
+    try:
+        actual = plan_delta_fingerprint(state)
+    except RuntimeError as exc:
+        return False, f"reconciled provenance is stale: {exc}"
     if expected != actual:
         return False, "working-tree delta changed after final qualification; requalification is required"
     return True, "qualified delta fingerprint matches"
 
 
 def finalization_review(state: dict) -> dict:
+    provenance_error = None
+    try:
+        provenance = _reconciled_provenance_guard(state, "finalization review")
+    except RuntimeError as exc:
+        provenance, provenance_error = None, str(exc)
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     baseline = set(checkpoint.get("baseline_dirty_paths") or []) if checkpoint else set()
     planned = set(state.get("plan_changed_files") or [])
@@ -975,6 +1789,8 @@ def finalization_review(state: dict) -> dict:
         "tooling": tooling,
         "unauthorized_tooling": unauthorized_tooling,
         "checkpoint": checkpoint,
+        "provenance": provenance,
+        "provenance_error": provenance_error,
     }
 
 
@@ -990,6 +1806,12 @@ def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
         raise RuntimeError(f"reconcile-commit requires READY_TO_COMMIT, found {state.get('status')}")
     if str((state.get("final_qualification") or {}).get("state") or "") != "PASS":
         raise RuntimeError("final qualification is not PASS; commit reconciliation refused")
+    # A manually-created candidate commit has already consumed the approved
+    # worktree delta.  Keep every reconciliation/adoption check, but do not
+    # require that consumed delta to still be dirty on disk.
+    provenance = _reconciled_provenance_guard(
+        state, "commit reconciliation", require_new_plan_delta=False,
+    )
     resolved = _git(["rev-parse", "--verify", f"{commit_sha}^{{commit}}"], check=False)
     if resolved.returncode != 0:
         raise RuntimeError(f"commit {commit_sha} does not exist")
@@ -997,7 +1819,7 @@ def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
     reachable = _git(["merge-base", "--is-ancestor", sha, "HEAD"], check=False)
     if reachable.returncode != 0:
         raise RuntimeError("commit is not reachable from current HEAD")
-    planned = set(state.get("plan_changed_files") or [])
+    planned = set(provenance["new_plan_paths"])
     if not planned:
         raise RuntimeError("plan has no recorded changed files")
     protected = sorted(path for path in planned if is_protected_path(path) or _is_runtime_authority_path(path))
@@ -1029,6 +1851,7 @@ def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
 
 
 def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
+    provenance = _reconciled_provenance_guard(state, "automated commit")
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     if not checkpoint:
         raise RuntimeError("recovery checkpoint is missing; finalization refused")
@@ -1036,7 +1859,7 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
     baseline_staged = sorted(checkpoint.get("baseline_staged_paths") or [])
     if baseline_staged:
         raise RuntimeError(f"pre-existing staged changes were present at approval; automated commit refused: {baseline_staged}")
-    planned = set(state.get("plan_changed_files") or [])
+    planned = set(provenance["new_plan_paths"])
     if not planned:
         raise RuntimeError("no RALPH plan changes are recorded; commit refused")
     overlap = sorted(baseline & planned)
@@ -1085,6 +1908,7 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
 
 def _requalification_delta_guard(state: dict) -> tuple[list[str], list[str]]:
     """Require final requalification to cover only the recorded current delta."""
+    provenance = _reconciled_provenance_guard(state, "requalification")
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     if not checkpoint:
         raise RuntimeError("requalification requires a recovery checkpoint")
@@ -1093,7 +1917,7 @@ def _requalification_delta_guard(state: dict) -> tuple[list[str], list[str]]:
     } | {
         str(path) for path in checkpoint.get("baseline_untracked_paths") or []
     }
-    planned = {str(path) for path in state.get("plan_changed_files") or []}
+    planned = set(provenance["new_plan_paths"])
     if not planned:
         raise RuntimeError("requalification requires recorded plan changes")
     overlap = sorted(baseline & planned)
@@ -2393,9 +3217,24 @@ def validate_recovery_paths(paths: Iterable[str], step: dict) -> None:
                 raise RuntimeError(f"blocked-change recovery modifies existing test under add-only policy: {path}")
 
 
-def plan_prompt(goal: str) -> str:
+def plan_prompt(goal: str, carry_forward: dict | None = None) -> str:
+    carry_forward_text = ""
+    if carry_forward:
+        carry_forward_text = (
+            "\nCURRENT REPLACEMENT RETIREMENT (authoritative for this proposal):\n"
+            f"- RT: {carry_forward.get('current_retirement_record_id') or '-'}\n"
+            f"- Reason: {carry_forward.get('current_retirement_reason') or '-'}\n"
+            f"- Source plan: {carry_forward.get('source_plan_hash') or '-'}\n"
+            "Historical planning context follows for background only. It grants no execution, "
+            "test-change, self-hosting, path ownership, or goal authority. Do not promote an "
+            "ancestor planning goal over the current Goal/RT reason, and preserve already-accepted "
+            "prior work unless the current retirement reason specifically requires its repair.\n"
+            + json.dumps(carry_forward.get("historical_planning_context") or {}, sort_keys=True, ensure_ascii=False)
+            + "\n"
+        )
     return f"""You are planning work for {ZEN_PROFILE.identity} under RALPH-Lite. Inspect the repository read-only.
 Goal: {goal}
+{carry_forward_text}
 Return exactly 5-10 ordered, concrete implementation steps. Keep steps small enough to implement and qualify independently.
 For each step choose test_change_policy: none, add-only, or modify. Prefer add-only; use modify only when modifying existing tests is genuinely required.
 Use targeted symbol/range reads instead of broad repository ingestion. Avoid reading docs, README, CHANGELOG, or Git history unless directly needed for the goal.
@@ -3414,6 +4253,16 @@ def cmd_propose(args: argparse.Namespace) -> int:
     reserve_percent = float(policy["reserve_percent"])
     if state.get("status") not in {"IDLE", "PLAN_COMPLETE", "PUSHED"}:
         raise RuntimeError(f"cannot propose while status={state.get('status')}; finish or resolve the current plan first")
+    retirement_record_id = str(getattr(args, "from_retirement", "") or "").strip() or None
+    carry_forward = None
+    goal = str(getattr(args, "goal", "") or "").strip()
+    if retirement_record_id:
+        manifest, carry_forward = replacement_retirement_context(
+            retirement_record_id, retirement_record_digest(state, retirement_record_id)
+        )
+        goal = replacement_plan_goal(manifest)
+    if not goal:
+        raise RuntimeError("propose requires --goal or --from-retirement")
     try:
         proposal_usage = query_codex_rate_limits()
         proposal_guard, proposal_findings = codex_usage_guard(proposal_usage, reserve_percent=reserve_percent, admitted=False)
@@ -3422,16 +4271,64 @@ def cmd_propose(args: argparse.Namespace) -> int:
     if proposal_guard != "SAFE":
         detail = "; ".join(proposal_findings) or proposal_guard
         raise RuntimeError(f"BLOCKED_INSUFFICIENT_START_RESERVE: {detail}")
-    plan = run_codex(plan_prompt(args.goal), PLAN_SCHEMA, "read-only", context="PLAN PROPOSAL")
+    plan = run_codex(plan_prompt(goal, carry_forward), PLAN_SCHEMA, "read-only", context="REPLACEMENT PLAN PROPOSAL" if carry_forward else "PLAN PROPOSAL")
     validate_plan(plan)
     digest = plan_hash(plan)
+    if retirement_record_id and secrets.compare_digest(digest, str(manifest["plan_hash"])):
+        raise RuntimeError("replacement proposal must produce a fresh plan hash")
     append_usage_ledger(
         plan.get("_ralph_metrics") if isinstance(plan, dict) else {},
-        plan_hash_value=digest, goal=args.goal, scope="planning", phase="proposal",
+        plan_hash_value=digest, goal=goal, scope="planning", phase="replacement-proposal" if carry_forward else "proposal",
     )
     previous_state = dict(state)
     previous_state.pop("proposal_previous_state", None)
-    state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan, "current_step": 1, "failure_attempts": {}, "active_failure": None, "last_failure": None, "last_result": None, "block_reason": None, "proposal_previous_state": previous_state, "recovery_checkpoint": None, "plan_changed_files": [], "plan_owned_files": [], "test_reconciliation_adoptions": [], "human_steering": [], "steering_allowed_new_tests": [], "self_hosting_grant": None, "self_hosting_candidate": None, "step_results": [], "final_qualification": None, "commit_sha": None, "commit_reconciled": False, "commit_reconcile_note": None, "push_upstream": None, "push_reconciled": False, "completion_changes": None, "usage_admission": {"admitted": True, "plan_hash": digest, "admitted_at": utc_now(), "reserve_percent": reserve_percent, "remaining_percent_at_admission": _minimum_remaining(proposal_usage), "scope": "proposal-and-plan"}, "codex_usage": proposal_usage, "efficiency_mode": str(policy["mode"]), "efficiency_recommendation": recommended_efficiency_mode(args.goal)})
+    state.update({
+        "status": "AWAITING_APPROVAL",
+        "plan_hash": digest,
+        "plan": plan,
+        "current_step": 1,
+        "failure_attempts": {},
+        "active_failure": None,
+        "last_failure": None,
+        "last_result": None,
+        "block_reason": None,
+        "proposal_previous_state": previous_state,
+        "retirement_record_id": retirement_record_id,
+        "recovery_checkpoint": None,
+        "plan_changed_files": [],
+        "plan_owned_files": [],
+        "plan_carry_forward_files": [],
+        "carry_forward_candidates": replacement_dirty_inventory(manifest) if retirement_record_id else [],
+        "test_reconciliation_adoptions": [],
+        "human_gate_resolutions": [],
+        "human_steering": [],
+        "steering_allowed_new_tests": [],
+        "self_hosting_grant": None,
+        "self_hosting_candidate": None,
+        "self_hosting_grant_history": [],
+        "step_results": [],
+        "final_qualification": None,
+        "completion_changes": None,
+        "commit_sha": None,
+        "commit_message": None,
+        "commit_reconciled": False,
+        "commit_reconcile_note": None,
+        "commit_reconciled_at": None,
+        "push_upstream": None,
+        "push_reconciled": False,
+        "pushed_at": None,
+        "usage_admission": {
+            "admitted": True,
+            "plan_hash": digest,
+            "admitted_at": utc_now(),
+            "reserve_percent": reserve_percent,
+            "remaining_percent_at_admission": _minimum_remaining(proposal_usage),
+            "scope": "proposal-and-plan",
+        },
+        "codex_usage": proposal_usage,
+        "efficiency_mode": str(policy["mode"]),
+        "efficiency_recommendation": recommended_efficiency_mode(goal),
+    })
     PLAN.write_text(render_plan(plan), encoding="utf-8")
     save_state(state)
     print(render_plan(plan))
@@ -3450,11 +4347,23 @@ def cmd_approve(args: argparse.Namespace) -> int:
         raise RuntimeError("approval hash does not match the proposed plan")
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
         raise RuntimeError("plan.md changed after proposal; proposal must be regenerated before approval")
+    candidates: list[dict] = []
+    retirement_record_id = state.get("retirement_record_id")
+    if retirement_record_id:
+        manifest, _ = replacement_retirement_context(
+            str(retirement_record_id), retirement_record_digest(state, str(retirement_record_id))
+        )
+        # Re-inventory at approval so evidence is current at the moment
+        # execution authority is granted; every dirty path has a final or
+        # explicitly pending controller disposition before that point.
+        candidates = replacement_dirty_inventory(manifest)
     checkpoint = create_recovery_checkpoint(state)
     state["status"] = "APPROVED"
     state["recovery_checkpoint"] = checkpoint["id"]
     state["plan_changed_files"] = []
     state["plan_owned_files"] = []
+    state["plan_carry_forward_files"] = []
+    state["carry_forward_candidates"] = candidates
     state["human_steering"] = []
     state["steering_allowed_new_tests"] = []
     clear_self_hosting_context(state)
@@ -3526,9 +4435,14 @@ def cmd_reject(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reject_carry_forward(args: argparse.Namespace) -> int:
+    """Public reconciliation command; kept after lifecycle commands intentionally."""
+    return _cmd_reject_carry_forward(args)
+
+
 
 def cmd_retire_plan(args: argparse.Namespace) -> int:
-    """Human-only retirement of an obsolete approved plan."""
+    """Retire an active plan by an explicit, auditable disposition."""
     init_files()
     state = load_state()
 
@@ -3555,19 +4469,61 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
     if not reason:
         raise RuntimeError("retire-plan requires a non-empty reason")
 
+    # Parser-driven invocations always carry explicit disposition flags.  Keep
+    # the pre-existing in-process controller API usable for its legacy callers;
+    # it maps only a flag-less invocation to the non-destructive disposition.
+    legacy_invocation = not hasattr(args, "rollback") and not hasattr(args, "carry_forward")
+    rollback = bool(getattr(args, "rollback", False))
+    carry_forward = bool(getattr(args, "carry_forward", False)) or legacy_invocation
+    if rollback == carry_forward:
+        raise RuntimeError("retire-plan requires exactly one of --rollback or --carry-forward")
+    if legacy_invocation and not state.get("recovery_checkpoint"):
+        state["recovery_checkpoint"] = create_recovery_checkpoint(state)["id"]
+        save_state(state)
+    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
+    if not checkpoint or checkpoint.get("id") != state.get("recovery_checkpoint"):
+        raise RuntimeError("retire-plan requires the active recovery checkpoint")
+    if not secrets.compare_digest(str(checkpoint.get("plan_hash") or ""), str(expected)):
+        raise RuntimeError("retire-plan recovery checkpoint does not belong to the active plan")
+    recovery_oid, recovery_ref = str(checkpoint.get("recovery_oid") or ""), str(checkpoint.get("ref") or "")
+    resolved = _git(["rev-parse", recovery_ref], check=False).stdout.strip() if recovery_oid and recovery_ref else ""
+    if not recovery_oid or not recovery_ref or resolved != recovery_oid:
+        raise RuntimeError("retire-plan recovery checkpoint ref is missing or inconsistent")
+
     old_step = int(state.get("current_step") or 1)
     old_loops = int(state.get("loop_count") or 0)
     steps = list(((state.get("plan") or {}).get("steps") or []))
 
-    retirement = {
-        "plan_hash": expected,
-        "status_before": status,
-        "step": old_step,
-        "step_count": len(steps),
-        "loop_count": old_loops,
-        "reason": reason[:1200],
-        "retired_at": utc_now(),
-    }
+    recorded_paths = set(state.get("plan_changed_files") or []) | set(state.get("plan_owned_files") or [])
+    records = retirement_path_records(state, recorded_paths)
+    unsafe = [item["path"] for item in records if not item["plan_owned"] or item["baseline"] != "absent" or item["unexpected"]]
+    if rollback and unsafe:
+        raise RuntimeError(f"retire-plan refuses ambiguous or unowned paths: {unsafe}")
+    before = repo_snapshot()
+    delete_paths = [item["path"] for item in records if item["current"] != "missing"]
+    restore_paths: list[str] = []
+    if rollback:
+        print("ROLLBACK PREVIEW")
+        print(f"Recovery checkpoint: {checkpoint['id']} ({recovery_ref})")
+        print("Restore paths: " + (", ".join(restore_paths) if restore_paths else "(none)"))
+        print("Delete paths: " + (", ".join(delete_paths) if delete_paths else "(none)"))
+        if str(getattr(args, "confirm", "") or "") != "ROLLBACK":
+            print("No files changed. Re-run with --confirm ROLLBACK to execute this exact rollback.")
+            return 0
+        for path in delete_paths:
+            record = next(item for item in records if item["path"] == path)
+            if not retirement_fingerprint_matches(record["evidence"]):
+                raise RuntimeError(f"retire-plan rollback path changed after preview evidence: {path}")
+            (ROOT / path).unlink()
+        disposition, operations = "ROLLED_BACK", {"restore": restore_paths, "delete": delete_paths, "preserved": []}
+    else:
+        disposition, operations = "RETIRED_WITH_CARRY_FORWARD", {"restore": [], "delete": [], "preserved": [item["path"] for item in records]}
+    after = repo_snapshot()
+    if carry_forward and after != before:
+        raise RuntimeError("carry-forward changed the worktree; retirement refused")
+    manifest = {"schema": RETIREMENT_MANIFEST_SCHEMA, "id": retirement_record_id(), "created_at": utc_now(), "plan_hash": expected, "status_before": status, "reason": reason[:1200], "disposition": disposition, "checkpoint": checkpoint["id"], "step": old_step, "step_count": len(steps), "loop_count": old_loops, "paths": records, "operations": operations, "repository_before": before, "repository_after": after, "planning_context": retirement_planning_context(state)}
+    manifest_path = write_retirement_manifest(manifest)
+    retirement = {"plan_hash": expected, "status_before": status, "step": old_step, "step_count": len(steps), "loop_count": old_loops, "reason": reason[:1200], "retired_at": manifest["created_at"], "disposition": disposition, "record_id": manifest["id"], "checkpoint": checkpoint["id"], "manifest_sha256": file_hash(manifest_path)}
 
     history = (
         state.get("retired_plans")
@@ -3580,15 +4536,15 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
         old_loops,
         old_step,
         "human-retire",
-        "RETIRED",
+        disposition,
         summary=reason,
-        next_action="propose a new plan",
+        files=[item["path"] for item in records],
+        next_action=f"python3 scripts/ralph.py propose --from-retirement {manifest['id']}" if carry_forward else "python3 scripts/ralph.py propose --goal '<next objective>'",
     )
 
     live_write(
-        f"plan={expected} retired at step={old_step}/{len(steps)} "
-        f"without Codex execution; returning controller to IDLE",
-        "RETIRED",
+        f"plan={expected} {disposition} record={manifest['id']} at step={old_step}/{len(steps)}; returning controller to IDLE",
+        disposition,
     )
 
     state.update({
@@ -3599,7 +4555,7 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
         "failure_attempts": {},
         "active_failure": None,
         "last_failure": None,
-        "last_result": "RETIRED",
+        "last_result": "RETIRED" if legacy_invocation else disposition,
         "block_reason": None,
     })
     clear_self_hosting_context(state)
@@ -3609,8 +4565,8 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
     save_state(state)
 
     print(
-        f"RETIRED plan={expected} "
-        f"step={old_step}/{len(steps)} loops={old_loops}; state=IDLE"
+        f"{disposition} plan={expected} record={manifest['id']} artifact={manifest_path.relative_to(ROOT)} step={old_step}/{len(steps)} loops={old_loops}; state=IDLE\n"
+        "Next: python3 scripts/ralph.py propose --goal '<next objective>'"
     )
     return 0
 
@@ -3825,6 +4781,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
         raise RuntimeError("resume is only valid from BLOCKED_HUMAN/BLOCKED_ENVIRONMENT")
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("resume hash does not match the approved plan")
+    if state.get("retirement_record_id"):
+        reconciliation_snapshot(state)
     clear_self_hosting_context(state)
     state["status"] = "APPROVED"
     state["block_reason"] = None
@@ -4098,6 +5056,148 @@ def cmd_efficiency_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_terminal_completion_report(state: dict, gates: list[str]) -> dict | None:
+    """Best-effort report emission after terminal qualification has persisted state."""
+    try:
+        return build_completion_report(state, gates)
+    except Exception as exc:
+        qualification = state.get("final_qualification") if isinstance(state.get("final_qualification"), dict) else {}
+        qualification["report_error"] = str(exc)[:2000]
+        state["final_qualification"] = qualification
+        save_state(state)
+        live_write(f"completion report generation failed after terminal state was persisted: {exc}", "FAIL")
+        return None
+
+
+def _block_terminal_qualification(
+    state: dict,
+    *,
+    stage: str,
+    error: str,
+    gates: Iterable[str] = (),
+    durations: dict[str, float] | None = None,
+    output: str = "",
+) -> int:
+    """Persist an exact terminal qualification refusal instead of escaping N+1/N."""
+    gate_list = list(gates)
+    detail = " ".join(str(error or "terminal qualification refused").split())[:6000]
+    state["final_qualification"] = {
+        "state": "BLOCKED",
+        "stage": stage,
+        "error": detail,
+        "gates": gate_list,
+        "durations": dict(durations or {}),
+        "output": str(output or "")[-6000:],
+        "completed_at": utc_now(),
+        "delta_fingerprint": None,
+    }
+    state["status"] = "BLOCKED_HUMAN"
+    state["block_reason"] = f"final qualification {stage} blocked after all approved steps completed: {detail}"
+    save_state(state)
+    report = _write_terminal_completion_report(state, gate_list)
+    report_note = f"; report={report['markdown_path']}" if report else ""
+    append_journal(
+        int(state.get("loop_count") or 0),
+        len((state.get("plan") or {}).get("steps") or []),
+        "final-qualification",
+        "BLOCKED",
+        summary=state["block_reason"],
+        gates=gate_list,
+        next_action="correct the exact provenance/qualification block, then resume terminal finalization",
+    )
+    live_write(state["block_reason"] + report_note, "FAIL")
+    print(state["block_reason"])
+    if report:
+        print(f"Report: {report['markdown_path']}")
+    return 2
+
+
+def finalize_completed_plan(state: dict) -> int:
+    """Run terminal qualification once all approved steps have been consumed."""
+    try:
+        passed, final_gates, final_durations, final_output = run_final_qualification(state)
+    except RuntimeError as exc:
+        return _block_terminal_qualification(state, stage="qualification-guard", error=str(exc))
+
+    fingerprint = None
+    if passed:
+        try:
+            fingerprint = plan_delta_fingerprint(state)
+        except RuntimeError as exc:
+            return _block_terminal_qualification(
+                state,
+                stage="delta-binding",
+                error=str(exc),
+                gates=final_gates,
+                durations=final_durations,
+                output=final_output,
+            )
+
+    state["final_qualification"] = {
+        "state": "PASS" if passed else "FAIL",
+        "gates": final_gates,
+        "durations": final_durations,
+        "output": final_output[-6000:],
+        "completed_at": utc_now(),
+        "delta_fingerprint": fingerprint,
+    }
+    state["block_reason"] = None
+    try:
+        state["codex_usage"] = query_codex_rate_limits()
+    except Exception:
+        pass
+
+    if not passed:
+        state["status"] = "BLOCKED_HUMAN"
+        state["block_reason"] = "final qualification failed after all approved steps completed"
+        save_state(state)
+        report = _write_terminal_completion_report(state, final_gates)
+        append_journal(
+            state["loop_count"], len(state["plan"]["steps"]), "final-qualification", "FAIL",
+            summary=state["block_reason"], gates=final_gates,
+            next_action="human review final qualification output",
+        )
+        live_write(
+            state["block_reason"] + (f"; report={report['markdown_path']}" if report else ""),
+            "FAIL",
+        )
+        if final_output:
+            print(final_output[-6000:])
+        if report:
+            print(f"Report: {report['markdown_path']}")
+        return 2
+
+    final_entries = change_entries(state.get("plan_changed_files") or [])
+    state["completion_changes"] = {
+        "entries": final_entries,
+        "files": len(final_entries),
+        "added": sum(int(item.get("added") or 0) for item in final_entries),
+        "removed": sum(int(item.get("removed") or 0) for item in final_entries),
+    }
+    state["status"] = "READY_TO_COMMIT"
+    save_state(state)
+    report = build_completion_report(state, final_gates)
+    with JOURNAL.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"## Plan complete — {utc_now()}\n\n"
+            f"- Plan: `{state['plan_hash']}`\n"
+            f"- Loops: {state['loop_count']}\n"
+            f"- Steps: {len(state['plan']['steps'])}\n"
+            "- Final qualification: PASS\n"
+            "- Status: READY_TO_COMMIT\n"
+            f"- Completion report: `{report['markdown_path']}`\n"
+            f"- Recovery checkpoint: `{state.get('recovery_checkpoint')}`\n"
+            f"- Next action: python3 scripts/ralph.py finalize {state['plan_hash']}\n\n"
+        )
+    live_write(
+        f"plan complete · final qualification PASS · report={report['markdown_path']} · READY_TO_COMMIT",
+        "READY",
+    )
+    print(tui.completion_card(report))
+    print(f"Next: python3 scripts/ralph.py finalize {state['plan_hash']}")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     tui.configure(getattr(args, "color", "auto"))
     init_files()
@@ -4114,6 +5214,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
         block(state, "approved plan file changed")
         raise RuntimeError("approved plan file changed; blocked for human review")
+    if state.get("retirement_record_id") and not refresh_replacement_dirty_inventory(state):
+        block(state, "replacement dirty-path inventory changed after approval; refreshed dispositions require human review")
+        raise RuntimeError("replacement dirty-path inventory changed after approval; execution refused")
+    unresolved = unresolved_replacement_dispositions(state) if state.get("retirement_record_id") else []
+    if unresolved:
+        block(state, "replacement dirty-path inventory has unresolved dispositions: " + ", ".join(unresolved))
+        raise RuntimeError("replacement dirty-path inventory requires explicit dispositions before execution")
     if not state.get("recovery_checkpoint"):
         checkpoint = create_recovery_checkpoint(state)
         state["recovery_checkpoint"] = checkpoint["id"]
@@ -4372,62 +5479,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             block(state, f"failure {fp} persisted through {MAX_REPAIRS_PER_FAILURE} repair attempts")
             return 2
 
-    passed, final_gates, final_durations, final_output = run_final_qualification()
-    state["final_qualification"] = {
-        "state": "PASS" if passed else "FAIL",
-        "gates": final_gates,
-        "durations": final_durations,
-        "output": final_output[-6000:],
-        "completed_at": utc_now(),
-        "delta_fingerprint": plan_delta_fingerprint(state) if passed else None,
-    }
-    state["block_reason"] = None
-    try:
-        state["codex_usage"] = query_codex_rate_limits()
-    except Exception:
-        pass
+    return finalize_completed_plan(state)
 
-    if not passed:
-        state["status"] = "BLOCKED_HUMAN"
-        state["block_reason"] = "final qualification failed after all approved steps completed"
-        save_state(state)
-        append_journal(
-            state["loop_count"], len(state["plan"]["steps"]), "final-qualification", "FAIL",
-            summary=state["block_reason"], gates=final_gates, next_action="human review final qualification output",
-        )
-        live_write(state["block_reason"], "FAIL")
-        print(final_output[-6000:])
-        return 2
-
-    final_entries = change_entries(state.get("plan_changed_files") or [])
-    state["completion_changes"] = {
-        "entries": final_entries,
-        "files": len(final_entries),
-        "added": sum(int(item.get("added") or 0) for item in final_entries),
-        "removed": sum(int(item.get("removed") or 0) for item in final_entries),
-    }
-    state["status"] = "READY_TO_COMMIT"
-    save_state(state)
-    report = build_completion_report(state, final_gates)
-    with JOURNAL.open("a", encoding="utf-8") as handle:
-        handle.write(
-            f"## Plan complete — {utc_now()}\n\n"
-            f"- Plan: `{state['plan_hash']}`\n"
-            f"- Loops: {state['loop_count']}\n"
-            f"- Steps: {len(state['plan']['steps'])}\n"
-            "- Final qualification: PASS\n"
-            "- Status: READY_TO_COMMIT\n"
-            f"- Completion report: `{report['markdown_path']}`\n"
-            f"- Recovery checkpoint: `{state.get('recovery_checkpoint')}`\n"
-            f"- Next action: python3 scripts/ralph.py finalize {state['plan_hash']}\n\n"
-        )
-    live_write(
-        f"plan complete · final qualification PASS · report={report['markdown_path']} · READY_TO_COMMIT",
-        "READY",
-    )
-    print(tui.completion_card(report))
-    print(f"Next: python3 scripts/ralph.py finalize {state['plan_hash']}")
-    return 0
 
 
 def cmd_recover_validation_block(args: argparse.Namespace) -> int:
@@ -4438,6 +5491,8 @@ def cmd_recover_validation_block(args: argparse.Namespace) -> int:
         raise RuntimeError("recover-validation-block requires BLOCKED_HUMAN status")
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("recovery hash does not match the approved plan")
+    if state.get("retirement_record_id"):
+        reconciliation_snapshot(state)
     if not is_recoverable_validation_block(state.get("block_reason") or ""):
         raise RuntimeError("current block is not classified as a recoverable validation-only block")
     if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
@@ -4510,7 +5565,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init").set_defaults(func=cmd_init)
     propose = sub.add_parser("propose")
-    propose.add_argument("--goal", required=True)
+    proposal_source = propose.add_mutually_exclusive_group(required=True)
+    proposal_source.add_argument("--goal")
+    proposal_source.add_argument("--from-retirement", metavar="RT_ID")
     propose.set_defaults(func=cmd_propose)
     approve = sub.add_parser("approve")
     approve.add_argument("plan_hash")
@@ -4526,7 +5583,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retire.add_argument("plan_hash")
     retire.add_argument("--reason", required=True)
+    disposition = retire.add_mutually_exclusive_group(required=True)
+    disposition.add_argument("--rollback", action="store_true")
+    disposition.add_argument("--carry-forward", action="store_true")
+    retire.add_argument("--confirm", default=None, help="must be ROLLBACK to execute a rollback")
     retire.set_defaults(func=cmd_retire_plan)
+    inspect_carry = sub.add_parser("inspect-carry-forward", help="inspect durable carry-forward reconciliation dispositions")
+    inspect_carry.add_argument("plan_hash")
+    inspect_carry.set_defaults(func=cmd_inspect_carry_forward)
+    adopt_carry = sub.add_parser("adopt-carry-forward", help="adopt unchanged retirement content into the approved plan")
+    adopt_carry.add_argument("plan_hash")
+    adopt_carry.add_argument("--path", required=True)
+    adopt_carry.add_argument("--step", required=True, type=int)
+    adopt_carry.add_argument("--ownership-basis", required=True)
+    adopt_carry.add_argument("--confirm", required=True)
+    adopt_carry.set_defaults(func=cmd_adopt_carry_forward)
+    leave_carry = sub.add_parser("leave-carry-forward-outside", help="leave a carry-forward candidate outside plan scope")
+    leave_carry.add_argument("plan_hash")
+    leave_carry.add_argument("--path", required=True)
+    leave_carry.add_argument("--step", required=True, type=int, help="current approved step claiming this disposition")
+    leave_carry.add_argument("--reason", required=True)
+    leave_carry.set_defaults(func=cmd_leave_carry_forward_outside)
+    reject_carry = sub.add_parser("reject-carry-forward", help="reject a candidate pending external reconciliation")
+    reject_carry.add_argument("plan_hash")
+    reject_carry.add_argument("--path", required=True)
+    reject_carry.add_argument("--step", required=True, type=int, help="current approved step claiming this disposition")
+    reject_carry.add_argument("--reason", required=True)
+    reject_carry.set_defaults(func=cmd_reject_carry_forward)
     run = sub.add_parser("run")
     run.add_argument("--max-loops", type=int, default=DEFAULT_MAX_LOOPS)
     run.add_argument("--efficiency-mode", choices=tuple(mode.lower() for mode in EFFICIENCY_MODES), default=None, help="efficiency governor for this plan: strict, normal, relaxed, or off; persisted for resumed runs")

@@ -158,9 +158,9 @@ class ControllerAdoptionCoverageTests(unittest.TestCase):
             mock.patch.object(ralph, "load_recovery_checkpoint", return_value=checkpoint),
             mock.patch.object(ralph, "git_changed_paths", return_value=unexpected),
         ):
-            with self.assertRaisesRegex(RuntimeError, "unexpected working-tree delta"):
+            with self.assertRaisesRegex(RuntimeError, r"^UNEXPECTED_DELTA: \['src/unrelated.py'\]$"):
                 ralph._requalification_delta_guard(state)
-            with self.assertRaisesRegex(RuntimeError, "unexpected working-tree delta"):
+            with self.assertRaisesRegex(RuntimeError, r"^UNEXPECTED_DELTA: \['src/unrelated.py'\]$"):
                 ralph._finalization_guard(state)
 
 
