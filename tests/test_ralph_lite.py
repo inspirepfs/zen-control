@@ -630,10 +630,11 @@ class CodexUsageGuardTests(unittest.TestCase):
 
     def test_usage_ledger_tracks_per_plan_and_reset_window_tokens(self):
         with tempfile.TemporaryDirectory() as td:
-            old_ralph, old_ledger = ralph.RALPH, ralph.USAGE_LEDGER
+            old_ralph, old_ledger, old_events = ralph.RALPH, ralph.USAGE_LEDGER, ralph.EVENTS
             try:
                 ralph.RALPH = Path(td)
                 ralph.USAGE_LEDGER = Path(td) / "usage-ledger.jsonl"
+                ralph.EVENTS = Path(td) / "events.jsonl"
                 ralph.append_usage_ledger(
                     {"input_tokens": 1000, "cached_input_tokens": 800, "output_tokens": 120, "reasoning_output_tokens": 30},
                     plan_hash_value="plan-a", goal="Plan A", scope="implementation", loop=1, step=1, phase="implement",
@@ -656,8 +657,40 @@ class CodexUsageGuardTests(unittest.TestCase):
                 self.assertEqual(plan_a["phases"][0]["name"], "implement")
                 self.assertEqual(plan_a["steps"][0]["name"], "1")
                 self.assertGreaterEqual(plan_a["cache_ratio_percent"], 79.9)
+                self.assertEqual(plan_a["control_stats_status"], "legacy")
             finally:
-                ralph.RALPH, ralph.USAGE_LEDGER = old_ralph, old_ledger
+                ralph.RALPH, ralph.USAGE_LEDGER, ralph.EVENTS = old_ralph, old_ledger, old_events
+
+    def test_usage_report_counts_only_explicit_plan_bound_control_events(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_ralph, old_ledger, old_events = ralph.RALPH, ralph.USAGE_LEDGER, ralph.EVENTS
+            try:
+                ralph.RALPH = Path(td)
+                ralph.USAGE_LEDGER = Path(td) / "usage-ledger.jsonl"
+                ralph.EVENTS = Path(td) / "events.jsonl"
+                ralph.append_usage_ledger(
+                    {"input_tokens": 1000, "cached_input_tokens": 800, "output_tokens": 100},
+                    plan_hash_value="plan-a", goal="Plan A", scope="implementation", loop=1, step=1, phase="implement",
+                )
+                # Generic legacy/test events are deliberately not attributed.
+                ralph.tui.write_event(ralph.EVENTS, "GATE", "gate=HG-0015-04 resolved HUMAN_CONFIRMED")
+                state = {"plan_hash": "plan-a", "loop_count": 1, "current_step": 1}
+                ralph.plan_control_event(state, "plan_control_baseline", "baseline", step=0)
+                ralph.plan_control_event(state, "human_gate_open", "opened", gate_id="HG-0001-01")
+                ralph.plan_control_event(state, "human_steer", "steered", gate_id="HG-0001-01")
+                ralph.plan_control_event(state, "self_hosting_grant", "authorized", gate_id="HG-0001-01")
+                ralph.plan_control_event(state, "human_gate_resolution", "resolved", gate_id="HG-0001-01")
+
+                report = ralph.usage_ledger_report({"plan_hash": "plan-a", "step_results": []}, {})
+                plan_a = next(item for item in report["plans"] if item["plan_hash"] == "plan-a")
+                self.assertEqual(plan_a["control_stats_status"], "complete")
+                self.assertEqual(plan_a["human_steers"], 1)
+                self.assertEqual(plan_a["self_hosting_grants"], 1)
+                self.assertEqual(plan_a["steering_total"], 2)
+                self.assertEqual(plan_a["human_gates_opened"], 1)
+                self.assertEqual(plan_a["human_gates_resolved"], 1)
+            finally:
+                ralph.RALPH, ralph.USAGE_LEDGER, ralph.EVENTS = old_ralph, old_ledger, old_events
 
     def test_reset_usage_statistics_moves_local_baseline_without_deleting_ledger(self):
         with tempfile.TemporaryDirectory() as td:
@@ -791,6 +824,7 @@ class HumanGateResolutionTests(unittest.TestCase):
             "JOURNAL": ralph.JOURNAL,
             "CONTEXT": ralph.CONTEXT,
             "LIVE": ralph.LIVE,
+            "EVENTS": ralph.EVENTS,
             "init_files": ralph.init_files,
         }
         ralph.STATE = root / "state.json"
@@ -798,8 +832,10 @@ class HumanGateResolutionTests(unittest.TestCase):
         ralph.JOURNAL = root / "journal.md"
         ralph.CONTEXT = root / "context.json"
         ralph.LIVE = root / "live.log"
+        ralph.EVENTS = root / "events.jsonl"
         ralph.JOURNAL.write_text("", encoding="utf-8")
         ralph.LIVE.write_text("", encoding="utf-8")
+        ralph.EVENTS.write_text("", encoding="utf-8")
         ralph.init_files = lambda: None
         return saved
 

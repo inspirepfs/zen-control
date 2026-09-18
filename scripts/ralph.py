@@ -2406,6 +2406,39 @@ def live_write(message: str, category: str = "RALPH") -> None:
     tui.write_event(EVENTS, category, clean)
 
 
+def plan_control_event(
+    state: dict,
+    control_kind: str,
+    message: str,
+    *,
+    step: int | None = None,
+    loop: int | None = None,
+    **data,
+) -> None:
+    """Persist plan-bound human/control activity without relying on current state later.
+
+    Legacy events intentionally remain un-attributed.  Only this explicit schema is
+    consumed by historical per-plan control statistics so old/test-generated generic
+    GATE events can never be guessed onto a plan.
+    """
+    plan_hash_value = str(state.get("plan_hash") or "").strip()
+    if not plan_hash_value:
+        return
+    now = dt.datetime.now(dt.timezone.utc)
+    tui.write_event(
+        EVENTS,
+        "CONTROL",
+        message,
+        schema="zen_ralph_plan_control_v1",
+        epoch=int(now.timestamp()),
+        plan_hash=plan_hash_value,
+        control_kind=str(control_kind),
+        loop=int(state.get("loop_count") or 0) if loop is None else int(loop),
+        step=int(state.get("current_step") or 0) if step is None else int(step),
+        **data,
+    )
+
+
 def _clip(text: str, limit: int = 500) -> str:
     compact = " ".join(str(text).split())
     return compact if len(compact) <= limit else compact[: limit - 3] + "..."
@@ -3966,12 +3999,68 @@ def _usage_breakdown(rows: list[dict], key: str) -> list[dict]:
     return output
 
 
-def _plan_usage_summary(key: str, rows: list[dict], goal: str, current_hash: str) -> dict:
+def _plan_control_stats(*, cutoff_epoch: int = 0) -> dict[str, dict]:
+    """Return only explicitly plan-bound control events.
+
+    Generic historical GATE/AUTHORITY events predate plan binding and may include
+    test output, so they are deliberately ignored instead of being heuristically
+    attributed.
+    """
+    output: dict[str, dict] = {}
+    if not EVENTS.exists():
+        return output
+    for raw in EVENTS.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict) or item.get("schema") != "zen_ralph_plan_control_v1":
+            continue
+        plan = str(item.get("plan_hash") or "").strip()
+        kind = str(item.get("control_kind") or "").strip()
+        try:
+            epoch = int(item.get("epoch") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not plan or not kind or (cutoff_epoch and epoch <= cutoff_epoch):
+            continue
+        stats = output.setdefault(plan, {
+            "control_stats_status": "partial",
+            "human_steers": 0,
+            "self_hosting_grants": 0,
+            "human_gates_opened": 0,
+            "human_gates_resolved": 0,
+        })
+        if kind == "plan_control_baseline":
+            stats["control_stats_status"] = "complete"
+        elif kind == "human_steer":
+            stats["human_steers"] += 1
+        elif kind == "self_hosting_grant":
+            stats["self_hosting_grants"] += 1
+        elif kind == "human_gate_open":
+            stats["human_gates_opened"] += 1
+        elif kind == "human_gate_resolution":
+            stats["human_gates_resolved"] += 1
+    for stats in output.values():
+        stats["steering_total"] = int(stats["human_steers"]) + int(stats["self_hosting_grants"])
+    return output
+
+
+def _plan_usage_summary(key: str, rows: list[dict], goal: str, current_hash: str, control_stats: dict | None = None) -> dict:
     totals = _sum_usage_rows(rows)
     first_epoch = min((int(row.get("epoch") or 0) for row in rows), default=0) or None
     last_epoch = max((int(row.get("epoch") or 0) for row in rows), default=0) or None
     turns = max(1, int(totals.get("turns") or 0))
     models = sorted({str(row.get("model") or "").strip() for row in rows if str(row.get("model") or "").strip()})
+    controls = {
+        "control_stats_status": "legacy",
+        "human_steers": 0,
+        "self_hosting_grants": 0,
+        "human_gates_opened": 0,
+        "human_gates_resolved": 0,
+        "steering_total": 0,
+        **dict(control_stats or {}),
+    }
     return {
         "plan_hash": None if key == "unassigned" else key,
         "current": bool(current_hash and key == current_hash),
@@ -3987,6 +4076,7 @@ def _plan_usage_summary(key: str, rows: list[dict], goal: str, current_hash: str
         "scopes": _usage_breakdown(rows, "scope"),
         "phases": _usage_breakdown(rows, "phase"),
         "steps": _usage_breakdown(rows, "step"),
+        **controls,
         **totals,
     }
 
@@ -3995,6 +4085,7 @@ def usage_ledger_report(state: dict, snapshot: dict | None = None) -> dict:
     """Return reset-aligned token tickers and detailed bounded per-plan consumption."""
     rows = usage_ledger_rows()
     reset_info = usage_stats_reset_info()
+    control_by_plan = _plan_control_stats(cutoff_epoch=usage_stats_reset_epoch())
     current_hash = str(state.get("plan_hash") or "")
     current_rows = [row for row in rows if str(row.get("plan_hash") or "") == current_hash] if current_hash else []
     current = _sum_usage_rows(current_rows)
@@ -4015,7 +4106,13 @@ def usage_ledger_report(state: dict, snapshot: dict | None = None) -> dict:
         group["last_epoch"] = max(int(group.get("last_epoch") or 0), int(row.get("epoch") or 0))
     plans: list[dict] = []
     for key, group in grouped.items():
-        plans.append(_plan_usage_summary(key, list(group["rows"]), str(group.get("goal") or ""), current_hash))
+        plans.append(_plan_usage_summary(
+            key,
+            list(group["rows"]),
+            str(group.get("goal") or ""),
+            current_hash,
+            control_by_plan.get(key),
+        ))
     plans.sort(key=lambda item: (not bool(item.get("current")), -int(item.get("last_epoch") or 0)))
 
     windows: list[dict] = []
@@ -4263,6 +4360,12 @@ def block(state: dict, reason: str) -> None:
     state["status"] = "BLOCKED_HUMAN"
     state["block_reason"] = reason
     save_state(state)
+    plan_control_event(
+        state,
+        "human_gate_open",
+        f"human gate opened {gate_id_for_state(state)}",
+        gate_id=gate_id_for_state(state),
+    )
 
 
 def block_environment(state: dict, reason: str) -> None:
@@ -4416,6 +4519,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     state["step_results"] = []
     state.pop("proposal_previous_state", None)
     save_state(state)
+    plan_control_event(state, "plan_control_baseline", "plan control accounting baseline created", step=0)
     print(tui.box(
         "PLAN APPROVED · RECOVERY CHECKPOINT CREATED",
         [
@@ -4683,6 +4787,14 @@ def cmd_steer(args: argparse.Namespace) -> int:
     state["status"] = "APPROVED"
     state["block_reason"] = None
     save_state(state)
+    plan_control_event(
+        state,
+        "human_steer",
+        f"human steering recorded for {expected_gate}",
+        step=step_no,
+        gate_id=expected_gate,
+        allowed_new_tests=len(allowed_new_tests),
+    )
 
     prior = context_handoff(state)
     findings = list(prior.get("accepted_findings") or [])
@@ -4803,6 +4915,14 @@ def cmd_authorize_self_hosting(args: argparse.Namespace) -> int:
     state["status"] = "APPROVED"
     state["block_reason"] = None
     save_state(state)
+    plan_control_event(
+        state,
+        "self_hosting_grant",
+        f"self-hosting authority granted for {expected_gate}",
+        step=step_no,
+        gate_id=expected_gate,
+        path_count=len(requested),
+    )
     append_journal(
         int(state.get("loop_count") or 0), step_no, "self-hosting-authority", "AUTHORIZED",
         summary=reason, files=sorted(requested),
@@ -4883,6 +5003,13 @@ def cmd_resolve_gate(args: argparse.Namespace) -> int:
     state["current_step"] = int(state["current_step"]) + 1
     state["status"] = "APPROVED"
     save_state(state)
+    plan_control_event(
+        state,
+        "human_gate_resolution",
+        f"human gate resolved {expected_gate}",
+        step=int(step.get("id") or 0),
+        gate_id=expected_gate,
+    )
     live_write(
         f"gate={expected_gate} resolved HUMAN_CONFIRMED; advanced to step={state['current_step']} without Codex retry",
         "GATE",

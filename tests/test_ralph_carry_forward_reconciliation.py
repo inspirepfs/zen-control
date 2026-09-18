@@ -22,7 +22,7 @@ def valid_plan() -> dict:
 
 
 class RepoHarness:
-    PATH_NAMES = ("ROOT", "RALPH", "STATE", "PLAN", "IDEAS", "JOURNAL", "POLICY", "LIVE", "CONTEXT", "EVENTS", "RECOVERY", "REPORTS", "RETIREMENTS")
+    PATH_NAMES = ("ROOT", "RALPH", "STATE", "PLAN", "IDEAS", "JOURNAL", "POLICY", "LIVE", "CONTEXT", "EVENTS", "RECOVERY", "REPORTS", "RETIREMENTS", "USAGE_LEDGER", "USAGE_STATS_RESET")
 
     def __init__(self, test: unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
@@ -40,6 +40,7 @@ class RepoHarness:
         for name, leaf in (("STATE", "state.json"), ("PLAN", "plan.md"), ("IDEAS", "ideas.md"), ("JOURNAL", "journal.md"), ("POLICY", "policy.md"), ("LIVE", "live.log"), ("CONTEXT", "context.json"), ("EVENTS", "events.jsonl")):
             setattr(ralph, name, ralph.RALPH / leaf)
         ralph.RECOVERY = ralph.RALPH / "recovery"; ralph.REPORTS = ralph.RALPH / "reports"; ralph.RETIREMENTS = ralph.RALPH / "retirements"
+        ralph.USAGE_LEDGER = ralph.RALPH / "usage-ledger.jsonl"; ralph.USAGE_STATS_RESET = ralph.RALPH / "usage-stats-reset.json"
         ralph.init_files(); return self
 
     def __exit__(self, *_args):

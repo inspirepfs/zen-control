@@ -37,7 +37,7 @@ def valid_plan() -> dict:
 class RepoHarness:
     PATH_NAMES = (
         "ROOT", "RALPH", "STATE", "PLAN", "IDEAS", "JOURNAL", "POLICY", "LIVE", "CONTEXT",
-        "EVENTS", "RECOVERY", "REPORTS",
+        "EVENTS", "RECOVERY", "REPORTS", "RETIREMENTS", "USAGE_LEDGER", "USAGE_STATS_RESET",
     )
 
     def __init__(self, test: unittest.TestCase):
@@ -71,6 +71,9 @@ class RepoHarness:
         ralph.EVENTS = ralph.RALPH / "events.jsonl"
         ralph.RECOVERY = ralph.RALPH / "recovery"
         ralph.REPORTS = ralph.RALPH / "reports"
+        ralph.RETIREMENTS = ralph.RALPH / "retirements"
+        ralph.USAGE_LEDGER = ralph.RALPH / "usage-ledger.jsonl"
+        ralph.USAGE_STATS_RESET = ralph.RALPH / "usage-stats-reset.json"
         ralph.init_files()
         return self
 
@@ -490,6 +493,10 @@ class EndToEndLifecycleTests(unittest.TestCase):
             self.assertEqual(finished["status"], "READY_TO_COMMIT")
             self.assertEqual(finished["current_step"], 6)
             self.assertEqual(len(finished["step_results"]), 5)
+            ledger_rows = ralph.usage_ledger_rows(include_before_reset=True)
+            self.assertEqual(5, len(ledger_rows))
+            self.assertEqual({digest}, {row.get("plan_hash") for row in ledger_rows})
+            self.assertTrue(all(row.get("input_tokens") == 1000 for row in ledger_rows))
             report_path = ralph.REPORTS / f"{digest[:16]}-summary.md"
             self.assertTrue(report_path.exists())
             report = report_path.read_text(encoding="utf-8")

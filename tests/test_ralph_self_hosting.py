@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -123,15 +124,25 @@ class AuthorizeSelfHostingCommandTests(unittest.TestCase):
             reason="Permit only these tooling paths for this approved repair step.",
         )
         saved = []
-        with (
-            mock.patch.object(ralph, "init_files"),
-            mock.patch.object(ralph, "load_state", return_value=state),
-            mock.patch.object(ralph, "save_state", side_effect=lambda value: saved.append(dict(value))),
-            mock.patch.object(ralph, "gate_id_for_state", return_value="HG-0007-02"),
-            mock.patch.object(ralph, "append_journal"),
-            mock.patch.object(ralph, "live_write"),
-        ):
-            rc = ralph.cmd_authorize_self_hosting(args)
+        with tempfile.TemporaryDirectory() as tmp:
+            isolated_events = Path(tmp) / "events.jsonl"
+            with (
+                mock.patch.object(ralph, "init_files"),
+                mock.patch.object(ralph, "load_state", return_value=state),
+                mock.patch.object(ralph, "save_state", side_effect=lambda value: saved.append(dict(value))),
+                mock.patch.object(ralph, "gate_id_for_state", return_value="HG-0007-02"),
+                mock.patch.object(ralph, "append_journal"),
+                mock.patch.object(ralph, "live_write"),
+                mock.patch.dict(
+                    ralph.plan_control_event.__globals__,
+                    {"EVENTS": isolated_events},
+                ),
+            ):
+                self.assertEqual(
+                    ralph.plan_control_event.__globals__["EVENTS"],
+                    isolated_events,
+                )
+                rc = ralph.cmd_authorize_self_hosting(args)
         return rc, saved
 
     def test_command_records_exact_scoped_grant_and_resumes_same_step(self):
