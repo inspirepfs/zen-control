@@ -75,6 +75,9 @@ USAGE_RESERVE_PERCENT = float(_DEFAULT_EFFICIENCY["reserve_percent"])
 USAGE_APP_SERVER_TIMEOUT_SECONDS = 15
 USAGE_POLL_SECONDS = 300
 USAGE_LEDGER_MAX_ROWS = 20_000
+PLAN_MIN_STEPS_DEFAULT = 5
+PLAN_MAX_STEPS_DEFAULT = 10
+PLAN_MAX_STEPS_LIMIT = 20
 _CODEX_PREFIX: list[str] | None = None
 EXCLUDED_DIRS = ZEN_PROFILE.excluded_dirs
 PROTECTED_PREFIXES = ZEN_PROFILE.protected_prefixes
@@ -88,7 +91,7 @@ PLAN_SCHEMA = {
     "properties": {
         "goal": {"type": "string"},
         "steps": {
-            "type": "array", "minItems": 5, "maxItems": 10,
+            "type": "array", "minItems": 1, "maxItems": PLAN_MAX_STEPS_LIMIT,
             "items": {
                 "type": "object",
                 "properties": {
@@ -101,6 +104,15 @@ PLAN_SCHEMA = {
                 "required": ["id", "title", "objective", "acceptance", "test_change_policy"],
                 "additionalProperties": False,
             },
+        },
+        "planning": {
+            "type": "object",
+            "properties": {
+                "min_steps": {"type": "integer", "minimum": 1, "maximum": PLAN_MAX_STEPS_LIMIT},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": PLAN_MAX_STEPS_LIMIT},
+            },
+            "required": ["min_steps", "max_steps"],
+            "additionalProperties": False,
         },
     },
     "required": ["goal", "steps"],
@@ -144,12 +156,31 @@ def plan_hash(plan: dict) -> str:
     return hashlib.sha256(canonical_plan(plan)).hexdigest()
 
 
+def proposal_step_bounds(min_steps: object = None, max_steps: object = None) -> tuple[int, int]:
+    """Validate operator-selected planning bounds without granting execution authority."""
+    minimum = PLAN_MIN_STEPS_DEFAULT if min_steps is None else int(min_steps)
+    maximum = PLAN_MAX_STEPS_DEFAULT if max_steps is None else int(max_steps)
+    if minimum < 1:
+        raise ValueError("minimum plan steps must be at least 1")
+    if maximum < minimum:
+        raise ValueError("maximum plan steps must be greater than or equal to minimum plan steps")
+    if maximum > PLAN_MAX_STEPS_LIMIT:
+        raise ValueError(f"maximum plan steps must not exceed {PLAN_MAX_STEPS_LIMIT}")
+    return minimum, maximum
+
+
+def plan_step_bounds(plan: dict) -> tuple[int, int]:
+    planning = plan.get("planning") if isinstance(plan, dict) and isinstance(plan.get("planning"), dict) else {}
+    return proposal_step_bounds(planning.get("min_steps"), planning.get("max_steps"))
+
+
 def validate_plan(plan: dict) -> None:
     steps = plan.get("steps") if isinstance(plan, dict) else None
     if not isinstance(plan.get("goal") if isinstance(plan, dict) else None, str) or not plan["goal"].strip():
         raise ValueError("plan goal must be a non-empty string")
-    if not isinstance(steps, list) or not 5 <= len(steps) <= 10:
-        raise ValueError("plan must contain 5-10 steps")
+    minimum, maximum = plan_step_bounds(plan)
+    if not isinstance(steps, list) or not minimum <= len(steps) <= maximum:
+        raise ValueError(f"plan must contain {minimum}-{maximum} steps")
     for index, step in enumerate(steps, 1):
         if step.get("id") != index:
             raise ValueError("plan step ids must be sequential starting at 1")
@@ -165,7 +196,8 @@ def validate_plan(plan: dict) -> None:
 
 def render_plan(plan: dict) -> str:
     digest = plan_hash(plan)
-    lines = ["# RALPH-Lite Approved-Plan Candidate", "", f"**Goal:** {plan['goal']}", f"**Plan SHA-256:** `{digest}`", ""]
+    minimum, maximum = plan_step_bounds(plan)
+    lines = ["# RALPH-Lite Approved-Plan Candidate", "", f"**Goal:** {plan['goal']}", f"**Plan size:** `{minimum}-{maximum}` steps", f"**Plan SHA-256:** `{digest}`", ""]
     for step in plan["steps"]:
         lines += [f"## {step['id']}. {step['title']}", "", step["objective"], "", "Acceptance:"]
         lines += [f"- {item}" for item in step["acceptance"]]
@@ -3217,7 +3249,7 @@ def validate_recovery_paths(paths: Iterable[str], step: dict) -> None:
                 raise RuntimeError(f"blocked-change recovery modifies existing test under add-only policy: {path}")
 
 
-def plan_prompt(goal: str, carry_forward: dict | None = None) -> str:
+def plan_prompt(goal: str, carry_forward: dict | None = None, *, min_steps: int = PLAN_MIN_STEPS_DEFAULT, max_steps: int = PLAN_MAX_STEPS_DEFAULT) -> str:
     carry_forward_text = ""
     if carry_forward:
         carry_forward_text = (
@@ -3235,7 +3267,7 @@ def plan_prompt(goal: str, carry_forward: dict | None = None) -> str:
     return f"""You are planning work for {ZEN_PROFILE.identity} under RALPH-Lite. Inspect the repository read-only.
 Goal: {goal}
 {carry_forward_text}
-Return exactly 5-10 ordered, concrete implementation steps. Keep steps small enough to implement and qualify independently.
+Return between {min_steps} and {max_steps} ordered, concrete implementation steps. Keep steps small enough to implement and qualify independently.
 For each step choose test_change_policy: none, add-only, or modify. Prefer add-only; use modify only when modifying existing tests is genuinely required.
 Use targeted symbol/range reads instead of broad repository ingestion. Avoid reading docs, README, CHANGELOG, or Git history unless directly needed for the goal.
 Do not execute or edit anything. Respect .ralph/policy.md. Put discovered nice-to-have work into later plan steps only if it directly serves the goal; otherwise it belongs in the ideas bucket during execution.
@@ -4255,12 +4287,17 @@ def cmd_propose(args: argparse.Namespace) -> int:
         raise RuntimeError(f"cannot propose while status={state.get('status')}; finish or resolve the current plan first")
     retirement_record_id = str(getattr(args, "from_retirement", "") or "").strip() or None
     carry_forward = None
+    try:
+        min_steps, max_steps = proposal_step_bounds(getattr(args, "min_steps", None), getattr(args, "max_steps", None))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
     goal = str(getattr(args, "goal", "") or "").strip()
     if retirement_record_id:
         manifest, carry_forward = replacement_retirement_context(
             retirement_record_id, retirement_record_digest(state, retirement_record_id)
         )
-        goal = replacement_plan_goal(manifest)
+        if not goal:
+            goal = replacement_plan_goal(manifest)
     if not goal:
         raise RuntimeError("propose requires --goal or --from-retirement")
     try:
@@ -4271,7 +4308,16 @@ def cmd_propose(args: argparse.Namespace) -> int:
     if proposal_guard != "SAFE":
         detail = "; ".join(proposal_findings) or proposal_guard
         raise RuntimeError(f"BLOCKED_INSUFFICIENT_START_RESERVE: {detail}")
-    plan = run_codex(plan_prompt(goal, carry_forward), PLAN_SCHEMA, "read-only", context="REPLACEMENT PLAN PROPOSAL" if carry_forward else "PLAN PROPOSAL")
+    proposal_schema = json.loads(json.dumps(PLAN_SCHEMA))
+    proposal_schema["properties"]["steps"]["minItems"] = min_steps
+    proposal_schema["properties"]["steps"]["maxItems"] = max_steps
+    plan = run_codex(
+        plan_prompt(goal, carry_forward, min_steps=min_steps, max_steps=max_steps),
+        proposal_schema,
+        "read-only",
+        context="REPLACEMENT PLAN PROPOSAL" if carry_forward else "PLAN PROPOSAL",
+    )
+    plan["planning"] = {"min_steps": min_steps, "max_steps": max_steps}
     validate_plan(plan)
     digest = plan_hash(plan)
     if retirement_record_id and secrets.compare_digest(digest, str(manifest["plan_hash"])):
@@ -5565,9 +5611,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init").set_defaults(func=cmd_init)
     propose = sub.add_parser("propose")
-    proposal_source = propose.add_mutually_exclusive_group(required=True)
-    proposal_source.add_argument("--goal")
-    proposal_source.add_argument("--from-retirement", metavar="RT_ID")
+    propose.add_argument("--goal")
+    propose.add_argument("--from-retirement", metavar="RT_ID")
+    propose.add_argument("--min-steps", type=int, default=PLAN_MIN_STEPS_DEFAULT)
+    propose.add_argument("--max-steps", type=int, default=PLAN_MAX_STEPS_DEFAULT)
     propose.set_defaults(func=cmd_propose)
     approve = sub.add_parser("approve")
     approve.add_argument("plan_hash")
