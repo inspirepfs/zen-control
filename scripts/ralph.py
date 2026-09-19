@@ -105,15 +105,6 @@ PLAN_SCHEMA = {
                 "additionalProperties": False,
             },
         },
-        "planning": {
-            "type": "object",
-            "properties": {
-                "min_steps": {"type": "integer", "minimum": 1, "maximum": PLAN_MAX_STEPS_LIMIT},
-                "max_steps": {"type": "integer", "minimum": 1, "maximum": PLAN_MAX_STEPS_LIMIT},
-            },
-            "required": ["min_steps", "max_steps"],
-            "additionalProperties": False,
-        },
     },
     "required": ["goal", "steps"],
     "additionalProperties": False,
