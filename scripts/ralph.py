@@ -1393,6 +1393,84 @@ def retirement_record_id() -> str:
     return f"RT-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:12]}"
 
 
+def restored_retirement_paths_match_checkpoint(
+    state: dict,
+    checkpoint: dict,
+    records: list[dict],
+) -> tuple[bool, str]:
+    """Verify every path recorded by a stranded plan is back at approval state.
+
+    This grants no ownership and performs no restoration. It exists only to
+    prove that an operator has already restored the plan's recorded paths to
+    the controller-owned recovery checkpoint.
+
+    Approval-time dirty/untracked paths are deliberately unsupported here:
+    their provenance is ambiguous and must continue to fail closed.
+    """
+    recovery_ref = str(checkpoint.get("ref") or "")
+    if not recovery_ref:
+        return False, "recovery checkpoint has no Git ref"
+
+    if not secrets.compare_digest(
+        str(checkpoint.get("plan_hash") or ""),
+        str(state.get("plan_hash") or ""),
+    ):
+        return False, "recovery checkpoint belongs to another plan"
+
+    for item in records:
+        path = _retirement_path(str(item.get("path") or ""))
+        baseline = str(item.get("baseline") or "")
+        full = ROOT / path
+
+        status = _git(
+            ["status", "--porcelain=v1", "--untracked-files=all", "--", path],
+            check=False,
+        )
+        if status.returncode != 0:
+            return False, f"cannot determine current status for {path}"
+
+        if baseline == "tracked":
+            if status.stdout:
+                return False, f"tracked path is not clean: {path}"
+            if full.is_symlink() or not full.is_file():
+                return False, f"tracked path is not a regular file: {path}"
+
+            expected = _git(
+                ["rev-parse", f"{recovery_ref}:{path}"],
+                check=False,
+            )
+            current = _git(
+                ["hash-object", "--", path],
+                check=False,
+            )
+
+            expected_oid = expected.stdout.strip()
+            current_oid = current.stdout.strip()
+
+            if (
+                expected.returncode != 0
+                or current.returncode != 0
+                or not expected_oid
+                or not current_oid
+            ):
+                return False, f"cannot fingerprint tracked path: {path}"
+
+            if not secrets.compare_digest(expected_oid, current_oid):
+                return False, f"tracked path differs from approval checkpoint: {path}"
+
+        elif baseline == "absent":
+            if status.stdout or full.exists() or full.is_symlink():
+                return False, f"approval-absent path still exists: {path}"
+
+        else:
+            return False, (
+                f"unsupported approval baseline for restored reconciliation: "
+                f"{path} ({baseline})"
+            )
+
+    return True, "all recorded plan paths match the approval checkpoint"
+
+
 def _retirement_path(path: str) -> str:
     """Canonicalize an artifact path, refusing protected or ambiguous targets."""
     value = _normalize_repo_path(path)
@@ -4638,14 +4716,50 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
     recorded_paths = set(state.get("plan_changed_files") or []) | set(state.get("plan_owned_files") or [])
     records = retirement_path_records(state, recorded_paths)
     unsafe = [item["path"] for item in records if not item["plan_owned"] or item["baseline"] != "absent" or item["unexpected"]]
+
+    reconcile_restored = bool(getattr(args, "reconcile_restored", False))
+    restored_reconciliation = False
+
     if rollback and unsafe:
-        raise RuntimeError(f"retire-plan refuses ambiguous or unowned paths: {unsafe}")
+        if not reconcile_restored:
+            raise RuntimeError(f"retire-plan refuses ambiguous or unowned paths: {unsafe}")
+
+        matched, detail = restored_retirement_paths_match_checkpoint(
+            state,
+            checkpoint,
+            records,
+        )
+        if not matched:
+            raise RuntimeError(
+                f"retire-plan restored reconciliation refused: {detail}; "
+                f"unsafe paths: {unsafe}"
+            )
+
+        restored_reconciliation = True
+
     before = repo_snapshot()
-    delete_paths = [item["path"] for item in records if item["current"] != "missing"]
-    restore_paths: list[str] = []
+
+    if restored_reconciliation:
+        # Operator already restored every recorded plan path to the exact
+        # approval checkpoint. Retirement is therefore intentionally a no-op.
+        delete_paths: list[str] = []
+        restore_paths: list[str] = []
+    else:
+        delete_paths = [
+            item["path"]
+            for item in records
+            if item["current"] != "missing"
+        ]
+        restore_paths: list[str] = []
     if rollback:
         print("ROLLBACK PREVIEW")
         print(f"Recovery checkpoint: {checkpoint['id']} ({recovery_ref})")
+        if restored_reconciliation:
+            print("Reconciliation: RECORDED_PATHS_RESTORED_TO_APPROVAL_CHECKPOINT")
+            print(
+                "Historical unsafe paths: "
+                + (", ".join(sorted(unsafe)) if unsafe else "(none)")
+            )
         print("Restore paths: " + (", ".join(restore_paths) if restore_paths else "(none)"))
         print("Delete paths: " + (", ".join(delete_paths) if delete_paths else "(none)"))
         if str(getattr(args, "confirm", "") or "") != "ROLLBACK":
@@ -5752,6 +5866,11 @@ def build_parser() -> argparse.ArgumentParser:
     disposition.add_argument("--rollback", action="store_true")
     disposition.add_argument("--carry-forward", action="store_true")
     retire.add_argument("--confirm", default=None, help="must be ROLLBACK to execute a rollback")
+    retire.add_argument(
+        "--reconcile-restored",
+        action="store_true",
+        help="permit no-op rollback only when every recorded plan path already matches its approval checkpoint",
+    )
     retire.set_defaults(func=cmd_retire_plan)
     inspect_carry = sub.add_parser("inspect-carry-forward", help="inspect durable carry-forward reconciliation dispositions")
     inspect_carry.add_argument("plan_hash")
