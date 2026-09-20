@@ -316,10 +316,18 @@ def completion_card(report: dict) -> str:
         f"Protected paths {'UNCHANGED' if not authority.get('protected_paths_changed') else 'CHANGED'} · RALPH tooling {'UNCHANGED' if not authority.get('ralph_tooling_changed') else 'CHANGED'}",
         f"Recovery {report.get('recovery_checkpoint') or '-'}",
         f"Report {report.get('markdown_path') or '-'}",
-        f"Suggested commit {clip(report.get('suggested_commit') or '-', 70)}",
-        "READY TO COMMIT" if report.get("status") == "READY_TO_COMMIT" else f"State {report.get('status')}",
-        f"Next: python3 scripts/ralph.py finalize {report.get('plan_hash')} --commit",
     ]
+    if report.get("repository_authority") == "read-only":
+        rows += [
+            "READ-ONLY COMPLETE" if report.get("status") == "READ_ONLY_COMPLETE" else f"State {report.get('status')}",
+            "No commit, push, or reconciliation action is required or permitted.",
+        ]
+    else:
+        rows += [
+            f"Suggested commit {clip(report.get('suggested_commit') or '-', 70)}",
+            "READY TO COMMIT" if report.get("status") == "READY_TO_COMMIT" else f"State {report.get('status')}",
+            f"Next: python3 scripts/ralph.py finalize {report.get('plan_hash')} --commit",
+        ]
     return box(f"RALPH-Lite v{VERSION} · PLAN COMPLETE", rows, width=92, tone="green")
 
 

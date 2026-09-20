@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import argparse
 import json
 import os
 import subprocess
@@ -21,6 +22,7 @@ tui = ralph.tui
 def valid_plan() -> dict:
     return {
         "goal": "Improve ZEN operational analytics",
+        "repository_authority": "write",
         "steps": [
             {
                 "id": i,
@@ -89,10 +91,71 @@ class RepoHarness:
         self.tmp.cleanup()
 
 
+def native_approved_state(
+    *, status: str = "APPROVED", repository_authority: str = "write",
+) -> tuple[dict, dict]:
+    plan = valid_plan()
+    plan["repository_authority"] = repository_authority
+    state = ralph.default_state()
+    state.update({
+        "status": status,
+        "plan_hash": ralph.plan_hash(plan),
+        "plan": plan,
+        "current_step": 1,
+    })
+    ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+    ralph.bind_approved_plan_artifact(state)
+    checkpoint = ralph.create_recovery_checkpoint(state)
+    state["recovery_checkpoint"] = checkpoint["id"]
+    state["approval_repository_evidence"] = checkpoint["repository_evidence"]
+    ralph.save_state(state)
+    return state, checkpoint
+
+
+def accept_native_paths(state: dict, paths: list[str], *, step_no: int = 1, loop: int = 1) -> dict:
+    step = state["plan"]["steps"][step_no - 1]
+    verification = {
+        "schema": "zen_ralph_post_turn_repository_verification_v1",
+        "state": "PASS",
+        "sandbox": "workspace-write",
+        "checkpoint": state["recovery_checkpoint"],
+        "plan_hash": state["plan_hash"],
+        "new_project_delta": list(paths),
+        "changed_approval_residue": [],
+        "current_fingerprints": {path: ralph.retirement_path_fingerprint(path) for path in paths},
+        "loop": loop,
+        "step": step_no,
+    }
+    attribution = ralph.verified_attribution_result(
+        state, step, verification, paths, loop=loop, phase="implement",
+    )
+    ralph.record_accepted_operations(state, attribution)
+    provenance = ralph.strict_native_provenance(
+        state, "test qualification", require_current_delta=True, require_write=True,
+    )
+    state["final_qualification"] = {
+        "state": "PASS",
+        "gates": ["unit-tests=PASS"],
+        "delta_fingerprint": provenance["current_sha256"],
+        "native_provenance_sha256": provenance["binding_sha256"],
+        "completed_at": ralph.utc_now(),
+    }
+    state["status"] = "READY_TO_COMMIT"
+    ralph.save_state(state)
+    return provenance
+
+
 class TuiTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_no_color = os.environ.get("NO_COLOR")
+        os.environ.pop("NO_COLOR", None)
+
     def tearDown(self):
         tui.configure("auto")
-        os.environ.pop("NO_COLOR", None)
+        if self.previous_no_color is None:
+            os.environ.pop("NO_COLOR", None)
+        else:
+            os.environ["NO_COLOR"] = self.previous_no_color
 
     def test_color_coded_file_events(self):
         tui.configure("always")
@@ -168,6 +231,30 @@ class RecoveryCheckpointTests(unittest.TestCase):
             resolved = repo.git("rev-parse", manifest["ref"]).stdout.strip()
             self.assertEqual(resolved, manifest["recovery_oid"])
 
+    def test_checkpoint_evidence_preserves_staged_and_operator_residue(self):
+        with RepoHarness(self) as repo:
+            (repo.root / "deleted.py").write_text("delete_me = True\n", encoding="utf-8")
+            repo.git("add", "deleted.py")
+            repo.git("commit", "-qm", "tracked deletion fixture")
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            (repo.root / "deleted.py").unlink()
+            (repo.root / "created.py").write_text("created = True\n", encoding="utf-8")
+            repo.git("add", "created.py")
+            (repo.root / "operator.txt").write_text("leave me alone\n", encoding="utf-8")
+            state = ralph.default_state()
+            state.update({"plan_hash": "a" * 64, "plan": valid_plan()})
+            manifest = ralph.create_recovery_checkpoint(state)
+            evidence = manifest["repository_evidence"]
+            by_path = {item["path"]: item for item in evidence["tracked_index_worktree"]}
+            self.assertEqual(" ", by_path["app.py"]["index_status"])
+            self.assertEqual("M", by_path["app.py"]["worktree_status"])
+            self.assertEqual("A", by_path["created.py"]["index_status"])
+            self.assertEqual("D", by_path["deleted.py"]["worktree_status"])
+            untracked = {item["path"]: item for item in evidence["untracked_content_fingerprints"]}
+            self.assertTrue(untracked["operator.txt"]["content_fingerprint"])
+            residue = {item["path"]: item for item in evidence["operator_residue"]}
+            self.assertEqual("operator-residue", residue["operator.txt"]["ownership"])
+
     def test_approval_creates_checkpoint_before_execution(self):
         with RepoHarness(self):
             plan = valid_plan()
@@ -181,6 +268,100 @@ class RecoveryCheckpointTests(unittest.TestCase):
             approved = ralph.load_state()
             self.assertEqual(approved["status"], "APPROVED")
             self.assertTrue(approved["recovery_checkpoint"].startswith("RP-"))
+            self.assertEqual(ralph.file_hash(ralph.PLAN), approved["approved_plan_artifact"]["sha256"])
+            self.assertEqual(
+                "zen_ralph_approval_repository_evidence_v1",
+                approved["approval_repository_evidence"]["schema"],
+            )
+            ralph.PLAN.write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "approved plan file changed"):
+                ralph.verify_approved_plan_artifact(approved)
+
+    def test_missing_native_evidence_is_refused_without_replacement(self):
+        with RepoHarness(self):
+            plan = valid_plan()
+            if ralph.REPOSITORY_AUTHORITY_FIELD not in plan:
+                ralph.controller_inject_repository_authority(plan, "write")
+            digest = ralph.plan_hash(plan)
+            state = ralph.default_state()
+            state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan})
+            ralph.save_state(state)
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            self.assertEqual(0, ralph.cmd_approve(type("Args", (), {"plan_hash": digest})()))
+            approved = ralph.load_state()
+            manifest_path = ralph.RECOVERY / approved["recovery_checkpoint"] / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["repository_evidence"] = None
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "structured approval repository evidence"):
+                ralph.verify_approval_execution_evidence(approved)
+            self.assertIsNone(json.loads(manifest_path.read_text(encoding="utf-8"))["repository_evidence"])
+
+    def test_accepted_operations_bind_checkpoint_and_exclude_residue(self):
+        with RepoHarness(self) as repo:
+            (repo.root / "operator.txt").write_text("before approval\n", encoding="utf-8")
+            state = ralph.default_state()
+            plan = valid_plan()
+            state.update({"status": "APPROVED", "plan_hash": ralph.plan_hash(plan), "plan": plan})
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            ralph.bind_approved_plan_artifact(state)
+            checkpoint = ralph.create_recovery_checkpoint(state)
+            state["recovery_checkpoint"] = checkpoint["id"]
+            state["approval_repository_evidence"] = checkpoint["repository_evidence"]
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            (repo.root / "created.py").write_text("created = True\n", encoding="utf-8")
+            (repo.root / "operator.txt").write_text("still operator work\n", encoding="utf-8")
+            attribution = ralph.verified_attribution_result(
+                state, plan["steps"][1], {
+                    "schema": "zen_ralph_post_turn_repository_verification_v1", "state": "PASS", "sandbox": "workspace-write", "checkpoint": checkpoint["id"],
+                    "plan_hash": state["plan_hash"], "new_project_delta": ["app.py", "created.py"], "loop": 7, "step": 2,
+                    "current_fingerprints": {
+                        "app.py": ralph.retirement_path_fingerprint("app.py"),
+                        "created.py": ralph.retirement_path_fingerprint("created.py"),
+                    },
+                }, ["app.py", "created.py", "operator.txt", ".ralph/state.json"], loop=7, phase="implement",
+            )
+            attributed = ralph.record_accepted_operations(state, attribution)
+            self.assertEqual({"app.py", "created.py"}, {item["path"] for item in attributed})
+            self.assertTrue(all(item["plan_hash"] == state["plan_hash"] for item in attributed))
+            self.assertTrue(all(item["schema"] == ralph.OPERATION_ATTRIBUTION_SCHEMA for item in attributed))
+            self.assertTrue(all(item["approval_checkpoint"]["id"] == checkpoint["id"] for item in attributed))
+            self.assertTrue(all(item["approved_plan_artifact"] == state["approved_plan_artifact"] for item in attributed))
+            self.assertTrue(all(item["originating_test_change_policy"] == "modify" for item in attributed))
+            self.assertTrue(all(item["controller_verification"].get("fingerprint") is None for item in attributed))
+            self.assertEqual("tracked", next(item for item in attributed if item["path"] == "app.py")["baseline_kind"])
+            created = next(item for item in attributed if item["path"] == "created.py")
+            self.assertEqual("absent", created["baseline_kind"])
+            self.assertEqual("create", created["operation"])
+            ralph.save_state(state)
+            self.assertEqual(attributed, ralph.load_state()["operation_attributions"])
+
+    def test_proposal_controller_injects_and_persists_repository_authority(self):
+        with RepoHarness(self):
+            model_plan = valid_plan()
+            model_plan.pop(ralph.REPOSITORY_AUTHORITY_FIELD)
+            args = argparse.Namespace(
+                goal="Add bounded controller contract", from_retirement=None,
+                repository_authority="write", min_steps=5, max_steps=5,
+            )
+            usage = {"schema": "zen_codex_usage_v1", "windows": [{"remaining_percent": 100.0}]}
+            with (
+                mock.patch.object(ralph, "query_codex_rate_limits", return_value=usage),
+                mock.patch.object(ralph, "codex_usage_guard", return_value=("SAFE", [])),
+                mock.patch.object(ralph, "run_codex", return_value=model_plan) as run,
+            ):
+                self.assertEqual(ralph.cmd_propose(args), 0)
+            proposed = ralph.load_state()
+            self.assertEqual(proposed["plan"][ralph.REPOSITORY_AUTHORITY_FIELD], "write")
+            self.assertEqual(proposed["plan_hash"], ralph.plan_hash(proposed["plan"]))
+            self.assertIn("Repository authority:** `write`", ralph.PLAN.read_text(encoding="utf-8"))
+            self.assertNotIn(ralph.REPOSITORY_AUTHORITY_FIELD, run.call_args.args[1]["properties"])
+
+    def test_proposal_refuses_missing_controller_repository_authority(self):
+        with RepoHarness(self):
+            args = argparse.Namespace(goal="Missing contract", from_retirement=None, repository_authority=None, min_steps=5, max_steps=5)
+            with self.assertRaisesRegex(RuntimeError, "--repository-authority"):
+                ralph.cmd_propose(args)
 
     def test_preexisting_staged_change_blocks_automated_commit(self):
         with RepoHarness(self) as repo:
@@ -201,8 +382,11 @@ class PlanOwnedTestPolicyTests(unittest.TestCase):
         plan["steps"][0]["test_change_policy"] = policy
         state = ralph.default_state()
         state.update({"status": "APPROVED", "plan_hash": ralph.plan_hash(plan), "plan": plan, "current_step": 1})
+        ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+        ralph.bind_approved_plan_artifact(state)
         checkpoint = ralph.create_recovery_checkpoint(state)
         state["recovery_checkpoint"] = checkpoint["id"]
+        state["approval_repository_evidence"] = checkpoint["repository_evidence"]
         ralph.save_state(state)
         return state
 
@@ -253,13 +437,12 @@ class PlanOwnedTestPolicyTests(unittest.TestCase):
                 ["tests/test_user.py"],
             )
 
-    def test_remember_plan_files_marks_new_path_plan_owned(self):
+    def test_remember_plan_files_refuses_unattributed_path(self):
         with RepoHarness(self) as repo:
             state = self._state_with_checkpoint(repo)
             (repo.root / "new.py").write_text("x = 1\n", encoding="utf-8")
-            ralph.remember_plan_files(state, ["new.py"])
-            self.assertIn("new.py", state["plan_owned_files"])
-            self.assertTrue(ralph.plan_owned_path(state, "new.py"))
+            with self.assertRaisesRegex(RuntimeError, "validated native operation attribution"):
+                ralph.remember_plan_files(state, ["new.py"])
 
     def test_changed_python_symbols_are_named(self):
         with RepoHarness(self) as repo:
@@ -270,6 +453,235 @@ class PlanOwnedTestPolicyTests(unittest.TestCase):
             module.write_text("def thing():\n    return 2\n", encoding="utf-8")
             entries = ralph.change_entries(["module.py"])
             self.assertIn("thing()", entries[0]["symbols"])
+
+
+class NativeAttributionTests(unittest.TestCase):
+    def _approved_state(self, repo):
+        plan = valid_plan()
+        state = ralph.default_state()
+        state.update({"status": "APPROVED", "plan_hash": ralph.plan_hash(plan), "plan": plan, "current_step": 1})
+        ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+        ralph.bind_approved_plan_artifact(state)
+        checkpoint = ralph.create_recovery_checkpoint(state)
+        state["recovery_checkpoint"] = checkpoint["id"]
+        state["approval_repository_evidence"] = checkpoint["repository_evidence"]
+        return state, checkpoint
+
+    def _verification(self, state, checkpoint, *, sandbox="read-only", paths=()):
+        evidence = {
+            "schema": "zen_ralph_post_turn_repository_verification_v1",
+            "state": "PASS", "sandbox": sandbox, "checkpoint": checkpoint["id"],
+            "plan_hash": state["plan_hash"], "new_project_delta": list(paths),
+            "current_fingerprints": {path: ralph.retirement_path_fingerprint(path) for path in paths},
+            "changed_approval_residue": [], "loop": 4, "step": 1, "recorded_at": "2026-09-20T00:00:00+00:00",
+        }
+        evidence["fingerprint"] = ralph._evidence_digest({key: value for key, value in evidence.items() if key != "fingerprint"})
+        return evidence
+
+    def test_read_only_zero_delta_creates_no_attribution_or_ownership(self):
+        with RepoHarness(self) as repo:
+            state, checkpoint = self._approved_state(repo)
+            attribution = ralph.verified_attribution_result(
+                state, state["plan"]["steps"][0], self._verification(state, checkpoint), [], loop=4, phase="implement",
+            )
+            self.assertEqual([], ralph.record_accepted_operations(state, attribution))
+            self.assertEqual([], state["operation_attributions"])
+            self.assertEqual([], state["plan_changed_files"])
+            self.assertEqual([], state["plan_owned_files"])
+
+    def test_stale_origin_test_policy_and_duplicate_records_fail_closed(self):
+        with RepoHarness(self) as repo:
+            state, checkpoint = self._approved_state(repo)
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            verification = self._verification(state, checkpoint, sandbox="workspace-write", paths=["app.py"])
+            attribution = ralph.verified_attribution_result(
+                state, state["plan"]["steps"][0], verification, ["app.py"], loop=4, phase="implement",
+            )
+            ralph.record_accepted_operations(state, attribution)
+            stale = dict(state["operation_attributions"][0])
+            stale["originating_test_change_policy"] = "none"
+            stale["record_sha256"] = ralph._operation_record_hash(stale)
+            state["operation_attributions"] = [stale]
+            with self.assertRaisesRegex(RuntimeError, "originating test policy"):
+                ralph.validated_plan_paths(state)
+
+            state["operation_attributions"] = []
+            ralph.record_accepted_operations(state, attribution)
+            with self.assertRaisesRegex(RuntimeError, "duplicate operation attribution"):
+                ralph.record_accepted_operations(state, attribution)
+            self.assertEqual(1, len(state["operation_attributions"]))
+
+    def test_current_fingerprint_and_altered_origin_step_fail_closed(self):
+        with RepoHarness(self) as repo:
+            state, checkpoint = self._approved_state(repo)
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            attribution = ralph.verified_attribution_result(
+                state, state["plan"]["steps"][0],
+                self._verification(state, checkpoint, sandbox="workspace-write", paths=["app.py"]),
+                ["app.py"], loop=4, phase="implement",
+            )
+            ralph.record_accepted_operations(state, attribution)
+            original = dict(state["operation_attributions"][0])
+            record = dict(original)
+            record["current_fingerprint"] = {"kind": "missing"}
+            record["operation"] = "delete"
+            record["record_sha256"] = ralph._operation_record_hash(record)
+            state["operation_attributions"] = [record]
+            with self.assertRaisesRegex(RuntimeError, "current fingerprint evidence is stale or altered"):
+                ralph.validated_plan_paths(state)
+
+            record = dict(original)
+            record["originating_step"] = {"id": 99}
+            record["record_sha256"] = ralph._operation_record_hash(record)
+            state["operation_attributions"] = [record]
+            with self.assertRaisesRegex(RuntimeError, "missing or ambiguous approved-step origin"):
+                ralph.validated_plan_paths(state)
+
+    def test_altered_self_hosting_grant_evidence_fails_closed(self):
+        with RepoHarness(self) as repo:
+            state, checkpoint = self._approved_state(repo)
+            path = "scripts/ralph.py"
+            (repo.root / path).parent.mkdir(exist_ok=True)
+            (repo.root / path).write_text("controller = 2\n", encoding="utf-8")
+            grant = {"plan_hash": state["plan_hash"], "step": 1, "gate_id": "HG-test", "paths": [path], "reason": "test", "granted_at": "2026-09-20T00:00:00+00:00"}
+            state["self_hosting_grant"] = dict(grant)
+            state["self_hosting_grant_history"] = [dict(grant)]
+            attribution = ralph.verified_attribution_result(
+                state, state["plan"]["steps"][0], self._verification(state, checkpoint, sandbox="workspace-write", paths=[path]), [path], loop=4, phase="implement",
+            )
+            ralph.record_accepted_operations(state, attribution)
+            state["self_hosting_grant_history"][0]["reason"] = "altered"
+            with self.assertRaisesRegex(RuntimeError, "self-hosting grant is missing or altered"):
+                ralph.validated_plan_paths(state)
+
+
+class SelfUpgradeRecoveryTests(unittest.TestCase):
+    def _approve(self, repo):
+        plan = valid_plan()
+        digest = ralph.plan_hash(plan)
+        state = ralph.default_state()
+        state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan})
+        ralph.save_state(state)
+        ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+        self.assertEqual(ralph.cmd_approve(type("Args", (), {"plan_hash": digest})()), 0)
+        return ralph.load_state()
+
+    @staticmethod
+    def _grant(state, step, paths, gate):
+        return {
+            "plan_hash": state["plan_hash"], "step": step, "gate_id": gate, "paths": list(paths),
+            "reason": "test recovery grant", "granted_at": f"2026-09-20T0{step}:00:00+00:00",
+        }
+
+    def test_approval_clears_foreign_operation_ledger(self):
+        with RepoHarness(self):
+            plan = valid_plan()
+            digest = ralph.plan_hash(plan)
+            state = ralph.default_state()
+            state.update({
+                "status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan,
+                "operation_attributions": [{"schema": "foreign", "plan_hash": "old"}],
+                "pending_step_delta_paths": {"step": 9, "paths": ["old.py"]},
+            })
+            ralph.save_state(state)
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            self.assertEqual(ralph.cmd_approve(type("Args", (), {"plan_hash": digest})()), 0)
+            approved = ralph.load_state()
+            self.assertEqual([], approved["operation_attributions"])
+            self.assertEqual([], approved["pending_step_delta_paths"])
+
+    def test_operator_recovery_converts_current_v1_drops_foreign_and_leaves_bootstrap_pending(self):
+        with RepoHarness(self) as repo:
+            for path in ("scripts/ralph.py", "tests/test_ralph_lifecycle.py", "tests/test_ralph_lite.py"):
+                target = repo.root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("baseline\n", encoding="utf-8")
+            repo.git("add", "scripts/ralph.py", "tests/test_ralph_lifecycle.py", "tests/test_ralph_lite.py")
+            repo.git("commit", "-qm", "tooling baseline")
+
+            state = self._approve(repo)
+            checkpoint = state["recovery_checkpoint"]
+            g1 = self._grant(state, 1, ["scripts/ralph.py", "tests/test_ralph_lifecycle.py", "tests/test_ralph_lite.py"], "HG-0001-01")
+            g2 = self._grant(state, 2, ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"], "HG-0002-02")
+            g3 = self._grant(state, 3, ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"], "HG-0003-03")
+
+            script = repo.root / "scripts/ralph.py"
+            lifecycle = repo.root / "tests/test_ralph_lifecycle.py"
+            lite = repo.root / "tests/test_ralph_lite.py"
+            script.write_text("accepted step 2\n", encoding="utf-8")
+            historical_script_fp = ralph.retirement_path_fingerprint("scripts/ralph.py")
+            lifecycle.write_text("accepted step 2\n", encoding="utf-8")
+            lite.write_text("accepted step 1\n", encoding="utf-8")
+            # The BIG PATCH itself is current-Step-3 bootstrap content and must
+            # stay pending rather than being retroactively assigned to Step 2.
+            script.write_text("accepted step 2\noperator bootstrap step 3\n", encoding="utf-8")
+            lifecycle.write_text("accepted step 2\noperator bootstrap step 3\n", encoding="utf-8")
+
+            state.update({
+                "status": "RUNNING", "current_step": 3, "loop_count": 204,
+                "self_hosting_grant_history": [g1, g2, g3], "self_hosting_grant": g3,
+                "step_results": [
+                    {"step": 1, "result": "PASS", "files": ["scripts/ralph.py"], "attribution": {"loop": 197}},
+                    {"step": 2, "result": "PASS", "files": ["scripts/ralph.py"], "attribution": {"loop": 202}},
+                ],
+                "operation_attributions": [
+                    {"schema": "zen_ralph_operation_attribution_v1", "plan_hash": "f" * 64, "path": "scripts/ralph.py"},
+                    {
+                        "schema": "zen_ralph_operation_attribution_v1", "plan_hash": state["plan_hash"],
+                        "checkpoint": checkpoint, "loop": 202, "step": state["plan"]["steps"][1],
+                        "path": "scripts/ralph.py", "baseline_kind": "tracked", "operation": "edit",
+                        "current_fingerprint": historical_script_fp, "phase": "repair",
+                    },
+                ],
+            })
+            ralph.save_state(state)
+            args = type("Args", (), {
+                "plan_hash": state["plan_hash"], "checkpoint": checkpoint, "confirm": "RECOVER",
+                "pending_path": ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"],
+            })()
+            self.assertEqual(ralph.cmd_recover_self_upgrade(args), 0)
+
+            recovered = ralph.load_state()
+            self.assertEqual("APPROVED", recovered["status"])
+            self.assertEqual(3, recovered["current_step"])
+            self.assertEqual(204, recovered["loop_count"])
+            self.assertEqual(g3, recovered["self_hosting_grant"])
+            self.assertEqual(
+                ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"],
+                recovered["pending_step_delta_paths"]["paths"],
+            )
+            self.assertTrue(all(item["schema"] == ralph.OPERATION_ATTRIBUTION_SCHEMA for item in recovered["operation_attributions"]))
+            self.assertTrue(all(item["plan_hash"] == state["plan_hash"] for item in recovered["operation_attributions"]))
+            self.assertEqual(["tests/test_ralph_lite.py"], ralph.current_attributed_paths(recovered))
+
+            verification = ralph.verify_post_turn_repository_state(
+                recovered, recovered["plan"]["steps"][2], "workspace-write", [],
+            )
+            attribution = ralph.verified_attribution_result(
+                recovered, recovered["plan"]["steps"][2],
+                verification | {
+                    "current_fingerprints": {
+                        path: ralph.retirement_path_fingerprint(path)
+                        for path in verification["new_project_delta"]
+                    },
+                },
+                [], loop=205, phase="repair",
+            )
+            self.assertEqual(
+                ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"],
+                attribution["paths"],
+            )
+
+    def test_unhandled_run_exception_never_leaves_running_state(self):
+        with RepoHarness(self):
+            state = ralph.default_state()
+            state.update({"status": "RUNNING", "plan_hash": "a" * 64, "current_step": 3})
+            ralph.save_state(state)
+            args = type("Args", (), {"command": "run"})()
+            ralph._fail_closed_unhandled_run_exception(args, RuntimeError("boom"))
+            blocked = ralph.load_state()
+            self.assertEqual("BLOCKED_HUMAN", blocked["status"])
+            self.assertIn("controller runtime exception: boom", blocked["block_reason"])
 
 
 class SteerTests(unittest.TestCase):
@@ -369,41 +781,72 @@ class SteerTests(unittest.TestCase):
                 ralph.cmd_steer(args)
 
 
-class FinalizationTests(unittest.TestCase):
-    def ready_state(self, checkpoint: dict) -> dict:
-        plan = valid_plan()
-        digest = ralph.plan_hash(plan)
-        state = ralph.default_state()
-        state.update({
-            "status": "READY_TO_COMMIT",
-            "plan_hash": digest,
-            "plan": plan,
-            "current_step": 6,
-            "recovery_checkpoint": checkpoint["id"],
-            "plan_changed_files": ["app.py"],
-            "step_results": [
-                {"step": i, "title": f"Step {i}", "result": "PASS", "summary": "ok", "files": [], "gates": [], "stats": {}}
-                for i in range(1, 6)
-            ],
-            "final_qualification": {"state": "PASS", "gates": ["unit-tests=PASS"]},
-        })
-        return state
+class StrictNativeProvenanceTests(unittest.TestCase):
+    def test_spoofed_filename_projection_never_changes_native_scope(self):
+        with RepoHarness(self) as repo:
+            state, _checkpoint = native_approved_state()
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            provenance = accept_native_paths(state, ["app.py"])
+            state = ralph.load_state()
+            state["plan_changed_files"] = ["surprise.py"]
+            derived = ralph.strict_native_provenance(
+                state, "spoof test", require_current_delta=True, require_write=True,
+            )
+            self.assertEqual(["app.py"], derived["new_plan_paths"])
+            self.assertEqual(provenance["binding_sha256"], derived["binding_sha256"])
 
+            reconciled = ralph._reconciled_provenance_guard(state, "spoofed reconciliation")
+            self.assertEqual(["app.py"], reconciled["new_plan_paths"])
+            self.assertEqual(provenance["binding_sha256"], reconciled["native_provenance_sha256"])
+
+    def test_stale_current_fingerprint_and_qualification_binding_fail_closed(self):
+        with RepoHarness(self) as repo:
+            state, _checkpoint = native_approved_state()
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            accept_native_paths(state, ["app.py"])
+            state = ralph.load_state()
+            state["final_qualification"]["native_provenance_sha256"] = "0" * 64
+            qualified, reason = ralph.qualified_delta_matches(state)
+            self.assertFalse(qualified)
+            self.assertIn("binding", reason)
+            state = ralph.load_state()
+            (repo.root / "app.py").write_text("value = 3\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "fingerprint is stale or altered"):
+                ralph.strict_native_provenance(
+                    state, "stale test", require_current_delta=True, require_write=True,
+                )
+
+    def test_altered_reconciliation_evidence_fails_closed(self):
+        with RepoHarness(self) as repo:
+            state, _checkpoint = native_approved_state()
+            (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            accept_native_paths(state, ["app.py"])
+            state = ralph.load_state()
+            record = dict(state["operation_attributions"][0])
+            record["reconciliation_evidence"] = {
+                "schema": "zen_ralph_operation_reconciliation_v1",
+                "state": "replacement",
+                "snapshot": {"candidates": ["forged"]},
+            }
+            record["record_sha256"] = ralph._operation_record_hash(record)
+            state["operation_attributions"] = [record]
+            with self.assertRaisesRegex(RuntimeError, "reconciliation evidence is stale or altered"):
+                ralph.strict_native_provenance(
+                    state, "tampered reconciliation", require_current_delta=True, require_write=True,
+                )
+
+
+class FinalizationTests(unittest.TestCase):
     def test_safe_plan_delta_can_be_committed(self):
         with RepoHarness(self) as repo:
-            bootstrap = ralph.default_state()
-            bootstrap.update({"plan_hash": "c" * 64, "plan": valid_plan()})
-            checkpoint = ralph.create_recovery_checkpoint(bootstrap)
+            state, _checkpoint = native_approved_state()
             (repo.root / "app.py").write_text("value = 3\n", encoding="utf-8")
-            state = self.ready_state(checkpoint)
-            # The checkpoint belongs to the test plan for guard purposes.
-            manifest_path = ralph.RECOVERY / checkpoint["id"] / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["plan_hash"] = state["plan_hash"]
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            ralph.save_state(state)
-            ralph.PLAN.write_text(ralph.render_plan(state["plan"]), encoding="utf-8")
-            rc = ralph.cmd_finalize(type("Args", (), {"plan_hash": state["plan_hash"], "commit": True, "push": False, "message": "test: ralph commit"})())
+            accept_native_paths(state, ["app.py"])
+            args = type("Args", (), {
+                "plan_hash": state["plan_hash"], "commit": True, "push": False,
+                "message": "test: ralph commit",
+            })()
+            rc = ralph.cmd_finalize(args)
             self.assertEqual(rc, 0)
             committed = ralph.load_state()
             self.assertEqual(committed["status"], "COMMITTED")
@@ -411,22 +854,20 @@ class FinalizationTests(unittest.TestCase):
 
     def test_unexpected_delta_blocks_commit(self):
         with RepoHarness(self) as repo:
-            bootstrap = ralph.default_state()
-            bootstrap.update({"plan_hash": "d" * 64, "plan": valid_plan()})
-            checkpoint = ralph.create_recovery_checkpoint(bootstrap)
+            state, _checkpoint = native_approved_state()
             (repo.root / "app.py").write_text("value = 4\n", encoding="utf-8")
+            accept_native_paths(state, ["app.py"])
             (repo.root / "surprise.txt").write_text("external\n", encoding="utf-8")
-            state = self.ready_state(checkpoint)
-            with self.assertRaisesRegex(RuntimeError, r"^UNEXPECTED_DELTA: \['surprise.txt'\]$"):
+            state = ralph.load_state()
+            with self.assertRaisesRegex(RuntimeError, "native provenance delta mismatch"):
                 ralph._finalization_guard(state)
 
     def test_completion_report_is_commit_ready_summary(self):
         with RepoHarness(self) as repo:
-            bootstrap = ralph.default_state()
-            bootstrap.update({"plan_hash": "e" * 64, "plan": valid_plan()})
-            checkpoint = ralph.create_recovery_checkpoint(bootstrap)
+            state, _checkpoint = native_approved_state()
             (repo.root / "app.py").write_text("value = 5\n", encoding="utf-8")
-            state = self.ready_state(checkpoint)
+            accept_native_paths(state, ["app.py"])
+            state = ralph.load_state()
             state["completion_changes"] = {
                 "entries": [{"action": "EDIT", "path": "app.py", "added": 1, "removed": 1, "symbols": []}],
                 "files": 1, "added": 1, "removed": 1,
@@ -437,6 +878,90 @@ class FinalizationTests(unittest.TestCase):
             self.assertIn("Final qualification", text)
             self.assertIn("Recovery checkpoint", text)
             self.assertIn("EDIT `app.py` +1/-1", text)
+
+
+    def test_read_only_zero_delta_reaches_distinct_non_commit_terminal(self):
+        with RepoHarness(self) as repo:
+            state, _checkpoint = native_approved_state(repository_authority="read-only")
+            state["current_step"] = 6
+            state["step_results"] = [
+                {"step": i, "title": f"Step {i}", "result": "PASS", "stats": {}}
+                for i in range(1, 6)
+            ]
+            ralph.save_state(state)
+            with (
+                mock.patch.object(ralph, "run_final_qualification", return_value=(
+                    True, ["unit-tests=PASS"], {}, "",
+                )),
+                mock.patch.object(ralph, "query_codex_rate_limits", return_value={}),
+            ):
+                self.assertEqual(ralph.finalize_completed_plan(state), 0)
+
+            finished = ralph.load_state()
+            self.assertEqual("READ_ONLY_COMPLETE", finished["status"])
+            self.assertEqual([], finished["operation_attributions"])
+            self.assertEqual([], finished["plan_changed_files"])
+            self.assertEqual([], finished["plan_owned_files"])
+            self.assertEqual(0, finished["completion_changes"]["files"])
+            self.assertEqual("PASS", finished["final_qualification"]["state"])
+            self.assertIsNotNone(finished["final_qualification"]["native_provenance_sha256"])
+            report = ralph.build_completion_report(finished, ["unit-tests=PASS"])
+            self.assertIsNone(report["suggested_commit"])
+            text = (repo.root / report["markdown_path"]).read_text(encoding="utf-8")
+            self.assertIn("READ_ONLY_COMPLETE", text)
+            self.assertIn("Commit/push/reconciliation: prohibited", text)
+            self.assertNotIn("Suggested commit", text)
+            self.assertNotIn("finalize ", text)
+
+    def test_read_only_checkpoint_delta_blocks_before_commit_capable_state(self):
+        with RepoHarness(self) as repo:
+            state, _checkpoint = native_approved_state(repository_authority="read-only")
+            (repo.root / "app.py").write_text("value = 99\n", encoding="utf-8")
+            state["current_step"] = 6
+            ralph.save_state(state)
+            with (
+                mock.patch.object(ralph, "run_final_qualification", return_value=(
+                    True, ["unit-tests=PASS"], {}, "",
+                )),
+                mock.patch.object(ralph, "query_codex_rate_limits", return_value={}),
+            ):
+                self.assertEqual(ralph.finalize_completed_plan(state), 2)
+
+            blocked = ralph.load_state()
+            self.assertEqual("BLOCKED_HUMAN", blocked["status"])
+            self.assertIn("read-only provenance has repository delta", blocked["block_reason"])
+            self.assertNotEqual("READY_TO_COMMIT", blocked["status"])
+
+    def test_read_only_terminal_explicitly_rejects_write_finalization_paths(self):
+        with RepoHarness(self):
+            state, _checkpoint = native_approved_state(
+                status="READ_ONLY_COMPLETE", repository_authority="read-only",
+            )
+            ralph.save_state(state)
+            plan_hash_value = state["plan_hash"]
+
+            for commit, push, label in (
+                (False, False, "finalize review"),
+                (True, False, "finalize --commit"),
+                (False, True, "finalize --push"),
+            ):
+                args = type("Args", (), {
+                    "plan_hash": plan_hash_value, "commit": commit, "push": push, "message": None,
+                })()
+                with self.assertRaisesRegex(RuntimeError, rf"{label}.*READ_ONLY_COMPLETE"):
+                    ralph.cmd_finalize(args)
+
+            with self.assertRaisesRegex(RuntimeError, "requalify.*READ_ONLY_COMPLETE"):
+                ralph.cmd_requalify(type("Args", (), {"plan_hash": plan_hash_value})())
+            with self.assertRaisesRegex(RuntimeError, "reconcile-commit.*READ_ONLY_COMPLETE"):
+                ralph.cmd_reconcile_commit(type("Args", (), {
+                    "plan_hash": plan_hash_value, "commit": "deadbeef", "reason": "not allowed",
+                })())
+            with self.assertRaisesRegex(RuntimeError, "reconcile-push.*READ_ONLY_COMPLETE"):
+                ralph.cmd_reconcile_push(type("Args", (), {"plan_hash": plan_hash_value})())
+
+
+
 
 
 class EndToEndLifecycleTests(unittest.TestCase):
@@ -506,6 +1031,267 @@ class EndToEndLifecycleTests(unittest.TestCase):
 
 
 
+    def test_all_green_read_only_plan_finishes_without_commit_state(self):
+        with RepoHarness(self):
+            plan = valid_plan()
+            plan["repository_authority"] = "read-only"
+            digest = ralph.plan_hash(plan)
+            state = ralph.default_state()
+            state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan})
+            ralph.save_state(state)
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            self.assertEqual(ralph.cmd_approve(type("Args", (), {"plan_hash": digest})()), 0)
+
+            counter = {"n": 0}
+
+            def fake_codex(_prompt, _schema, sandbox, **_kwargs):
+                self.assertEqual("read-only", sandbox)
+                counter["n"] += 1
+                return {
+                    "summary": f"inspected step {counter['n']}",
+                    "blocker_class": "none",
+                    "needs_human": False,
+                    "blockers": [],
+                    "validation_notes": [],
+                    "ideas": [],
+                    "context": {"files_inspected": ["app.py"], "relevant_files": ["app.py"], "accepted_findings": []},
+                    "_ralph_metrics": {
+                        "commands_executed": 1,
+                        "input_tokens": 100,
+                        "cached_input_tokens": 80,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 5,
+                    },
+                }
+
+            args = type("Args", (), {
+                "max_loops": 10,
+                "wait_for_limits": False,
+                "usage_poll_seconds": 300,
+                "color": "never",
+                "efficiency_mode": None,
+            })()
+            with (
+                mock.patch.object(ralph, "ensure_codex_usage_capacity", return_value=True),
+                mock.patch.object(ralph, "run_codex", side_effect=fake_codex),
+                mock.patch.object(ralph, "run_gates", return_value=(True, ["unit-tests=PASS"], None, "", {})),
+                mock.patch.object(ralph, "run_final_qualification", return_value=(
+                    True, ["unit-tests=PASS", "public-audit=PASS"], {}, "",
+                )),
+                mock.patch.object(ralph, "query_codex_rate_limits", return_value={}),
+            ):
+                self.assertEqual(ralph.cmd_run(args), 0)
+
+            finished = ralph.load_state()
+            self.assertEqual("READ_ONLY_COMPLETE", finished["status"])
+            self.assertEqual(6, finished["current_step"])
+            self.assertEqual(5, len(finished["step_results"]))
+            self.assertEqual([], finished["operation_attributions"])
+            self.assertEqual([], finished["plan_changed_files"])
+            self.assertEqual([], finished["plan_owned_files"])
+            self.assertEqual(0, finished["completion_changes"]["files"])
+            report_path = ralph.REPORTS / f"{digest[:16]}-summary.md"
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("READ_ONLY_COMPLETE", report)
+            self.assertNotIn("Suggested commit", report)
+
+
+class RunLoopSandboxVerificationTests(unittest.TestCase):
+    def _approved_state(self, plan: dict) -> None:
+        digest = ralph.plan_hash(plan)
+        state = ralph.default_state()
+        state.update({"status": "AWAITING_APPROVAL", "plan_hash": digest, "plan": plan})
+        ralph.save_state(state)
+        ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+        self.assertEqual(ralph.cmd_approve(type("Args", (), {"plan_hash": digest})()), 0)
+
+    @staticmethod
+    def _args():
+        return type("Args", (), {
+            "max_loops": 1, "wait_for_limits": False, "usage_poll_seconds": 300,
+            "color": "never", "efficiency_mode": None,
+        })()
+
+    def test_run_refuses_missing_checkpoint_without_bootstrapping_replacement(self):
+        with RepoHarness(self):
+            plan = valid_plan()
+            plan["repository_authority"] = "write"
+            self._approved_state(plan)
+            state = ralph.load_state()
+            artifact = dict(state["approved_plan_artifact"])
+            state.pop("recovery_checkpoint")
+            ralph.save_state(state)
+            with mock.patch.object(ralph, "run_codex") as run_codex:
+                with self.assertRaisesRegex(RuntimeError, "approval recovery checkpoint is missing or invalid"):
+                    ralph.cmd_run(self._args())
+            blocked = ralph.load_state()
+            run_codex.assert_not_called()
+            self.assertNotIn("recovery_checkpoint", blocked)
+            self.assertEqual(artifact, blocked["approved_plan_artifact"])
+
+    def test_recovery_refuses_missing_artifact_without_bootstrapping_replacement(self):
+        with RepoHarness(self):
+            plan = valid_plan()
+            plan["repository_authority"] = "write"
+            self._approved_state(plan)
+            state = ralph.load_state()
+            state.update({"status": "BLOCKED_HUMAN", "block_reason": "validation failed"})
+            state.pop("approved_plan_artifact")
+            ralph.save_state(state)
+            args = type("Args", (), {"plan_hash": state["plan_hash"]})()
+            with mock.patch.object(ralph, "run_gates") as gates:
+                with self.assertRaisesRegex(RuntimeError, "approved plan artifact binding is missing"):
+                    ralph.cmd_recover_validation_block(args)
+            blocked = ralph.load_state()
+            gates.assert_not_called()
+            self.assertNotIn("approved_plan_artifact", blocked)
+
+    @staticmethod
+    def _result() -> dict:
+        return {
+            "summary": "bounded implementation result",
+            "ideas": [], "context": {"files_inspected": [], "relevant_files": [], "accepted_findings": []},
+        }
+
+    def test_read_only_sandbox_refuses_checkpoint_delta_before_continuation(self):
+        with RepoHarness(self) as repo:
+            operator = repo.root / "operator.txt"
+            operator.write_text("operator residue\n", encoding="utf-8")
+            plan = valid_plan()
+            plan["repository_authority"] = "read-only"
+            self._approved_state(plan)
+            events: list[str] = []
+            original_verify = ralph.verify_post_turn_repository_state
+
+            def fake_codex(_prompt, _schema, sandbox, **_kwargs):
+                events.append(f"codex:{sandbox}")
+                (repo.root / "app.py").write_text("model delta\n", encoding="utf-8")
+                return self._result()
+
+            def tracked_verify(*args, **kwargs):
+                events.append("verify")
+                return original_verify(*args, **kwargs)
+
+            with (
+                mock.patch.object(ralph, "ensure_codex_usage_capacity", return_value=True),
+                mock.patch.object(ralph, "run_codex", side_effect=fake_codex),
+                mock.patch.object(ralph, "verify_post_turn_repository_state", side_effect=tracked_verify),
+                mock.patch.object(ralph, "codex_requests_continuation") as continuation,
+                mock.patch.object(ralph, "run_gates") as gates,
+            ):
+                self.assertEqual(ralph.cmd_run(self._args()), 2)
+
+            self.assertEqual(events, ["codex:read-only", "verify"])
+            continuation.assert_not_called()
+            gates.assert_not_called()
+            self.assertEqual(operator.read_text(encoding="utf-8"), "operator residue\n")
+            blocked = ralph.load_state()
+            self.assertEqual(blocked["last_post_turn_verification"]["state"], "REFUSED")
+            self.assertIn("READ_ONLY_CHECKPOINT_DELTA", blocked["block_reason"])
+            self.assertEqual([], blocked["plan_changed_files"])
+            self.assertEqual([], blocked["plan_owned_files"])
+            self.assertEqual([], blocked["operation_attributions"])
+
+    def test_write_sandbox_verifies_checkpoint_delta_before_continuation(self):
+        with RepoHarness(self) as repo:
+            plan = valid_plan()
+            plan["repository_authority"] = "write"
+            self._approved_state(plan)
+            events: list[str] = []
+            original_verify = ralph.verify_post_turn_repository_state
+
+            def fake_codex(_prompt, _schema, sandbox, **_kwargs):
+                events.append(f"codex:{sandbox}")
+                (repo.root / "app.py").write_text("authorized model delta\n", encoding="utf-8")
+                return self._result()
+
+            def tracked_verify(*args, **kwargs):
+                events.append("verify")
+                return original_verify(*args, **kwargs)
+
+            def continuation_result(*_args, **_kwargs):
+                events.append("continuation")
+                return True, "ordinary bounded continuation"
+
+            with (
+                mock.patch.object(ralph, "ensure_codex_usage_capacity", return_value=True),
+                mock.patch.object(ralph, "run_codex", side_effect=fake_codex),
+                mock.patch.object(ralph, "verify_post_turn_repository_state", side_effect=tracked_verify),
+                mock.patch.object(ralph, "codex_requests_continuation", side_effect=continuation_result),
+                mock.patch.object(ralph, "run_gates") as gates,
+            ):
+                self.assertEqual(ralph.cmd_run(self._args()), 0)
+
+            self.assertEqual(events, ["codex:workspace-write", "verify", "continuation"])
+            gates.assert_not_called()
+            state = ralph.load_state()
+            self.assertEqual(state["last_post_turn_verification"]["state"], "PASS")
+            self.assertEqual(state["last_post_turn_verification"]["new_project_delta"], ["app.py"])
+
+    def test_mixed_tooling_and_product_pass_records_only_verified_attribution(self):
+        with RepoHarness(self) as repo:
+            plan = valid_plan()
+            self._approved_state(plan)
+            state = ralph.load_state()
+            granted_paths = ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"]
+            self.assertTrue(all(ralph.is_tooling_path(path) for path in granted_paths))
+            state["self_hosting_grant"] = {
+                "plan_hash": state["plan_hash"], "step": 1, "paths": granted_paths,
+            }
+            ralph.save_state(state)
+
+            def fake_codex(*_args, **_kwargs):
+                (repo.root / "app.py").write_text("verified product delta\n", encoding="utf-8")
+                for path in granted_paths:
+                    target = repo.root / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("verified tooling delta\n", encoding="utf-8")
+                return self._result()
+
+            with (
+                mock.patch.object(ralph, "ensure_codex_usage_capacity", return_value=True),
+                mock.patch.object(ralph, "run_codex", side_effect=fake_codex),
+                mock.patch.object(ralph, "codex_requests_continuation", return_value=(False, "")),
+                mock.patch.object(ralph, "run_gates", return_value=(True, ["unit-tests=PASS"], None, "", {})),
+            ):
+                self.assertEqual(ralph.cmd_run(self._args()), 0)
+
+            accepted = ralph.load_state()
+            paths = {item["path"] for item in accepted["operation_attributions"]}
+            self.assertEqual({"app.py", *granted_paths}, paths)
+            self.assertEqual(sorted(paths), accepted["plan_changed_files"])
+            self.assertEqual(sorted(paths), accepted["step_results"][-1]["files"])
+            self.assertEqual(sorted(paths), accepted["step_results"][-1]["attribution"]["paths"])
+
+    def test_test_policy_block_does_not_create_attribution_or_progress(self):
+        with RepoHarness(self) as repo:
+            plan = valid_plan()
+            plan["steps"][0]["test_change_policy"] = "none"
+            self._approved_state(plan)
+
+            def fake_codex(*_args, **_kwargs):
+                (repo.root / "app.py").write_text("unaccepted product delta\n", encoding="utf-8")
+                test = repo.root / "tests" / "test_new.py"
+                test.parent.mkdir(exist_ok=True)
+                test.write_text("def test_new(): pass\n", encoding="utf-8")
+                return self._result()
+
+            with (
+                mock.patch.object(ralph, "ensure_codex_usage_capacity", return_value=True),
+                mock.patch.object(ralph, "run_codex", side_effect=fake_codex),
+                mock.patch.object(ralph, "run_gates") as gates,
+            ):
+                self.assertEqual(ralph.cmd_run(self._args()), 2)
+
+            blocked = ralph.load_state()
+            gates.assert_not_called()
+            self.assertEqual(1, blocked["current_step"])
+            self.assertEqual([], blocked["plan_changed_files"])
+            self.assertEqual([], blocked["operation_attributions"])
+            self.assertIn("test paths ['tests/test_new.py']", blocked["block_reason"])
+
+
+
     def test_terminal_guard_exception_blocks_with_report_and_no_model_turn(self):
         with RepoHarness(self) as repo:
             plan = valid_plan()
@@ -522,12 +1308,14 @@ class EndToEndLifecycleTests(unittest.TestCase):
                     for i in range(1, len(plan["steps"]) + 1)
                 ],
             })
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            ralph.bind_approved_plan_artifact(state)
             checkpoint = ralph.create_recovery_checkpoint(state)
             state["recovery_checkpoint"] = checkpoint["id"]
+            state["approval_repository_evidence"] = checkpoint["repository_evidence"]
             state["plan_changed_files"] = ["app.py"]
             (repo.root / "app.py").write_text("value = 9\n", encoding="utf-8")
             ralph.save_state(state)
-            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
             args = type("Args", (), {
                 "max_loops": 10, "wait_for_limits": False, "usage_poll_seconds": 300,
                 "color": "never", "efficiency_mode": None,
@@ -570,19 +1358,24 @@ class EndToEndLifecycleTests(unittest.TestCase):
                     for i in range(1, len(plan["steps"]) + 1)
                 ],
             })
+            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            ralph.bind_approved_plan_artifact(state)
             checkpoint = ralph.create_recovery_checkpoint(state)
             state["recovery_checkpoint"] = checkpoint["id"]
-            state["plan_changed_files"] = ["app.py"]
+            state["approval_repository_evidence"] = checkpoint["repository_evidence"]
             (repo.root / "app.py").write_text("value = 10\n", encoding="utf-8")
             ralph.save_state(state)
-            ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+            accept_native_paths(state, ["app.py"], step_no=5, loop=12)
+            state = ralph.load_state()
+            state["status"] = "APPROVED"
+            state["current_step"] = len(plan["steps"]) + 1
+            ralph.save_state(state)
             args = type("Args", (), {
                 "max_loops": 10, "wait_for_limits": False, "usage_poll_seconds": 300,
                 "color": "never", "efficiency_mode": None,
             })()
             with (
                 mock.patch.object(ralph, "run_final_qualification", return_value=(True, ["unit-tests=PASS"], {}, "")) as final_qualification,
-                mock.patch.object(ralph, "plan_delta_fingerprint", return_value="bound-terminal-delta"),
                 mock.patch.object(ralph, "query_codex_rate_limits", return_value={}),
                 mock.patch.object(ralph, "run_codex") as run_codex,
             ):
@@ -595,7 +1388,8 @@ class EndToEndLifecycleTests(unittest.TestCase):
             self.assertEqual("READY_TO_COMMIT", finished["status"])
             self.assertEqual(len(plan["steps"]) + 1, finished["current_step"])
             self.assertEqual("PASS", finished["final_qualification"]["state"])
-            self.assertEqual("bound-terminal-delta", finished["final_qualification"]["delta_fingerprint"])
+            self.assertTrue(finished["final_qualification"]["delta_fingerprint"])
+            self.assertTrue(finished["final_qualification"]["native_provenance_sha256"])
 
 
 class RetirePlanTests(unittest.TestCase):
@@ -646,6 +1440,168 @@ class RetirePlanTests(unittest.TestCase):
             self.assertEqual(retired["loop_count"], 9)
             self.assertEqual(retired["last_result"], "RETIRED")
             self.assertEqual(retired["retired_plans"][-1]["plan_hash"], state["plan_hash"])
+
+    def _rollback_state(self, repo) -> tuple[dict, dict]:
+        (repo.root / "deleted.py").write_text("delete_me = True\n", encoding="utf-8")
+        (repo.root / "residue.py").write_text("operator = 'before'\n", encoding="utf-8")
+        repo.git("add", "deleted.py", "residue.py")
+        repo.git("commit", "-qm", "rollback fixture")
+        (repo.root / "residue.py").write_text("operator = 'staged approval residue'\n", encoding="utf-8")
+        repo.git("add", "residue.py")
+        (repo.root / "operator.txt").write_text("untracked approval residue\n", encoding="utf-8")
+        plan = valid_plan()
+        state = self.blocked_state()
+        state.update({"plan_hash": ralph.plan_hash(plan), "plan": plan})
+        ralph.PLAN.write_text(ralph.render_plan(plan), encoding="utf-8")
+        ralph.bind_approved_plan_artifact(state)
+        checkpoint = ralph.create_recovery_checkpoint(state)
+        state["recovery_checkpoint"] = checkpoint["id"]
+        state["approval_repository_evidence"] = checkpoint["repository_evidence"]
+
+        (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+        (repo.root / "deleted.py").unlink()
+        (repo.root / "created.py").write_text("created = True\n", encoding="utf-8")
+        paths = ["app.py", "created.py", "deleted.py"]
+        verification = {
+            "schema": "zen_ralph_post_turn_repository_verification_v1",
+            "state": "PASS", "sandbox": "workspace-write", "checkpoint": checkpoint["id"],
+            "plan_hash": state["plan_hash"], "new_project_delta": paths, "loop": 9, "step": 1,
+            "current_fingerprints": {path: ralph.retirement_path_fingerprint(path) for path in paths},
+        }
+        attribution = ralph.verified_attribution_result(
+            state, plan["steps"][0], verification, paths, loop=9, phase="implement",
+        )
+        ralph.record_accepted_operations(state, attribution)
+        ralph.save_state(state)
+        return state, checkpoint
+
+    @staticmethod
+    def _rollback_args(plan_hash: str):
+        return type("Args", (), {
+            "plan_hash": plan_hash, "reason": "obsolete", "rollback": True,
+            "carry_forward": False, "confirm": "ROLLBACK", "reconcile_restored": False,
+        })()
+
+    def test_rollback_restores_attributed_tracked_edits_deletions_and_creations(self):
+        with RepoHarness(self) as repo:
+            state, checkpoint = self._rollback_state(repo)
+            self.assertEqual(0, ralph.cmd_retire_plan(self._rollback_args(state["plan_hash"])))
+            self.assertEqual("value = 1\n", (repo.root / "app.py").read_text(encoding="utf-8"))
+            self.assertEqual("delete_me = True\n", (repo.root / "deleted.py").read_text(encoding="utf-8"))
+            self.assertFalse((repo.root / "created.py").exists())
+            self.assertEqual("operator = 'staged approval residue'\n", (repo.root / "residue.py").read_text(encoding="utf-8"))
+            self.assertEqual("untracked approval residue\n", (repo.root / "operator.txt").read_text(encoding="utf-8"))
+            manifest = json.loads(next(ralph.RETIREMENTS.glob("*.json")).read_text(encoding="utf-8"))
+            self.assertEqual(ralph.RETIREMENT_MANIFEST_SCHEMA, manifest["schema"])
+            self.assertEqual("ROLLED_BACK", manifest["disposition"])
+            self.assertEqual(checkpoint["id"], manifest["checkpoint"])
+            self.assertEqual({"app.py", "created.py", "deleted.py"}, {item["path"] for item in manifest["paths"]})
+            self.assertTrue(all(item["before"] and item["after"] for item in manifest["paths"]))
+
+    def test_rollback_refuses_stale_altered_duplicate_and_unattributed_evidence(self):
+        cases = ("stale", "altered", "duplicate", "unattributed")
+        for case in cases:
+            with self.subTest(case=case), RepoHarness(self) as repo:
+                state, _checkpoint = self._rollback_state(repo)
+                if case == "stale":
+                    (repo.root / "app.py").write_text("value = stale\n", encoding="utf-8")
+                    expected = "stale attribution fingerprint"
+                elif case == "altered":
+                    state["operation_attributions"][0]["path"] = "altered.py"
+                    ralph.save_state(state)
+                    expected = "incomplete or altered"
+                elif case == "duplicate":
+                    state["operation_attributions"].append(dict(state["operation_attributions"][0]))
+                    ralph.save_state(state)
+                    expected = "duplicate operation attribution"
+                else:
+                    (repo.root / "surprise.py").write_text("surprise = True\n", encoding="utf-8")
+                    expected = "unattributed or stale checkpoint delta"
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    ralph.cmd_retire_plan(self._rollback_args(state["plan_hash"]))
+
+    def test_rollback_refuses_protected_and_unsupported_attribution_baselines(self):
+        for case in ("protected", "unsupported"):
+            with self.subTest(case=case), RepoHarness(self) as repo:
+                state, _checkpoint = self._rollback_state(repo)
+                record = state["operation_attributions"][0]
+                if case == "protected":
+                    record["path"] = ".ralph/state.json"
+                    expected = "protected, runtime, residue, or ambiguous"
+                else:
+                    record["baseline_kind"] = "unknown"
+                    expected = "baseline classification is invalid"
+                record["record_sha256"] = ralph._operation_record_hash(record)
+                ralph.save_state(state)
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    ralph.cmd_retire_plan(self._rollback_args(state["plan_hash"]))
+
+    def test_carry_forward_v4_manifest_preserves_inventory_without_rollback_authority(self):
+        with RepoHarness(self):
+            state = self.blocked_state()
+            ralph.PLAN.write_text(ralph.render_plan(state["plan"]), encoding="utf-8")
+            checkpoint = ralph.create_recovery_checkpoint(state)
+            state.update({
+                "recovery_checkpoint": checkpoint["id"],
+                "plan_changed_files": ["app.py"],
+            })
+            ralph.save_state(state)
+            args = type("Args", (), {
+                "plan_hash": state["plan_hash"], "reason": "replacement required",
+                "rollback": False, "carry_forward": True, "confirm": None,
+                "reconcile_restored": False,
+            })()
+            self.assertEqual(0, ralph.cmd_retire_plan(args))
+            manifest = json.loads(next(ralph.RETIREMENTS.glob("*.json")).read_text(encoding="utf-8"))
+            self.assertEqual(ralph.RETIREMENT_MANIFEST_SCHEMA, manifest["schema"])
+            self.assertEqual("RETIRED_WITH_CARRY_FORWARD", manifest["disposition"])
+            self.assertEqual(["app.py"], manifest["operations"]["preserved"])
+            self.assertEqual(1, len(manifest["paths"]))
+            record = manifest["paths"][0]
+            self.assertEqual("app.py", record["path"])
+            self.assertEqual("inventory-only", record["attribution"]["authority"])
+            self.assertEqual(record["evidence"], record["before"])
+            self.assertEqual(record["evidence"], record["after"])
+            self.assertEqual(
+                {"disposition": "preserved", "action": "none", "checkpoint": checkpoint["id"]},
+                record["restoration"],
+            )
+
+    def test_legacy_v3_retirement_manifest_remains_readable(self):
+        with RepoHarness(self):
+            state = self.blocked_state()
+            checkpoint = ralph.create_recovery_checkpoint(state)
+            state["recovery_checkpoint"] = checkpoint["id"]
+            current = ralph.retirement_path_fingerprint("app.py")
+            record = {
+                "path": "app.py",
+                "baseline": "tracked",
+                "plan_owned": False,
+                "current": current["kind"],
+                "unexpected": False,
+                "evidence": current,
+            }
+            manifest = {
+                "schema": ralph.RETIREMENT_MANIFEST_LEGACY_SCHEMA,
+                "id": ralph.retirement_record_id(),
+                "created_at": ralph.utc_now(),
+                "plan_hash": state["plan_hash"],
+                "status_before": state["status"],
+                "reason": "historical carry-forward evidence",
+                "disposition": "RETIRED_WITH_CARRY_FORWARD",
+                "checkpoint": checkpoint["id"],
+                "step": state["current_step"],
+                "step_count": len(state["plan"]["steps"]),
+                "loop_count": state["loop_count"],
+                "paths": [record],
+                "operations": {"restore": [], "delete": [], "preserved": ["app.py"]},
+                "repository_before": ralph.repo_snapshot(),
+                "repository_after": ralph.repo_snapshot(),
+                "planning_context": ralph.retirement_planning_context(state),
+            }
+            validated = ralph.validate_retirement_manifest(manifest)
+            self.assertEqual(ralph.RETIREMENT_MANIFEST_LEGACY_SCHEMA, validated["schema"])
+            self.assertEqual("app.py", validated["paths"][0]["path"])
 
 
 class ParserTests(unittest.TestCase):
@@ -709,6 +1665,28 @@ class OperatorConsoleV022Tests(unittest.TestCase):
         self.assertIn("HUMAN_CONFIRMED 1", card)
         self.assertIn("recovered 1", card)
 
+    def test_read_only_completion_card_has_no_commit_action(self):
+        tui.configure("never")
+        card = tui.completion_card({
+            "plan_hash": "d" * 64,
+            "status": "READ_ONLY_COMPLETE",
+            "repository_authority": "read-only",
+            "counts": {
+                "steps_total": 5, "steps_accepted": 5, "steps_passed": 5,
+                "steps_human_confirmed": 0, "steps_recovered": 0,
+                "steps_failed": 0, "loops": 5, "human_gates": 0, "human_steers": 0,
+            },
+            "qualification": {"state": "PASS"},
+            "changes": {"files": 0, "added": 0, "removed": 0},
+            "authority": {"protected_paths_changed": False, "ralph_tooling_changed": False},
+            "recovery_checkpoint": "RP-RO", "markdown_path": ".ralph/reports/read-only.md",
+            "suggested_commit": None,
+        })
+        self.assertIn("READ-ONLY COMPLETE", card)
+        self.assertIn("No commit, push, or reconciliation", card)
+        self.assertNotIn("Suggested commit", card)
+        self.assertNotIn("finalize", card)
+
     def test_commit_overlap_card_explains_safe_action(self):
         tui.configure("never")
         card = tui.commit_overlap_card(
@@ -740,41 +1718,19 @@ class OperatorConsoleV022Tests(unittest.TestCase):
 
 
 class ReconciliationTests(unittest.TestCase):
-    def _ready_state(self, checkpoint: dict, plan_paths: list[str]) -> dict:
-        plan = valid_plan()
-        digest = ralph.plan_hash(plan)
-        state = ralph.default_state()
-        state.update({
-            "status": "READY_TO_COMMIT",
-            "plan_hash": digest,
-            "plan": plan,
-            "current_step": 6,
-            "recovery_checkpoint": checkpoint["id"],
-            "plan_changed_files": plan_paths,
-            "step_results": [
-                {"step": i, "title": f"Step {i}", "result": "PASS", "summary": "ok", "files": [], "gates": [], "stats": {}}
-                for i in range(1, 6)
-            ],
-            "final_qualification": {"state": "PASS", "gates": ["unit-tests=PASS"]},
-        })
-        manifest_path = ralph.RECOVERY / checkpoint["id"] / "manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["plan_hash"] = digest
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        return state
-
     def test_reconcile_commit_adopts_verified_manual_commit(self):
         with RepoHarness(self) as repo:
-            bootstrap = ralph.default_state()
-            bootstrap.update({"plan_hash": "a" * 64, "plan": valid_plan()})
-            checkpoint = ralph.create_recovery_checkpoint(bootstrap)
+            state, _checkpoint = native_approved_state()
             (repo.root / "app.py").write_text("value = 2\n", encoding="utf-8")
+            accept_native_paths(state, ["app.py"])
             repo.git("add", "app.py")
             repo.git("commit", "-qm", "manual qualified plan")
             sha = repo.git("rev-parse", "HEAD").stdout.strip()
-            state = self._ready_state(checkpoint, ["app.py"])
-            ralph.save_state(state)
-            args = type("Args", (), {"plan_hash": state["plan_hash"], "commit": sha, "reason": "Manual closure after approved dirty-overlap review"})()
+            state = ralph.load_state()
+            args = type("Args", (), {
+                "plan_hash": state["plan_hash"], "commit": sha,
+                "reason": "Manual closure after approved dirty-overlap review",
+            })()
             self.assertEqual(ralph.cmd_reconcile_commit(args), 0)
             adopted = ralph.load_state()
             self.assertEqual(adopted["status"], "COMMITTED")
@@ -783,17 +1739,15 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_reconcile_commit_rejects_unexpected_extra_path(self):
         with RepoHarness(self) as repo:
-            bootstrap = ralph.default_state()
-            bootstrap.update({"plan_hash": "b" * 64, "plan": valid_plan()})
-            checkpoint = ralph.create_recovery_checkpoint(bootstrap)
+            state, _checkpoint = native_approved_state()
             (repo.root / "app.py").write_text("value = 3\n", encoding="utf-8")
+            accept_native_paths(state, ["app.py"])
             (repo.root / "surprise.txt").write_text("unexpected\n", encoding="utf-8")
             repo.git("add", "app.py", "surprise.txt")
             repo.git("commit", "-qm", "manual bad commit")
             sha = repo.git("rev-parse", "HEAD").stdout.strip()
-            state = self._ready_state(checkpoint, ["app.py"])
-            ralph.save_state(state)
-            with self.assertRaisesRegex(RuntimeError, r"^manual commit contains unexpected paths outside plan/baseline: \['surprise.txt'\]$"):
+            state = ralph.load_state()
+            with self.assertRaisesRegex(RuntimeError, "commit scope differs from native provenance"):
                 ralph._verify_reconciled_commit(state, sha)
 
     def test_reconcile_push_requires_recorded_commit_on_upstream(self):
@@ -805,12 +1759,14 @@ class ReconciliationTests(unittest.TestCase):
             repo.git("remote", "add", "origin", str(remote))
             repo.git("push", "-u", "origin", "master")
 
+            state, _checkpoint = native_approved_state()
             (repo.root / "app.py").write_text("value = 9\n", encoding="utf-8")
+            accept_native_paths(state, ["app.py"])
             repo.git("add", "app.py")
             repo.git("commit", "-qm", "manual commit")
             sha = repo.git("rev-parse", "HEAD").stdout.strip()
-            state = ralph.default_state()
-            state.update({"status": "COMMITTED", "plan_hash": "c" * 64, "plan": valid_plan(), "commit_sha": sha, "final_qualification": {"state": "PASS", "gates": []}})
+            state = ralph.load_state()
+            state.update({"status": "COMMITTED", "commit_sha": sha})
             ralph.save_state(state)
             args = type("Args", (), {"plan_hash": state["plan_hash"]})()
             with self.assertRaisesRegex(RuntimeError, "not present"):

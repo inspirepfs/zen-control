@@ -85,7 +85,8 @@ PROTECTED_EXACT = ZEN_PROFILE.protected_exact
 PROTECTED_DIR_PREFIXES = ZEN_PROFILE.protected_dir_prefixes
 PROTECTED_SUFFIXES = ZEN_PROFILE.protected_suffixes
 TOOLING_PATHS = ZEN_PROFILE.tooling_paths
-
+REPOSITORY_AUTHORITY_FIELD = "repository_authority"
+REPOSITORY_AUTHORITIES = frozenset({"read-only", "write"})
 PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -185,10 +186,51 @@ def validate_plan(plan: dict) -> None:
             raise ValueError(f"step {index} has invalid test_change_policy")
 
 
+def validate_complete_plan(plan: dict, expected_hash: str | None = None) -> None:
+    """Validate the controller-completed approval candidate and its authority."""
+    validate_plan(plan)
+    authority = plan.get(REPOSITORY_AUTHORITY_FIELD) if isinstance(plan, dict) else None
+    if authority in REPOSITORY_AUTHORITIES:
+        return
+    raise ValueError("plan is missing controller-injected repository authority")
+
+
+def sandbox_for_approved_plan(plan: dict, expected_hash: str | None = None) -> str:
+    """Select the model sandbox from the controller-bound plan authority only.
+    """
+    validate_complete_plan(plan, expected_hash)
+    authority = plan.get(REPOSITORY_AUTHORITY_FIELD) if isinstance(plan, dict) else None
+    if authority == "read-only":
+        return "read-only"
+    if authority == "write":
+        return "workspace-write"
+    raise ValueError("approved plan has no sandbox-selecting repository authority")
+
+
+def controller_inject_repository_authority(plan: dict, authority: object) -> None:
+    """Bind an operator-selected controller contract after model planning."""
+    if not isinstance(plan, dict):
+        raise ValueError("model proposal must be an object")
+    if REPOSITORY_AUTHORITY_FIELD in plan:
+        raise ValueError("model proposal must not supply repository authority")
+    if authority not in REPOSITORY_AUTHORITIES:
+        raise ValueError("proposal requires repository authority: read-only or write")
+    plan[REPOSITORY_AUTHORITY_FIELD] = authority
+
+
 def render_plan(plan: dict) -> str:
     digest = plan_hash(plan)
     minimum, maximum = plan_step_bounds(plan)
-    lines = ["# RALPH-Lite Approved-Plan Candidate", "", f"**Goal:** {plan['goal']}", f"**Plan size:** `{minimum}-{maximum}` steps", f"**Plan SHA-256:** `{digest}`", ""]
+    authority = plan.get(REPOSITORY_AUTHORITY_FIELD)
+    lines = [
+        "# RALPH-Lite Approved-Plan Candidate",
+        "",
+        f"**Goal:** {plan['goal']}",
+        f"**Plan size:** `{minimum}-{maximum}` steps",
+    ]
+    if authority in REPOSITORY_AUTHORITIES:
+        lines.append(f"**Repository authority:** `{authority}`")
+    lines += [f"**Plan SHA-256:** `{digest}`", ""]
     for step in plan["steps"]:
         lines += [f"## {step['id']}. {step['title']}", "", step["objective"], "", "Acceptance:"]
         lines += [f"- {item}" for item in step["acceptance"]]
@@ -211,6 +253,10 @@ def default_state() -> dict:
         "last_result": None,
         "block_reason": None,
         "recovery_checkpoint": None,
+        "approved_plan_artifact": None,
+        "approval_repository_evidence": None,
+        "operation_attributions": [],
+        "pending_step_delta_paths": [],
         "plan_changed_files": [],
         "plan_owned_files": [],
         "test_reconciliation_adoptions": [],
@@ -471,8 +517,9 @@ def create_recovery_checkpoint(state: dict) -> dict:
     (directory / "status.txt").write_text(_git(["status", "--short"]).stdout, encoding="utf-8")
     (directory / "working.patch").write_text(_git(["diff", "--binary", "HEAD"]).stdout, encoding="utf-8")
     (directory / "staged.patch").write_text(_git(["diff", "--cached", "--binary"]).stdout, encoding="utf-8")
+    repository_evidence = approval_repository_evidence()
     manifest = {
-        "schema": "zen_ralph_recovery_v1",
+        "schema": "zen_ralph_recovery_v2",
         "id": checkpoint_id,
         "created_at": utc_now(),
         "plan_hash": plan_digest,
@@ -485,11 +532,819 @@ def create_recovery_checkpoint(state: dict) -> dict:
         "baseline_untracked_paths": untracked,
         "baseline_staged_paths": staged,
         "protected_untracked_not_copied": [path for path in untracked if is_protected_path(path)],
+        "repository_evidence": repository_evidence,
+        "approved_plan_artifact": dict(state.get("approved_plan_artifact") or {}),
     }
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tui.write_event(EVENTS, "CHECKPOINT", f"created {checkpoint_id}", checkpoint=manifest)
     live_write(f"{checkpoint_id} · HEAD {head[:12]} · dirty={len(dirty)} · ref={ref}", "CHECKPOINT")
     return manifest
+
+
+def _approval_status_records() -> dict[str, str]:
+    """Return current porcelain status codes keyed by their worktree paths."""
+    proc = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    records: dict[str, str] = {}
+    entries = proc.stdout.split("\0")
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if not entry:
+            continue
+        code, path = entry[:2], entry[3:].strip()
+        if path:
+            records[_normalize_repo_path(path)] = code
+        # In -z mode renamed/copied entries have a second, source-path field.
+        if len(code) == 2 and (code[0] in {"R", "C"} or code[1] in {"R", "C"}):
+            index += 1
+    return records
+
+
+def _approval_path_evidence(path: str, status: str) -> dict:
+    """Capture status and safe content evidence without conferring ownership."""
+    path = _normalize_repo_path(path)
+    full = ROOT / path
+    head = git_head()
+    tracked_at_head = _git(["cat-file", "-e", f"{head}:{path}"], check=False).returncode == 0
+    tracked_in_index = _git(["ls-files", "--error-unmatch", "--", path], check=False).returncode == 0
+    index_status = status[:1] if status else " "
+    worktree_status = status[1:2] if len(status) > 1 else " "
+    if status == "??":
+        baseline_kind = "preexisting-untracked"
+    elif tracked_at_head:
+        baseline_kind = "tracked"
+    elif tracked_in_index:
+        baseline_kind = "index-created"
+    else:
+        baseline_kind = "unknown"
+    evidence = {
+        "path": path,
+        "baseline_kind": baseline_kind,
+        "index_status": index_status,
+        "worktree_status": worktree_status,
+        "tracked_at_head": tracked_at_head,
+        "tracked_in_index": tracked_in_index,
+    }
+    if is_protected_path(path) or _is_runtime_authority_path(path):
+        return evidence | {"content_fingerprint": None, "content_not_read": "protected-or-runtime"}
+    if full.is_symlink() or (full.exists() and not full.is_file()):
+        return evidence | {"content_fingerprint": None, "content_not_read": "not-a-regular-file"}
+    if full.is_file():
+        return evidence | {"content_fingerprint": file_hash(full), "bytes": full.stat().st_size}
+    return evidence | {"content_fingerprint": None, "missing": True}
+
+
+def approval_repository_evidence() -> dict:
+    """Describe approval-time residue; evidence is explicitly not plan ownership."""
+    records = [_approval_path_evidence(path, status) for path, status in sorted(_approval_status_records().items())]
+    return {
+        "schema": "zen_ralph_approval_repository_evidence_v1",
+        "captured_at": utc_now(),
+        "tracked_index_worktree": [item for item in records if item["baseline_kind"] != "preexisting-untracked"],
+        "untracked_content_fingerprints": [item for item in records if item["baseline_kind"] == "preexisting-untracked"],
+        "operator_residue": [item | {"ownership": "operator-residue"} for item in records],
+    }
+
+
+def bind_approved_plan_artifact(state: dict) -> dict:
+    """Bind the exact approved bytes once, independent of future rendering code."""
+    if not PLAN.is_file():
+        raise RuntimeError("approved plan artifact is missing")
+    artifact = {
+        "schema": "zen_ralph_approved_plan_artifact_v1",
+        "path": PLAN.relative_to(ROOT).as_posix(),
+        "plan_hash": str(state.get("plan_hash") or ""),
+        "sha256": file_hash(PLAN),
+        "bytes": PLAN.stat().st_size,
+        "bound_at": utc_now(),
+    }
+    state["approved_plan_artifact"] = artifact
+    return artifact
+
+
+def verify_approved_plan_artifact(state: dict) -> None:
+    """Verify the immutable approved-plan bytes bound by ``cmd_approve``."""
+    artifact = state.get("approved_plan_artifact")
+    if not isinstance(artifact, dict):
+        raise RuntimeError("approved plan artifact binding is missing")
+    if artifact.get("schema") != "zen_ralph_approved_plan_artifact_v1":
+        raise RuntimeError("approved plan artifact binding is invalid")
+    if artifact.get("path") != ".ralph/plan.md" or artifact.get("plan_hash") != state.get("plan_hash"):
+        raise RuntimeError("approved plan artifact binding does not match the active plan")
+    if not PLAN.is_file() or artifact.get("bytes") != PLAN.stat().st_size or artifact.get("sha256") != file_hash(PLAN):
+        raise RuntimeError("approved plan file changed")
+
+
+def verify_approval_execution_evidence(state: dict) -> dict:
+    """Require the native approval bindings before execution or recovery.
+
+    Only ``cmd_approve`` creates these linked records.  Later lifecycle paths
+    are verification-only: they must never reconstruct absent authority.
+    """
+    verify_approved_plan_artifact(state)
+    artifact = state["approved_plan_artifact"]
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    checkpoint = load_recovery_checkpoint(checkpoint_id)
+    if (
+        not checkpoint_id
+        or checkpoint.get("schema") != "zen_ralph_recovery_v2"
+        or checkpoint.get("id") != checkpoint_id
+        or checkpoint.get("plan_hash") != state.get("plan_hash")
+    ):
+        raise RuntimeError("matching approval recovery checkpoint is missing or invalid")
+    if checkpoint.get("approved_plan_artifact") != artifact:
+        raise RuntimeError("approval checkpoint artifact does not match the approved plan")
+    evidence = checkpoint.get("repository_evidence")
+    evidence_fields = (
+        "tracked_index_worktree",
+        "untracked_content_fingerprints",
+        "operator_residue",
+    )
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("schema") != "zen_ralph_approval_repository_evidence_v1"
+        or not isinstance(evidence.get("captured_at"), str)
+        or any(not isinstance(evidence.get(field), list) for field in evidence_fields)
+        or any(not isinstance(item, dict) for field in evidence_fields for item in evidence[field])
+    ):
+        raise RuntimeError("structured approval repository evidence is missing or invalid")
+    if state.get("approval_repository_evidence") != evidence:
+        raise RuntimeError("approval repository evidence does not match the approval checkpoint")
+    return checkpoint
+
+
+OPERATION_ATTRIBUTION_SCHEMA = "zen_ralph_operation_attribution_v2"
+
+
+def _evidence_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _json_copy(value: object) -> object:
+    """Detach durable evidence from mutable state and caller-owned dictionaries."""
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
+def _originating_step(state: dict, step: dict) -> dict:
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    if plan_hash(plan) != state.get("plan_hash"):
+        raise RuntimeError("operation attribution approved-plan origin is stale or altered")
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    step_id = int(step.get("id") or 0) if isinstance(step, dict) else 0
+    matches = [item for item in steps if isinstance(item, dict) and int(item.get("id") or 0) == step_id]
+    if len(matches) != 1 or not isinstance(step, dict) or _evidence_digest(matches[0]) != _evidence_digest(step):
+        raise RuntimeError("operation attribution has missing or ambiguous approved-step origin")
+    return matches[0]
+
+
+def _checkpoint_identity(checkpoint_id: str, checkpoint: dict) -> dict:
+    manifest = RECOVERY / checkpoint_id / "manifest.json"
+    if not manifest.is_file():
+        raise RuntimeError("operation attribution approval checkpoint manifest is missing")
+    identity = {
+        "id": checkpoint_id,
+        "ref": checkpoint.get("ref"),
+        "recovery_oid": checkpoint.get("recovery_oid"),
+        "manifest_sha256": file_hash(manifest),
+    }
+    if not all(isinstance(identity[key], str) and identity[key] for key in ("id", "ref", "recovery_oid", "manifest_sha256")):
+        raise RuntimeError("operation attribution approval checkpoint identity is invalid")
+    return identity
+
+
+def _self_hosting_grants_for_origin(state: dict, step_no: int, path: str) -> list[dict]:
+    """Return durable grants that explicitly cover one originating tooling path."""
+    if not is_tooling_path(path):
+        return []
+    candidates: list[dict] = []
+    active = state.get("self_hosting_grant")
+    history = state.get("self_hosting_grant_history")
+    for raw in [active, *((history if isinstance(history, list) else []))]:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("plan_hash") != state.get("plan_hash") or int(raw.get("step") or 0) != int(step_no):
+            continue
+        paths = sorted({_normalize_repo_path(str(item)) for item in raw.get("paths") or [] if str(item).strip()})
+        if path not in paths:
+            continue
+        candidate = _json_copy(raw)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    candidates.sort(key=lambda item: str(item.get("granted_at") or ""))
+    return candidates
+
+
+def _origin_self_hosting_grant(state: dict, origin_step: dict, path: str) -> dict | None:
+    if not is_tooling_path(path):
+        return None
+    step_no = int(origin_step["id"])
+    grants = _self_hosting_grants_for_origin(state, step_no, path)
+    if not grants:
+        raise RuntimeError("operation attribution has no applicable durable self-hosting grant")
+    # Prefer the currently active exact grant when it is applicable. Otherwise
+    # use the newest durable grant for the originating step. This is critical
+    # when validating accepted operations after the controller has moved on to
+    # a later step and the active grant has changed.
+    active = state.get("self_hosting_grant") if isinstance(state.get("self_hosting_grant"), dict) else None
+    if active is not None:
+        active_copy = _json_copy(active)
+        if active_copy in grants:
+            return active_copy
+    return grants[-1]
+
+
+def _reconciliation_evidence(state: dict) -> dict:
+    if state.get("retirement_record_id"):
+        snapshot = reconciliation_snapshot(state)
+        return {"schema": "zen_ralph_operation_reconciliation_v1", "state": "replacement", "snapshot": _json_copy(snapshot)}
+    return {"schema": "zen_ralph_operation_reconciliation_v1", "state": "not-applicable"}
+
+
+def _operation_record_hash(record: dict) -> str:
+    unsigned = {key: value for key, value in record.items() if key != "record_sha256"}
+    return _evidence_digest(unsigned)
+
+
+def _validated_operation_records(state: dict) -> list[dict]:
+    """Validate native attribution records before they can confer plan ownership."""
+    records = state.get("operation_attributions")
+    if not isinstance(records, list):
+        raise RuntimeError("operation attribution collection is invalid")
+    checkpoint = verify_approval_execution_evidence(state)
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    artifact = state["approved_plan_artifact"]
+    evidence = checkpoint["repository_evidence"]
+    expected_checkpoint = _checkpoint_identity(checkpoint_id, checkpoint)
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    repository_authority = plan.get(REPOSITORY_AUTHORITY_FIELD)
+    if not isinstance(repository_authority, str) or not repository_authority:
+        raise RuntimeError("operation attribution repository authority is invalid")
+    seen: set[tuple[str, int, int]] = set()
+    accepted: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("schema") != OPERATION_ATTRIBUTION_SCHEMA:
+            raise RuntimeError("operation attribution record schema is invalid")
+        required = {
+            "schema", "record_sha256", "plan_hash", "approved_plan_artifact", "approved_plan_artifact_sha256",
+            "approval_checkpoint", "approval_repository_evidence", "approval_repository_evidence_sha256",
+            "repository_authority", "loop", "originating_step", "originating_step_sha256",
+            "originating_test_change_policy", "self_hosting_grant", "self_hosting_grant_sha256",
+            "path", "baseline_kind", "operation", "current_fingerprint", "controller_verification",
+            "reconciliation_evidence",
+        }
+        if set(record) != required or record.get("record_sha256") != _operation_record_hash(record):
+            raise RuntimeError("operation attribution record is incomplete or altered")
+        if record["plan_hash"] != state.get("plan_hash") or record["approved_plan_artifact"] != artifact or record["approved_plan_artifact_sha256"] != _evidence_digest(artifact):
+            raise RuntimeError("operation attribution approved-artifact origin is stale or altered")
+        if record["approval_checkpoint"] != expected_checkpoint or record["approval_repository_evidence"] != evidence or record["approval_repository_evidence_sha256"] != _evidence_digest(evidence):
+            raise RuntimeError("operation attribution approval checkpoint/evidence origin is stale or altered")
+        if record["repository_authority"] != repository_authority:
+            raise RuntimeError("operation attribution repository authority is stale or altered")
+        origin = _originating_step(state, record["originating_step"])
+        if record["originating_step_sha256"] != _evidence_digest(origin) or record["originating_test_change_policy"] != origin.get("test_change_policy"):
+            raise RuntimeError("operation attribution originating test policy is stale or altered")
+        path = _normalize_repo_path(str(record["path"] or ""))
+        if not path or path != record["path"] or path in approval_baseline_residue_paths(state) or is_protected_path(path) or _is_runtime_authority_path(path):
+            raise RuntimeError("operation attribution path is protected, runtime, residue, or ambiguous")
+        baseline = plan_baseline_path_kind(state, path)
+        if record["baseline_kind"] != baseline or baseline not in {"tracked", "absent"}:
+            raise RuntimeError("operation attribution baseline classification is invalid")
+        fingerprint = record["current_fingerprint"]
+        if not isinstance(fingerprint, dict) or fingerprint.get("kind") not in {"tracked", "untracked", "missing"}:
+            raise RuntimeError("operation attribution current fingerprint is invalid")
+        expected_operation = "create" if baseline == "absent" and fingerprint["kind"] != "missing" else ("delete" if fingerprint["kind"] == "missing" else "edit")
+        if record["operation"] != expected_operation:
+            raise RuntimeError("operation attribution kind is invalid")
+        grant = record["self_hosting_grant"]
+        if is_tooling_path(path):
+            history = state.get("self_hosting_grant_history") if isinstance(state.get("self_hosting_grant_history"), list) else []
+            if not isinstance(grant, dict) or grant not in history or record["self_hosting_grant_sha256"] != _evidence_digest(grant):
+                raise RuntimeError("operation attribution self-hosting grant is missing or altered")
+            allowed, reason = self_hosting_grant_allows({**state, "self_hosting_grant": grant}, int(origin["id"]), [path])
+            if not allowed:
+                raise RuntimeError(f"operation attribution self-hosting grant is stale: {reason}")
+        elif grant is not None or record["self_hosting_grant_sha256"] is not None:
+            raise RuntimeError("operation attribution has inapplicable self-hosting grant evidence")
+        verification = record["controller_verification"]
+        if not isinstance(verification, dict) or verification.get("schema") != "zen_ralph_post_turn_repository_verification_v1" or verification.get("state") != "PASS" or verification.get("checkpoint") != checkpoint_id or verification.get("plan_hash") != state.get("plan_hash") or int(verification.get("step") or 0) != int(origin["id"]) or path not in verification.get("new_project_delta", []):
+            raise RuntimeError("operation attribution controller verification evidence is invalid")
+        fingerprints = verification.get("current_fingerprints")
+        if not isinstance(fingerprints, dict) or fingerprints.get(path) != fingerprint:
+            raise RuntimeError("operation attribution current fingerprint evidence is stale or altered")
+        reconciliation = record["reconciliation_evidence"]
+        if reconciliation != _reconciliation_evidence(state):
+            raise RuntimeError("operation attribution reconciliation evidence is stale or altered")
+        key = (path, int(record["loop"]), int(origin["id"]))
+        if key in seen:
+            raise RuntimeError(f"duplicate operation attribution record: {path}")
+        seen.add(key)
+        accepted.append(record)
+    return accepted
+
+
+def _latest_operation_records_by_path(state: dict) -> dict[str, dict]:
+    """Return the newest validated accepted record for each path."""
+    latest: dict[str, dict] = {}
+    for record in _validated_operation_records(state):
+        path = str(record["path"])
+        origin = record.get("originating_step") if isinstance(record.get("originating_step"), dict) else {}
+        key = (int(record.get("loop") or 0), int(origin.get("id") or 0))
+        current = latest.get(path)
+        if current is None:
+            latest[path] = record
+            continue
+        current_origin = current.get("originating_step") if isinstance(current.get("originating_step"), dict) else {}
+        current_key = (int(current.get("loop") or 0), int(current_origin.get("id") or 0))
+        if key > current_key:
+            latest[path] = record
+    return latest
+
+
+def current_attributed_paths(state: dict) -> list[str]:
+    """Return accepted paths whose newest attribution still matches the worktree."""
+    covered: list[str] = []
+    for path, record in _latest_operation_records_by_path(state).items():
+        if record.get("current_fingerprint") == retirement_path_fingerprint(path):
+            covered.append(path)
+    return sorted(covered)
+
+
+def _pending_step_paths(state: dict, step_no: int) -> set[str]:
+    pending = state.get("pending_step_delta_paths")
+    if not isinstance(pending, dict) or int(pending.get("step") or 0) != int(step_no):
+        return set()
+    return {
+        _normalize_repo_path(str(path))
+        for path in pending.get("paths") or []
+        if _normalize_repo_path(str(path))
+    }
+
+
+def _remember_pending_step_paths(state: dict, step_no: int, paths: Iterable[str]) -> None:
+    existing = _pending_step_paths(state, step_no)
+    existing.update(
+        _normalize_repo_path(str(path))
+        for path in paths
+        if _normalize_repo_path(str(path))
+    )
+    state["pending_step_delta_paths"] = {
+        "step": int(step_no),
+        "paths": sorted(existing),
+        "updated_at": utc_now(),
+    }
+
+
+def _clear_pending_step_paths(state: dict) -> None:
+    state["pending_step_delta_paths"] = []
+
+
+def validated_plan_paths(state: dict, *, owned_only: bool = False) -> list[str]:
+    records = _validated_operation_records(state)
+    return sorted({str(record["path"]) for record in records if not owned_only or record["baseline_kind"] == "absent"})
+
+
+def strict_native_provenance(
+    state: dict, phase: str, *, require_current_delta: bool = True, require_write: bool = True,
+) -> dict:
+    """Validate the sole native authority chain used by qualification and terminals.
+
+    Filename projections such as ``plan_changed_files`` are intentionally absent
+    from this decision.  Authority comes only from the approval bindings plus the
+    validated native operation ledger.  Historical operation policy/grant evidence
+    is validated by ``_validated_operation_records`` against each originating step.
+    """
+    checkpoint = verify_approval_execution_evidence(state)
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    if plan_hash(plan) != state.get("plan_hash"):
+        raise RuntimeError(f"{phase} native provenance plan hash is stale or altered")
+    authority = str(plan.get(REPOSITORY_AUTHORITY_FIELD) or "")
+    if authority not in REPOSITORY_AUTHORITIES:
+        raise RuntimeError(f"{phase} native provenance repository authority is missing or invalid")
+    if require_write and authority != "write":
+        raise RuntimeError(f"{phase} requires write repository authority")
+
+    records = _validated_operation_records(state)
+    latest = _latest_operation_records_by_path(state)
+    reconciliation = _reconciliation_evidence(state)
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    artifact = state.get("approved_plan_artifact")
+    evidence = checkpoint.get("repository_evidence")
+    binding = {
+        "schema": "zen_ralph_native_provenance_binding_v1",
+        "plan_hash": str(state.get("plan_hash") or ""),
+        "approved_plan_artifact_sha256": _evidence_digest(artifact),
+        "approval_checkpoint": _checkpoint_identity(checkpoint_id, checkpoint),
+        "approval_repository_evidence_sha256": _evidence_digest(evidence),
+        "repository_authority": authority,
+        "operations": [
+            {
+                "path": path,
+                "record_sha256": str(record.get("record_sha256") or ""),
+                "loop": int(record.get("loop") or 0),
+                "originating_step_sha256": str(record.get("originating_step_sha256") or ""),
+                "originating_test_change_policy": str(record.get("originating_test_change_policy") or ""),
+                "self_hosting_grant_sha256": record.get("self_hosting_grant_sha256"),
+                "current_fingerprint": _json_copy(record.get("current_fingerprint")),
+            }
+            for path, record in sorted(latest.items())
+        ],
+        "reconciliation_evidence": _json_copy(reconciliation),
+    }
+    binding_sha256 = _evidence_digest(binding)
+
+    if authority == "write" and require_write and not latest:
+        raise RuntimeError(f"{phase} native provenance has no accepted write attribution")
+    if authority == "read-only" and records:
+        raise RuntimeError(f"{phase} read-only provenance contains operation attribution")
+
+    result = {
+        "schema": "zen_ralph_strict_native_provenance_v1",
+        "binding": binding,
+        "binding_sha256": binding_sha256,
+        "new_plan_paths": sorted(latest),
+        "repository_authority": authority,
+    }
+    if not require_current_delta:
+        return result
+
+    repository = recompute_repository_against_approval_checkpoint(state)
+    changed_residue = sorted(repository.get("changed_approval_residue") or [])
+    if changed_residue:
+        raise RuntimeError(f"{phase} refuses changed approval residue: {changed_residue}")
+    current_delta = {
+        _normalize_repo_path(str(path))
+        for path in repository.get("new_project_delta") or []
+        if _normalize_repo_path(str(path))
+    }
+    attributed = set(latest)
+    if authority == "read-only":
+        if current_delta:
+            raise RuntimeError(f"{phase} read-only provenance has repository delta: {sorted(current_delta)}")
+    elif current_delta != attributed:
+        raise RuntimeError(
+            f"{phase} native provenance delta mismatch: "
+            f"unattributed={sorted(current_delta - attributed)} stale={sorted(attributed - current_delta)}"
+        )
+
+    current_fingerprints: dict[str, dict] = {}
+    for path, record in sorted(latest.items()):
+        current = retirement_path_fingerprint(path)
+        if record.get("current_fingerprint") != current:
+            raise RuntimeError(f"{phase} native provenance fingerprint is stale or altered: {path}")
+        current_fingerprints[path] = current
+    result["current_delta"] = sorted(current_delta)
+    result["current_fingerprints"] = current_fingerprints
+    result["current_sha256"] = _evidence_digest({
+        "binding_sha256": binding_sha256,
+        "current_delta": result["current_delta"],
+        "current_fingerprints": current_fingerprints,
+    })
+    return result
+
+
+def verified_read_only_completion(state: dict, phase: str = "read-only completion") -> dict:
+    """Prove that a read-only plan has no repository mutation authority to finalize.
+
+    READ_ONLY_COMPLETE is deliberately not a commit-capable state.  Admission is
+    derived from the approval/checkpoint binding and the native operation ledger,
+    never from filename projections.  Cached ownership/change projections must also
+    remain empty so the durable state cannot contradict the native zero-delta proof.
+    """
+    provenance = strict_native_provenance(
+        state, phase, require_current_delta=True, require_write=False,
+    )
+    if provenance.get("repository_authority") != "read-only":
+        raise RuntimeError(f"{phase} requires read-only repository authority")
+    if provenance.get("new_plan_paths"):
+        raise RuntimeError(f"{phase} refuses native operation attribution")
+    if validated_plan_paths(state, owned_only=True):
+        raise RuntimeError(f"{phase} refuses native plan ownership")
+    projected_changes = sorted({
+        _normalize_repo_path(str(path))
+        for path in state.get("plan_changed_files") or []
+        if _normalize_repo_path(str(path))
+    })
+    projected_owned = sorted({
+        _normalize_repo_path(str(path))
+        for path in state.get("plan_owned_files") or []
+        if _normalize_repo_path(str(path))
+    })
+    if projected_changes or projected_owned:
+        raise RuntimeError(
+            f"{phase} refuses stale read-only ownership projections: "
+            f"changed={projected_changes} owned={projected_owned}"
+        )
+    return provenance
+
+
+def _qualified_native_provenance(
+    state: dict, phase: str, *, require_current_delta: bool, require_write: bool = True,
+) -> dict:
+    qualification = state.get("final_qualification") if isinstance(state.get("final_qualification"), dict) else {}
+    if qualification.get("state") != "PASS":
+        raise RuntimeError(f"{phase} requires PASS final qualification")
+    provenance = strict_native_provenance(
+        state, phase, require_current_delta=require_current_delta, require_write=require_write,
+    )
+    expected = str(qualification.get("native_provenance_sha256") or "")
+    if not expected or not secrets.compare_digest(expected, provenance["binding_sha256"]):
+        raise RuntimeError(f"{phase} native provenance binding is missing, stale, or altered")
+    if require_current_delta:
+        delta = str(qualification.get("delta_fingerprint") or "")
+        if not delta or not secrets.compare_digest(delta, provenance.get("current_sha256") or ""):
+            raise RuntimeError(f"{phase} qualified repository delta is stale or altered")
+    return provenance
+
+
+def _commit_blob_sha256(commit_sha: str, path: str) -> str | None:
+    """Return one commit blob content digest, or ``None`` when the path is absent."""
+    exists = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit_sha}:{path}"], cwd=ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if exists.returncode != 0:
+        return None
+    proc = subprocess.run(
+        ["git", "show", f"{commit_sha}:{path}"], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"cannot inspect commit content for {path}")
+    return hashlib.sha256(proc.stdout).hexdigest()
+
+
+def _verify_commit_native_provenance(state: dict, commit_sha: str, provenance: dict, phase: str) -> list[str]:
+    """Prove a consumed commit exactly contains the qualified native operation set."""
+    planned = set(provenance.get("new_plan_paths") or [])
+    commit_paths = set(_commit_paths(commit_sha))
+    if commit_paths != planned:
+        raise RuntimeError(
+            f"{phase} commit scope differs from native provenance: "
+            f"missing={sorted(planned - commit_paths)} unexpected={sorted(commit_paths - planned)}"
+        )
+    latest = _latest_operation_records_by_path(state)
+    for path in sorted(planned):
+        record = latest[path]
+        operation = str(record.get("operation") or "")
+        expected_content = (record.get("current_fingerprint") or {}).get("content_sha256")
+        actual_content = _commit_blob_sha256(commit_sha, path)
+        if operation == "delete":
+            if actual_content is not None:
+                raise RuntimeError(f"{phase} deleted path remains present in commit: {path}")
+        elif not expected_content or actual_content != expected_content:
+            raise RuntimeError(f"{phase} commit content differs from qualified attribution: {path}")
+    return sorted(commit_paths)
+
+
+def verified_attribution_result(
+    state: dict, step: dict, verification: dict, observed_paths: Iterable[str], *, loop: int, phase: str,
+) -> dict:
+    """Turn checkpoint verification into the sole authority for accepted paths.
+
+    ``observed_paths`` remains useful as a per-turn witness, but can never by
+    itself make a path plan-owned.  Conversely, a pre-existing accepted delta
+    remains visible in checkpoint evidence without being re-attributed to a
+    later turn.
+    """
+    checkpoint = verify_approval_execution_evidence(state)
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    origin_step = _originating_step(state, step)
+    if verification.get("state") != "PASS" or verification.get("sandbox") not in {"read-only", "workspace-write"}:
+        raise RuntimeError("verified attribution requires a passing controller checkpoint verification")
+    if verification.get("checkpoint") != checkpoint_id or verification.get("plan_hash") != state.get("plan_hash"):
+        raise RuntimeError("verified attribution does not match the active approval checkpoint")
+    verification_fingerprints = verification.get("current_fingerprints")
+    if not isinstance(verification_fingerprints, dict):
+        raise RuntimeError("verified attribution requires controller current-fingerprint evidence")
+
+    verified_delta = {
+        _normalize_repo_path(str(path)) for path in verification.get("new_project_delta") or []
+        if _normalize_repo_path(str(path))
+    }
+    observed = {
+        _normalize_repo_path(str(path)) for path in observed_paths
+        if _normalize_repo_path(str(path))
+    }
+    pending = _pending_step_paths(state, int(origin_step["id"]))
+    witness = observed | pending
+    latest = _latest_operation_records_by_path(state)
+    paths = sorted(
+        path for path in (verified_delta & witness)
+        if path not in latest
+        or latest[path].get("current_fingerprint") != verification_fingerprints.get(path)
+    )
+    if verification["sandbox"] == "read-only" and paths:
+        raise RuntimeError(f"read-only turn cannot create attributed operations: {paths}")
+
+    residue = approval_baseline_residue_paths(state)
+    operations: list[dict] = []
+    for raw_path in paths:
+        if not raw_path or raw_path in residue or is_protected_path(raw_path) or _is_runtime_authority_path(raw_path):
+            raise RuntimeError(f"verified attribution includes forbidden path: {raw_path}")
+        baseline_kind = plan_baseline_path_kind(state, raw_path)
+        if baseline_kind in {"preexisting-dirty", "preexisting-untracked", "unknown"}:
+            raise RuntimeError(f"verified attribution includes non-plan baseline path: {raw_path}")
+        current = verification_fingerprints.get(raw_path)
+        if not isinstance(current, dict) or current != retirement_path_fingerprint(raw_path):
+            raise RuntimeError(f"verified attribution current fingerprint is missing or stale: {raw_path}")
+        operation = "create" if baseline_kind == "absent" and current["kind"] != "missing" else ("delete" if current["kind"] == "missing" else "edit")
+        grant = _origin_self_hosting_grant(state, origin_step, raw_path)
+        record = {
+            "schema": OPERATION_ATTRIBUTION_SCHEMA,
+            "plan_hash": state["plan_hash"],
+            "approved_plan_artifact": _json_copy(state["approved_plan_artifact"]),
+            "approved_plan_artifact_sha256": _evidence_digest(state["approved_plan_artifact"]),
+            "approval_checkpoint": _checkpoint_identity(checkpoint_id, checkpoint),
+            "approval_repository_evidence": _json_copy(checkpoint["repository_evidence"]),
+            "approval_repository_evidence_sha256": _evidence_digest(checkpoint["repository_evidence"]),
+            "repository_authority": state["plan"][REPOSITORY_AUTHORITY_FIELD],
+            "loop": loop,
+            "originating_step": _json_copy(origin_step),
+            "originating_step_sha256": _evidence_digest(origin_step),
+            "originating_test_change_policy": origin_step["test_change_policy"],
+            "self_hosting_grant": grant,
+            "self_hosting_grant_sha256": _evidence_digest(grant) if grant is not None else None,
+            "path": raw_path,
+            "baseline_kind": baseline_kind,
+            "operation": operation,
+            "current_fingerprint": current,
+            "controller_verification": _json_copy(verification),
+            "reconciliation_evidence": _reconciliation_evidence(state),
+        }
+        record["record_sha256"] = _operation_record_hash(record)
+        operations.append(record)
+    return {
+        "schema": "zen_ralph_verified_attribution_v1",
+        "plan_hash": state["plan_hash"],
+        "checkpoint": checkpoint_id,
+        "loop": loop,
+        "step": step,
+        "phase": phase,
+        "sandbox": verification["sandbox"],
+        "paths": paths,
+        "operations": operations,
+        "verification_fingerprint": verification.get("fingerprint"),
+    }
+
+
+def record_accepted_operations(state: dict, attribution: dict) -> list[dict]:
+    """Persist only the operation records produced by verified attribution."""
+    if attribution.get("schema") != "zen_ralph_verified_attribution_v1":
+        raise RuntimeError("accepted operation recording requires verified attribution")
+    if attribution.get("plan_hash") != state.get("plan_hash") or attribution.get("checkpoint") != state.get("recovery_checkpoint"):
+        raise RuntimeError("accepted operation attribution does not match active plan authority")
+    accepted = [dict(item) for item in attribution.get("operations") or [] if isinstance(item, dict)]
+    existing = state.get("operation_attributions")
+    if not isinstance(existing, list):
+        raise RuntimeError("operation attribution collection is invalid")
+    # Validate the proposed collection before mutating controller state.  A
+    # malformed or duplicate native record must not become durable evidence,
+    # even transiently on an error path.
+    prospective = dict(state)
+    # A grant used for an accepted native record remains evidence even after
+    # the one-step active grant is cleared.  Retain the exact grant before
+    # validation; do not later reconstruct it from the mutable active field.
+    history = list(state.get("self_hosting_grant_history") or [])
+    for record in accepted:
+        grant = record.get("self_hosting_grant")
+        if isinstance(grant, dict) and grant not in history:
+            history.append(_json_copy(grant))
+    prospective["self_hosting_grant_history"] = history[-20:]
+    prospective["operation_attributions"] = [*existing, *accepted]
+    validated = _validated_operation_records(prospective)
+    state["self_hosting_grant_history"] = prospective["self_hosting_grant_history"]
+    state["operation_attributions"] = prospective["operation_attributions"]
+    state["plan_changed_files"] = sorted({str(item["path"]) for item in validated})
+    state["plan_owned_files"] = sorted({str(item["path"]) for item in validated if item["baseline_kind"] == "absent"})
+    return accepted
+
+
+def _accepted_step_results_by_id(state: dict) -> dict[int, dict]:
+    accepted: dict[int, dict] = {}
+    for item in state.get("step_results") or []:
+        if not isinstance(item, dict) or item.get("result") != "PASS":
+            continue
+        step_no = int(item.get("step") or 0)
+        if step_no > 0:
+            accepted[step_no] = item
+    return accepted
+
+
+def _step_by_id(state: dict, step_no: int) -> dict:
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    matches = [
+        item for item in plan.get("steps") or []
+        if isinstance(item, dict) and int(item.get("id") or 0) == int(step_no)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"self-upgrade recovery cannot resolve approved step {step_no}")
+    return matches[0]
+
+
+def _recovery_verification_for_path(
+    state: dict, origin_step: dict, path: str, fingerprint: dict, *, loop: int, source: str,
+) -> dict:
+    verification = {
+        "schema": "zen_ralph_post_turn_repository_verification_v1",
+        "state": "PASS",
+        "sandbox": "workspace-write",
+        "checkpoint": state.get("recovery_checkpoint"),
+        "plan_hash": state.get("plan_hash"),
+        "new_project_delta": [path],
+        "changed_approval_residue": [],
+        "current_fingerprints": {path: _json_copy(fingerprint)},
+        "loop": int(loop),
+        "step": int(origin_step["id"]),
+        "recorded_at": utc_now(),
+        "recovery": {
+            "schema": "zen_ralph_self_upgrade_attribution_recovery_v1",
+            "source": source,
+            "recovered_at": utc_now(),
+        },
+    }
+    verification["fingerprint"] = _evidence_digest(
+        {key: value for key, value in verification.items() if key != "fingerprint"}
+    )
+    return verification
+
+
+def _native_recovery_record(
+    state: dict, origin_step: dict, path: str, fingerprint: dict, *, loop: int, source: str,
+) -> dict:
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    checkpoint = verify_approval_execution_evidence(state)
+    baseline_kind = plan_baseline_path_kind(state, path)
+    if baseline_kind not in {"tracked", "absent"}:
+        raise RuntimeError(f"self-upgrade recovery refuses non-plan baseline path: {path}")
+    if path in approval_baseline_residue_paths(state) or is_protected_path(path) or _is_runtime_authority_path(path):
+        raise RuntimeError(f"self-upgrade recovery refuses protected/runtime/residue path: {path}")
+    if not isinstance(fingerprint, dict) or fingerprint.get("kind") not in {"tracked", "untracked", "missing"}:
+        raise RuntimeError(f"self-upgrade recovery has invalid fingerprint: {path}")
+    operation = "create" if baseline_kind == "absent" and fingerprint["kind"] != "missing" else (
+        "delete" if fingerprint["kind"] == "missing" else "edit"
+    )
+    grant = _origin_self_hosting_grant(state, origin_step, path)
+    verification = _recovery_verification_for_path(
+        state, origin_step, path, fingerprint, loop=loop, source=source,
+    )
+    record = {
+        "schema": OPERATION_ATTRIBUTION_SCHEMA,
+        "plan_hash": state["plan_hash"],
+        "approved_plan_artifact": _json_copy(state["approved_plan_artifact"]),
+        "approved_plan_artifact_sha256": _evidence_digest(state["approved_plan_artifact"]),
+        "approval_checkpoint": _checkpoint_identity(checkpoint_id, checkpoint),
+        "approval_repository_evidence": _json_copy(checkpoint["repository_evidence"]),
+        "approval_repository_evidence_sha256": _evidence_digest(checkpoint["repository_evidence"]),
+        "repository_authority": state["plan"][REPOSITORY_AUTHORITY_FIELD],
+        "loop": int(loop),
+        "originating_step": _json_copy(origin_step),
+        "originating_step_sha256": _evidence_digest(origin_step),
+        "originating_test_change_policy": origin_step["test_change_policy"],
+        "self_hosting_grant": grant,
+        "self_hosting_grant_sha256": _evidence_digest(grant) if grant is not None else None,
+        "path": path,
+        "baseline_kind": baseline_kind,
+        "operation": operation,
+        "current_fingerprint": _json_copy(fingerprint),
+        "controller_verification": verification,
+        "reconciliation_evidence": _reconciliation_evidence(state),
+    }
+    record["record_sha256"] = _operation_record_hash(record)
+    return record
+
+
+def _legacy_v1_origin_step(state: dict, record: dict) -> dict:
+    raw = record.get("step")
+    if isinstance(raw, dict):
+        return _originating_step(state, raw)
+    try:
+        step_no = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("self-upgrade recovery found v1 attribution without an approved step") from exc
+    return _step_by_id(state, step_no)
+
+
+def _accepted_origin_for_recovery(state: dict, path: str, accepted: dict[int, dict]) -> tuple[dict, int]:
+    baseline = plan_baseline_path_kind(state, path)
+    candidates: list[tuple[int, dict, int]] = []
+    for step_no, result in accepted.items():
+        step = _step_by_id(state, step_no)
+        policy = str(step.get("test_change_policy") or "none")
+        if path == "tests" or path.startswith("tests/"):
+            if policy == "none" or (policy == "add-only" and baseline != "absent"):
+                continue
+        if is_tooling_path(path):
+            if not _self_hosting_grants_for_origin(state, step_no, path):
+                continue
+        elif path not in {_normalize_repo_path(str(item)) for item in result.get("files") or []}:
+            continue
+        attr = result.get("attribution") if isinstance(result.get("attribution"), dict) else {}
+        loop = int(attr.get("loop") or result.get("loop") or 0)
+        candidates.append((step_no, step, loop))
+    if not candidates:
+        raise RuntimeError(f"self-upgrade recovery cannot prove an accepted origin for: {path}")
+    _step_no, step, loop = sorted(candidates, key=lambda item: item[0])[-1]
+    return step, loop
 
 
 def load_recovery_checkpoint(checkpoint_id: str | None) -> dict:
@@ -524,7 +1379,7 @@ def plan_baseline_path_kind(state: dict, path: str) -> str:
 
 
 def plan_owned_path(state: dict, path: str) -> bool:
-    return str(path) in set(state.get("plan_owned_files") or [])
+    return _normalize_repo_path(str(path)) in set(validated_plan_paths(state, owned_only=True))
 
 
 def approval_baseline_residue_paths(state: dict) -> set[str]:
@@ -542,26 +1397,176 @@ def approval_baseline_residue_paths(state: dict) -> set[str]:
     }
 
 
+def _project_repository_evidence(evidence: dict) -> dict[str, dict]:
+    """Normalize checkpoint/current residue evidence without treating it as plan work."""
+    records = evidence.get("operator_residue") if isinstance(evidence, dict) else []
+    result: dict[str, dict] = {}
+    for item in records if isinstance(records, list) else []:
+        if not isinstance(item, dict):
+            continue
+        path = _normalize_repo_path(str(item.get("path") or ""))
+        if not path or _is_runtime_authority_path(path):
+            continue
+        result[path] = {key: value for key, value in item.items() if key != "ownership"}
+    return result
+
+
+def recompute_repository_against_approval_checkpoint(state: dict) -> dict:
+    """Independently compare the current project worktree with approval evidence."""
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    checkpoint = load_recovery_checkpoint(checkpoint_id)
+    if not checkpoint or checkpoint.get("plan_hash") != state.get("plan_hash"):
+        raise RuntimeError("post-turn verification requires the matching approval checkpoint")
+    expected_evidence = checkpoint.get("repository_evidence")
+    if not isinstance(expected_evidence, dict) or expected_evidence.get("schema") != "zen_ralph_approval_repository_evidence_v1":
+        raise RuntimeError("post-turn verification requires structured approval repository evidence")
+
+    expected = _project_repository_evidence(expected_evidence)
+    current = _project_repository_evidence(approval_repository_evidence())
+    expected_paths, current_paths = set(expected), set(current)
+    changed_residue = sorted(
+        path for path in expected_paths
+        if path not in current or current[path] != expected[path]
+    )
+    new_delta = sorted(current_paths - expected_paths)
+    evidence = {
+        "schema": "zen_ralph_post_turn_repository_verification_v1",
+        "checkpoint": checkpoint_id,
+        "plan_hash": state.get("plan_hash"),
+        "new_project_delta": new_delta,
+        "changed_approval_residue": changed_residue,
+    }
+    evidence["fingerprint"] = hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return evidence
+
+
+def verify_post_turn_repository_state(
+    state: dict, step: dict, sandbox: str, observed_paths: Iterable[str],
+) -> dict:
+    """Fail closed on checkpoint-relative deltas before any outcome decision.
+
+    This deliberately recomputes Git/content evidence rather than trusting the
+    pre-turn in-memory snapshot.  Sandboxing limits what a turn can do; this is
+    the authority decision that determines whether its result can proceed.
+    """
+    evidence = recompute_repository_against_approval_checkpoint(state)
+    new_delta = set(evidence["new_project_delta"])
+    changed_residue = list(evidence["changed_approval_residue"])
+    if sandbox == "read-only":
+        if new_delta or changed_residue:
+            raise RuntimeError(
+                "READ_ONLY_CHECKPOINT_DELTA: "
+                f"new={sorted(new_delta)} residue_changed={changed_residue}"
+            )
+        return evidence | {"sandbox": sandbox, "state": "PASS"}
+    if sandbox != "workspace-write":
+        raise RuntimeError(f"post-turn verification received unsupported sandbox {sandbox!r}")
+    if changed_residue:
+        raise RuntimeError(f"APPROVAL_RESIDUE_CHANGED: {changed_residue}")
+
+    recorded = set(current_attributed_paths(state))
+    pending = _pending_step_paths(state, int(step["id"]))
+    observed = {_normalize_repo_path(str(path)) for path in observed_paths if _normalize_repo_path(str(path))}
+    candidates = recorded | pending | observed
+    unexpected = sorted(new_delta - candidates)
+    if unexpected:
+        raise RuntimeError(f"UNATTRIBUTED_CHECKPOINT_DELTA: {unexpected}")
+    protected = sorted(path for path in new_delta if is_protected_path(path) or _is_runtime_authority_path(path))
+    if protected:
+        raise RuntimeError(f"CHECKPOINT_PROTECTED_OR_RUNTIME_DELTA: {protected}")
+    # Accepted paths whose current fingerprints still match their native record
+    # retain their originating step/grant authority. Only uncovered current
+    # delta is governed by the live step's self-hosting and test policy.
+    current_step_delta = new_delta - recorded
+    tooling = sorted(path for path in current_step_delta if is_tooling_path(path))
+    authorized_tooling = authorized_self_hosting_paths(state)
+    current_grant, _grant_reason = self_hosting_grant_allows(state, int(step["id"]), tooling) if tooling else (True, "")
+    if tooling and not current_grant:
+        unauthorized = sorted(set(tooling) - authorized_tooling)
+        if unauthorized:
+            raise RuntimeError(f"CHECKPOINT_UNAUTHORIZED_TOOLING_DELTA: {unauthorized}")
+    after = {path: "checkpoint-delta" for path in current_step_delta}
+    test_violations = test_policy_violation(
+        {}, after, str(step.get("test_change_policy") or "none"), state=state, step_no=int(step["id"]),
+    )
+    if test_violations:
+        raise RuntimeError(f"CHECKPOINT_TEST_POLICY_DELTA: {test_violations}")
+    return evidence | {
+        "sandbox": sandbox,
+        "state": "PASS",
+        # These controller-derived categories are retained with the successful
+        # verification so later acceptance cannot reinterpret raw model paths.
+        "verified_tooling_paths": tooling,
+        "verified_test_paths": sorted(path for path in new_delta if path == "tests" or path.startswith("tests/")),
+    }
+
+
+def record_post_turn_repository_verification(
+    state: dict, step: dict, sandbox: str, observed_paths: Iterable[str], *, loop: int,
+) -> dict:
+    """Retain PASS/refusal evidence so every model turn has an audit record."""
+    try:
+        verification = verify_post_turn_repository_state(state, step, sandbox, observed_paths)
+    except RuntimeError as exc:
+        verification = {
+            "schema": "zen_ralph_post_turn_repository_verification_v1",
+            "state": "REFUSED",
+            "sandbox": sandbox,
+            "checkpoint": state.get("recovery_checkpoint"),
+            "plan_hash": state.get("plan_hash"),
+            "loop": loop,
+            "step": int(step["id"]),
+            "error": str(exc),
+            "recorded_at": utc_now(),
+        }
+    else:
+        verification = verification | {
+            "loop": loop,
+            "step": int(step["id"]),
+            "recorded_at": utc_now(),
+            "current_fingerprints": {
+                path: retirement_path_fingerprint(path)
+                for path in verification.get("new_project_delta") or []
+            },
+        }
+    state["last_post_turn_verification"] = verification
+    return verification
+
+
 def remember_plan_files(state: dict, paths: Iterable[str]) -> None:
-    current = list(state.get("plan_changed_files") or [])
-    owned = list(state.get("plan_owned_files") or [])
-    replacement_baseline = approval_baseline_residue_paths(state) if state.get("retirement_record_id") else set()
-    for raw_path in paths:
-        path = _normalize_repo_path(str(raw_path or ""))
-        if not path:
-            continue
-        # A replacement plan may inspect or even attempt to touch approval-time
-        # residue, but that path must never silently become new-plan delta.  Its
-        # retirement/candidate evidence remains authoritative and qualification
-        # will fail closed if the retained content changed or lacks disposition.
-        if path in replacement_baseline:
-            continue
-        if path not in current:
-            current.append(path)
-        if plan_baseline_path_kind(state, path) == "absent" and path not in owned:
-            owned.append(path)
-    state["plan_changed_files"] = sorted(current)
-    state["plan_owned_files"] = sorted(owned)
+    requested = sorted({_normalize_repo_path(str(path)) for path in paths if _normalize_repo_path(str(path))})
+    derived = validated_plan_paths(state)
+    missing = set(requested) - set(derived)
+    # Replacement reconciliation can ask the controller to re-verify a
+    # checkpoint-relative delta.  This preserves the old reconciliation flow
+    # without allowing filenames to confer ownership: only records generated
+    # by the same native attribution verifier can update the display lists.
+    if missing and state.get("retirement_record_id"):
+        step_no = int(state.get("current_step") or 0)
+        steps = list(((state.get("plan") or {}).get("steps") or []))
+        if not (1 <= step_no <= len(steps)):
+            raise RuntimeError("replacement reconciliation cannot resolve the current approved step")
+        step = steps[step_no - 1]
+        verification = record_post_turn_repository_verification(
+            state, step, "workspace-write", requested,
+            loop=int(state.get("loop_count") or 0),
+        )
+        if verification.get("state") == "PASS":
+            attribution = verified_attribution_result(
+                state, step, verification, requested,
+                loop=int(state.get("loop_count") or 0), phase="controller-reconciliation",
+            )
+            record_accepted_operations(state, attribution)
+            derived = validated_plan_paths(state)
+        missing = set(requested) - set(derived)
+    # Approval-time residue is deliberately visible to reconciliation but can
+    # never become native plan ownership or cause a raw-path rejection.
+    if missing - approval_baseline_residue_paths(state):
+        raise RuntimeError("plan file ownership requires validated native operation attribution")
+    state["plan_changed_files"] = derived
+    state["plan_owned_files"] = validated_plan_paths(state, owned_only=True)
 
 
 _CARRY_FORWARD_PENDING = "PENDING_RECONCILIATION"
@@ -1042,7 +2047,7 @@ def _step_results_from_state(state: dict) -> list[dict]:
     return [dict(value) for value in values if isinstance(value, dict)]
 
 
-def record_step_result(state: dict, step: dict, result: str, *, summary: str = "", files: Iterable[str] = (), gates: Iterable[str] = (), stats: dict | None = None) -> None:
+def record_step_result(state: dict, step: dict, result: str, *, summary: str = "", files: Iterable[str] = (), gates: Iterable[str] = (), stats: dict | None = None, attribution: dict | None = None) -> None:
     values = _step_results_from_state(state)
     values.append({
         "step": int(step.get("id") or 0),
@@ -1050,6 +2055,7 @@ def record_step_result(state: dict, step: dict, result: str, *, summary: str = "
         "result": result,
         "summary": " ".join(str(summary or "").split())[:1000],
         "files": list(files),
+        "attribution": dict(attribution or {}),
         "gates": list(gates),
         "stats": dict(stats or {}),
         "recorded_at": utc_now(),
@@ -1102,7 +2108,17 @@ def plan_progress_rows(state: dict) -> list[str]:
 def build_completion_report(state: dict, final_gates: list[str]) -> dict:
     plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
     steps = list(plan.get("steps") or [])
-    files = list(state.get("plan_changed_files") or [])
+    # Cached filename fields are conveniences for state inspection only.  The
+    # report is an authority-facing display and must be rebuilt from native
+    # records every time.
+    try:
+        files = validated_plan_paths(state)
+        owned_files = validated_plan_paths(state, owned_only=True)
+        attribution_error = None
+    except RuntimeError as exc:
+        # A terminal report must retain a controller refusal without turning
+        # stale filename fields into authority-facing change lists.
+        files, owned_files, attribution_error = [], [], str(exc)
     saved_changes = state.get("completion_changes") if isinstance(state.get("completion_changes"), dict) else {}
     entries = list(saved_changes.get("entries") or []) if saved_changes else change_entries(files)
     added = int(saved_changes.get("added") or 0) if saved_changes else sum(int(item.get("added") or 0) for item in entries)
@@ -1135,6 +2151,7 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         "plan_hash": state.get("plan_hash"),
         "goal": plan.get("goal"),
         "status": state.get("status"),
+        "repository_authority": plan.get(REPOSITORY_AUTHORITY_FIELD),
         "counts": {
             "steps_total": len(steps),
             "steps_accepted": int(outcomes["accepted"]),
@@ -1152,6 +2169,10 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
             "error": qualification_record.get("error"),
             "gates": final_gates,
         },
+        "attribution": {
+            "state": "REFUSED" if attribution_error else "PASS",
+            "error": attribution_error,
+        },
         "changes": {"files": len(entries), "added": added, "removed": removed, "entries": entries},
         "step_results": step_results,
         "recovery_checkpoint": state.get("recovery_checkpoint"),
@@ -1159,11 +2180,14 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         "authority": {
             "ralph_tooling_changed": any(is_tooling_path(path) for path in files),
             "protected_paths_changed": any(is_protected_path(path) for path in files),
-            "plan_owned_files": sorted(state.get("plan_owned_files") or []),
+            "plan_owned_files": owned_files,
             "human_steering": list(state.get("human_steering") or []),
         },
         "usage": token_totals,
-        "suggested_commit": state.get("commit_message") or _default_commit_message(state),
+        "suggested_commit": (
+            None if plan.get(REPOSITORY_AUTHORITY_FIELD) == "read-only"
+            else state.get("commit_message") or _default_commit_message(state)
+        ),
         "commit": state.get("commit_sha"),
         "push": state.get("push_upstream"),
         "reconciliation": {
@@ -1198,6 +2222,7 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         f"- State: {report['qualification']['state']}",
         *([f"- Stage: {report['qualification']['stage']}"] if report['qualification'].get('stage') else []),
         *([f"- Error: {report['qualification']['error']}"] if report['qualification'].get('error') else []),
+        *([f"- Native attribution refusal: {attribution_error}"] if attribution_error else []),
         *[f"- {gate}" for gate in final_gates], "",
         "## Changes", "",
         f"- Files: {len(entries)}", f"- Lines: +{added}/-{removed}",
@@ -1221,6 +2246,7 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
                 lines.append(f"- `{item['path']}` — {item['classification']}; {item['disposition']}; step={item['claiming_step'] or '-'}; evidence={item['evidence_status']}; qualification={item['qualification_impact']}; reason={item['reason'] or '-'}")
     lines += [
         "", "## Authority", "",
+        f"- Repository authority: `{plan.get(REPOSITORY_AUTHORITY_FIELD) or '-'}`",
         f"- RALPH tooling changed by plan: {'YES' if report['authority']['ralph_tooling_changed'] else 'NO'}",
         f"- Protected paths changed by plan: {'YES' if report['authority']['protected_paths_changed'] else 'NO'}",
         f"- Plan-owned files: {', '.join(report['authority']['plan_owned_files']) if report['authority']['plan_owned_files'] else '-'}",
@@ -1232,16 +2258,27 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
         f"- Reasoning tokens: {token_totals['reasoning_output_tokens']}",
         f"- Commands executed: {token_totals['commands_executed']}",
         "", "## Finalization", "",
-        f"- Suggested commit: `{report['suggested_commit']}`",
-        f"- Commit: `{state.get('commit_sha') or '-'}`",
-        f"- Push upstream: `{state.get('push_upstream') or '-'}`",
-        f"- Commit reconciled: {'yes' if state.get('commit_reconciled') else 'no'}",
-        f"- Push reconciled: {'yes' if state.get('push_reconciled') else 'no'}",
-        f"- Review: `python3 scripts/ralph.py finalize {state.get('plan_hash')}`",
-        f"- Commit: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --commit`",
-        f"- Push: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --push`",
-        "",
     ]
+    if plan.get(REPOSITORY_AUTHORITY_FIELD) == "read-only":
+        lines += [
+            f"- Terminal: `{state.get('status')}`",
+            "- Repository delta: zero required",
+            "- Commit/push/reconciliation: prohibited for this read-only plan",
+            "- Next action: no repository finalization is required",
+            "",
+        ]
+    else:
+        lines += [
+            f"- Suggested commit: `{report['suggested_commit']}`",
+            f"- Commit: `{state.get('commit_sha') or '-'}`",
+            f"- Push upstream: `{state.get('push_upstream') or '-'}`",
+            f"- Commit reconciled: {'yes' if state.get('commit_reconciled') else 'no'}",
+            f"- Push reconciled: {'yes' if state.get('push_reconciled') else 'no'}",
+            f"- Review: `python3 scripts/ralph.py finalize {state.get('plan_hash')}`",
+            f"- Commit: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --commit`",
+            f"- Push: `python3 scripts/ralph.py finalize {state.get('plan_hash')} --push`",
+            "",
+        ]
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return report
 
@@ -1268,39 +2305,15 @@ def authorized_self_hosting_paths(state: dict) -> set[str]:
 
 
 def plan_delta_fingerprint(state: dict) -> str:
-    """Bind qualification to the exact recorded plan delta currently on disk."""
-    # Validate reconciliation action context before checking whether a current
-    # new-plan delta exists.  This keeps a stale adoption record diagnosable
-    # even when its replacement plan has already consumed the original delta.
-    if state.get("retirement_record_id"):
-        reconciliation_snapshot(state)
-    provenance = _reconciled_provenance_guard(state, "fingerprint")
-    planned = provenance["new_plan_paths"]
-    if not planned:
-        raise RuntimeError("plan has no recorded changed files")
-    digest = hashlib.sha256()
-    digest.update(str(state.get("plan_hash") or "").encode())
-    digest.update(b"\0")
-    digest.update(str(state.get("recovery_checkpoint") or "").encode())
-    digest.update(b"\0RECONCILIATION\0")
-    digest.update(json.dumps(reconciliation_snapshot(state), sort_keys=True, separators=(",", ":")).encode())
-    digest.update(b"\0PROVENANCE\0")
-    digest.update(json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode())
-    for path in planned:
-        digest.update(b"\0PATH\0" + path.encode())
-        status = _git(["status", "--porcelain=v1", "--", path], check=False).stdout
-        digest.update(b"\0STATUS\0" + status.encode())
-        full = ROOT / path
-        if full.is_symlink():
-            digest.update(b"\0SYMLINK\0" + os.readlink(full).encode())
-        elif full.exists() and full.is_file():
-            digest.update(b"\0FILE\0")
-            with full.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        else:
-            digest.update(b"\0MISSING\0")
-    return digest.hexdigest()
+    """Bind qualification to exact native authority and current attributed delta."""
+    # A pending retirement reconciliation is an independently disqualifying
+    # condition.  Preserve its precise refusal before checking the native plan
+    # artifact so controller diagnostics cannot mask unresolved residue.
+    pending = unresolved_replacement_dispositions(state)
+    if pending and pending != ["<inventory-missing>"]:
+        raise RuntimeError(f"PENDING_RECONCILIATION: {', '.join(pending)}")
+    provenance = strict_native_provenance(state, "delta fingerprint", require_current_delta=True)
+    return str(provenance["current_sha256"])
 
 
 def _reconciled_provenance_guard(
@@ -1311,6 +2324,26 @@ def _reconciled_provenance_guard(
     Carry-forward content remains approval-time residue: it is revalidated and
     fingerprinted as evidence, but is never returned as new-plan staging scope.
     """
+    # Every executable approved plan has a native approval artifact.  Do not
+    # let this older reconciliation-shaped entry point turn its convenience
+    # filename projections into authority when it is called directly.
+    if isinstance(state.get("approved_plan_artifact"), dict):
+        native = strict_native_provenance(
+            state, phase, require_current_delta=require_new_plan_delta, require_write=True,
+        )
+        return {
+            "new_plan_paths": list(native["new_plan_paths"]),
+            "adopted_carry_forward_paths": [],
+            "approval_baseline_paths": [],
+            "adopted_evidence": {},
+            "untracked_residue": [],
+            "native_provenance_sha256": native["binding_sha256"],
+        }
+
+    # This compatibility branch is retained solely for non-executable legacy
+    # diagnostic fixtures which have no controller-bound approval artifact.
+    # Approval, qualification, staging, and terminal commands never authorize
+    # an approved plan through this branch.
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     if not checkpoint:
         raise RuntimeError(f"{phase} requires a recovery checkpoint")
@@ -1383,7 +2416,8 @@ def _reconciled_provenance_guard(
             "untracked_residue": untracked_residue}
 
 
-RETIREMENT_MANIFEST_SCHEMA = "zen_ralph_retirement_v3"
+RETIREMENT_MANIFEST_SCHEMA = "zen_ralph_retirement_v4"
+RETIREMENT_MANIFEST_LEGACY_SCHEMA = "zen_ralph_retirement_v3"
 _RETIREMENT_ID_RE = re.compile(r"^RT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 _RETIREMENT_PATH_KINDS = {"tracked", "untracked", "missing"}
 
@@ -1671,8 +2705,16 @@ def unresolved_replacement_dispositions(state: dict) -> list[str]:
 
 
 def retirement_path_records(state: dict, paths: Iterable[str]) -> list[dict]:
-    """Bind paths to baseline, explicit plan ownership, current state, and surprise."""
+    """Capture carry-forward inventory evidence without granting rollback authority.
+
+    These records intentionally preserve the historical retirement/carry-forward
+    contract: a replacement plan needs immutable evidence for retained paths even
+    though rollback authority now comes exclusively from native operation
+    attribution.  The projection fields identify what the retiring controller
+    knew; the embedded attribution marker explicitly grants no mutation authority.
+    """
     explicit_owned = {_retirement_path(str(item)) for item in state.get("plan_owned_files") or []}
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
     records: list[dict] = []
     for raw in sorted({_retirement_path(str(item)) for item in paths}):
         baseline = plan_baseline_path_kind(state, raw)
@@ -1689,8 +2731,107 @@ def retirement_path_records(state: dict, paths: Iterable[str]) -> list[dict]:
             "current": current,
             "unexpected": unexpected,
             "evidence": fingerprint,
+            "attribution": {
+                "schema": "zen_ralph_carry_forward_inventory_v1",
+                "authority": "inventory-only",
+                "plan_hash": state.get("plan_hash"),
+                "checkpoint": checkpoint_id,
+                "source": "controller-plan-file-projection",
+            },
+            "before": fingerprint,
+            "after": fingerprint,
+            "restoration": {
+                "disposition": "preserved",
+                "action": "none",
+                "checkpoint": checkpoint_id,
+            },
         })
     return records
+
+
+def retirement_attribution_records(state: dict) -> list[dict]:
+    """Derive one fail-closed rollback record per current native attribution.
+
+    Retirement deliberately does not consult the convenience plan-file lists:
+    those lists are reporting projections, not recovery authority.  Every
+    checkpoint-relative delta must instead have one intact native operation
+    record whose fingerprint still describes the current worktree.
+    """
+    latest = _latest_operation_records_by_path(state)
+    validated = _validated_operation_records(state)
+    if len(latest) != len(validated):
+        raise RuntimeError("retire-plan refuses duplicate operation attribution")
+
+    repository = recompute_repository_against_approval_checkpoint(state)
+    changed_residue = sorted(repository.get("changed_approval_residue") or [])
+    if changed_residue:
+        raise RuntimeError(f"retire-plan refuses changed approval residue: {changed_residue}")
+    current_delta = {
+        _retirement_path(str(path))
+        for path in repository.get("new_project_delta") or []
+    }
+    attributed = set(latest)
+    if current_delta != attributed:
+        raise RuntimeError(
+            "retire-plan refuses unattributed or stale checkpoint delta: "
+            f"unattributed={sorted(current_delta - attributed)} "
+            f"stale={sorted(attributed - current_delta)}"
+        )
+
+    records: list[dict] = []
+    for path in sorted(attributed):
+        attribution = latest[path]
+        baseline = str(attribution.get("baseline_kind") or "")
+        if baseline not in {"tracked", "absent"}:
+            raise RuntimeError(f"retire-plan refuses unsupported attribution baseline: {path} ({baseline})")
+        before = retirement_path_fingerprint(path)
+        if attribution.get("current_fingerprint") != before:
+            raise RuntimeError(f"retire-plan refuses stale attribution fingerprint: {path}")
+        if baseline == "tracked" and before["kind"] not in {"tracked", "missing"}:
+            raise RuntimeError(f"retire-plan refuses invalid tracked attribution state: {path}")
+        if baseline == "absent" and before["kind"] == "missing":
+            raise RuntimeError(f"retire-plan refuses stale creation attribution: {path}")
+        records.append({
+            "path": path,
+            "baseline": baseline,
+            "plan_owned": baseline == "absent",
+            "current": before["kind"],
+            "unexpected": False,
+            "evidence": before,
+            "attribution": _json_copy(attribution),
+            "before": before,
+            "after": None,
+            "restoration": None,
+        })
+    return records
+
+
+def _restore_attributed_retirement_path(recovery_ref: str, record: dict) -> dict:
+    """Restore exactly one pre-validated attribution and return post-state proof."""
+    path = _retirement_path(str(record["path"]))
+    baseline = str(record["baseline"])
+    if baseline == "tracked":
+        restored = _git(["checkout", recovery_ref, "--", path], check=False)
+        if restored.returncode != 0:
+            raise RuntimeError(f"retire-plan cannot restore tracked checkpoint path: {path}")
+        after = retirement_path_fingerprint(path)
+        if after["kind"] != "tracked":
+            raise RuntimeError(f"retire-plan tracked restoration is not a regular tracked file: {path}")
+        index_diff = _git(["diff", "--quiet", recovery_ref, "--", path], check=False)
+        worktree_diff = _git(["diff", "--quiet", "--", path], check=False)
+        if index_diff.returncode != 0 or worktree_diff.returncode != 0:
+            raise RuntimeError(f"retire-plan tracked restoration differs from recovery checkpoint: {path}")
+        return after
+    if baseline == "absent":
+        full = ROOT / path
+        if full.is_symlink() or not full.is_file():
+            raise RuntimeError(f"retire-plan creation target is no longer a regular file: {path}")
+        full.unlink()
+        after = retirement_path_fingerprint(path)
+        if after["kind"] != "missing":
+            raise RuntimeError(f"retire-plan checkpoint-absent creation remains present: {path}")
+        return after
+    raise RuntimeError(f"retire-plan refuses unsupported attribution baseline: {path} ({baseline})")
 
 
 def validate_retirement_manifest(manifest: dict) -> dict:
@@ -1698,7 +2839,8 @@ def validate_retirement_manifest(manifest: dict) -> dict:
     if not isinstance(manifest, dict):
         raise RuntimeError("retirement manifest must be an object")
     required = {"schema", "id", "created_at", "plan_hash", "status_before", "reason", "disposition", "checkpoint", "step", "step_count", "loop_count", "paths", "operations", "repository_before", "repository_after", "planning_context"}
-    if set(manifest) != required or manifest.get("schema") != RETIREMENT_MANIFEST_SCHEMA:
+    schema = manifest.get("schema")
+    if set(manifest) != required or schema not in {RETIREMENT_MANIFEST_SCHEMA, RETIREMENT_MANIFEST_LEGACY_SCHEMA}:
         raise RuntimeError("retirement manifest schema is invalid")
     if not _RETIREMENT_ID_RE.fullmatch(str(manifest["id"])):
         raise RuntimeError("retirement manifest identifier is invalid")
@@ -1729,7 +2871,10 @@ def validate_retirement_manifest(manifest: dict) -> dict:
         raise RuntimeError("retirement manifest requires path evidence")
     seen: set[str] = set()
     for item in paths:
-        if not isinstance(item, dict) or set(item) != {"path", "baseline", "plan_owned", "current", "unexpected", "evidence"}:
+        expected_fields = {"path", "baseline", "plan_owned", "current", "unexpected", "evidence"}
+        if schema == RETIREMENT_MANIFEST_SCHEMA:
+            expected_fields |= {"attribution", "before", "after", "restoration"}
+        if not isinstance(item, dict) or set(item) != expected_fields:
             raise RuntimeError("retirement manifest path record is invalid")
         path = _retirement_path(str(item.get("path") or ""))
         if path in seen or item["baseline"] not in {"tracked", "preexisting-untracked", "preexisting-dirty", "absent", "unknown"}:
@@ -1754,6 +2899,26 @@ def validate_retirement_manifest(manifest: dict) -> dict:
         actual = _retirement_sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         if not isinstance(expected, str) or expected != actual:
             raise RuntimeError("retirement manifest fingerprint integrity check failed")
+        if schema == RETIREMENT_MANIFEST_LEGACY_SCHEMA:
+            # v3 artifacts are immutable historical evidence.  They remain
+            # readable for replacement/carry-forward reconciliation, but no v3
+            # path record can satisfy the v4 native rollback contract.
+            continue
+        if not isinstance(item["attribution"], dict) or item["before"] != evidence:
+            raise RuntimeError("retirement manifest attribution restoration evidence is invalid")
+        restoration = item["restoration"]
+        if not isinstance(restoration, dict) or set(restoration) != {"disposition", "action", "checkpoint"}:
+            raise RuntimeError("retirement manifest restoration disposition is invalid")
+        if restoration["checkpoint"] != manifest["checkpoint"]:
+            raise RuntimeError("retirement manifest restoration checkpoint is invalid")
+        if manifest["disposition"] == "ROLLED_BACK":
+            if restoration["disposition"] != "restored" or restoration["action"] not in {"checkout", "delete"}:
+                raise RuntimeError("retirement manifest rollback restoration is invalid")
+            after = item["after"]
+            if not isinstance(after, dict) or set(after) != set(evidence):
+                raise RuntimeError("retirement manifest rollback lacks post-restoration evidence")
+        elif restoration["disposition"] != "preserved" or restoration["action"] != "none" or item["after"] != evidence:
+            raise RuntimeError("retirement manifest carry-forward preservation evidence is invalid")
     return manifest
 
 
@@ -1849,6 +3014,15 @@ def qualified_delta_matches(state: dict) -> tuple[bool, str]:
     qualification = state.get("final_qualification") if isinstance(state.get("final_qualification"), dict) else {}
     if str(qualification.get("state") or "") != "PASS":
         return False, "final qualification is not PASS"
+    # Native approved plans must bind qualification to exact operation provenance.
+    # Legacy in-memory fixtures without native approval bindings retain the old
+    # diagnostic behavior, but no executable native plan can reach this branch.
+    if isinstance(state.get("approved_plan_artifact"), dict):
+        try:
+            _qualified_native_provenance(state, "qualified delta", require_current_delta=True)
+        except RuntimeError as exc:
+            return False, str(exc)
+        return True, "qualified native provenance and delta match"
     expected = str(qualification.get("delta_fingerprint") or "").strip()
     if not expected:
         planned = {_normalize_repo_path(str(path)) for path in state.get("plan_changed_files") or []}
@@ -1867,13 +3041,20 @@ def qualified_delta_matches(state: dict) -> tuple[bool, str]:
 
 def finalization_review(state: dict) -> dict:
     provenance_error = None
+    native = None
     try:
-        provenance = _reconciled_provenance_guard(state, "finalization review")
+        if isinstance(state.get("approved_plan_artifact"), dict):
+            native = strict_native_provenance(state, "finalization review", require_current_delta=True)
+            planned = set(native["new_plan_paths"])
+            provenance = native
+        else:
+            provenance = _reconciled_provenance_guard(state, "finalization review")
+            planned = set(provenance["new_plan_paths"])
     except RuntimeError as exc:
         provenance, provenance_error = None, str(exc)
+        planned = set()
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     baseline = set(checkpoint.get("baseline_dirty_paths") or []) if checkpoint else set()
-    planned = set(state.get("plan_changed_files") or [])
     current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
     overlap = sorted((baseline & planned) - {path for path in planned if path.startswith(".ralph/")})
     unexpected = sorted(current - baseline - planned)
@@ -1905,13 +3086,8 @@ def _commit_paths(commit_sha: str) -> list[str]:
 def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
     if state.get("status") != "READY_TO_COMMIT":
         raise RuntimeError(f"reconcile-commit requires READY_TO_COMMIT, found {state.get('status')}")
-    if str((state.get("final_qualification") or {}).get("state") or "") != "PASS":
-        raise RuntimeError("final qualification is not PASS; commit reconciliation refused")
-    # A manually-created candidate commit has already consumed the approved
-    # worktree delta.  Keep every reconciliation/adoption check, but do not
-    # require that consumed delta to still be dirty on disk.
-    provenance = _reconciled_provenance_guard(
-        state, "commit reconciliation", require_new_plan_delta=False,
+    provenance = _qualified_native_provenance(
+        state, "commit reconciliation", require_current_delta=False, require_write=True,
     )
     resolved = _git(["rev-parse", "--verify", f"{commit_sha}^{{commit}}"], check=False)
     if resolved.returncode != 0:
@@ -1920,39 +3096,24 @@ def _verify_reconciled_commit(state: dict, commit_sha: str) -> dict:
     reachable = _git(["merge-base", "--is-ancestor", sha, "HEAD"], check=False)
     if reachable.returncode != 0:
         raise RuntimeError("commit is not reachable from current HEAD")
-    planned = set(provenance["new_plan_paths"])
-    if not planned:
-        raise RuntimeError("plan has no recorded changed files")
-    protected = sorted(path for path in planned if is_protected_path(path) or _is_runtime_authority_path(path))
-    if protected:
-        raise RuntimeError(f"plan records protected/runtime authority paths; reconciliation refused: {protected}")
-    tooling = sorted(path for path in planned if is_tooling_path(path))
-    unauthorized_tooling = sorted(set(tooling) - authorized_self_hosting_paths(state))
-    if unauthorized_tooling:
-        raise RuntimeError(f"plan records RALPH tooling without same-plan self-hosting authority: {unauthorized_tooling}")
-    checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
-    if not checkpoint:
-        raise RuntimeError("recovery checkpoint is missing; reconciliation refused")
-    baseline = set(checkpoint.get("baseline_dirty_paths") or []) | set(checkpoint.get("baseline_untracked_paths") or [])
-    commit_paths = set(_commit_paths(sha))
-    missing = sorted(planned - commit_paths)
-    if missing:
-        raise RuntimeError(f"manual commit does not contain every recorded plan path: {missing}")
-    unexpected = sorted(commit_paths - planned - baseline)
-    if unexpected:
-        raise RuntimeError(f"manual commit contains unexpected paths outside plan/baseline: {unexpected}")
-    qualified, qualified_reason = qualified_delta_matches(state)
-    if not qualified:
-        raise RuntimeError(f"commit reconciliation refused: {qualified_reason}")
+    commit_paths = _verify_commit_native_provenance(state, sha, provenance, "commit reconciliation")
     return {
         "sha": sha,
-        "commit_paths": sorted(commit_paths),
-        "baseline_extras": sorted(commit_paths - planned),
+        "commit_paths": commit_paths,
+        "baseline_extras": [],
+        "native_provenance_sha256": provenance["binding_sha256"],
     }
 
 
 def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
-    provenance = _reconciled_provenance_guard(state, "automated commit")
+    if isinstance(state.get("approved_plan_artifact"), dict):
+        native = _qualified_native_provenance(
+            state, "automated commit", require_current_delta=True, require_write=True,
+        )
+        planned = set(native["new_plan_paths"])
+    else:
+        provenance = _reconciled_provenance_guard(state, "automated commit")
+        planned = set(provenance["new_plan_paths"])
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     if not checkpoint:
         raise RuntimeError("recovery checkpoint is missing; finalization refused")
@@ -1960,7 +3121,6 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
     baseline_staged = sorted(checkpoint.get("baseline_staged_paths") or [])
     if baseline_staged:
         raise RuntimeError(f"pre-existing staged changes were present at approval; automated commit refused: {baseline_staged}")
-    planned = set(provenance["new_plan_paths"])
     if not planned:
         raise RuntimeError("no RALPH plan changes are recorded; commit refused")
     overlap = sorted(baseline & planned)
@@ -1993,9 +3153,6 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
     missing = sorted(path for path in planned if path not in current)
     if missing:
         raise RuntimeError(f"recorded plan paths are no longer present in the working-tree delta: {missing}")
-    qualified, qualified_reason = qualified_delta_matches(state)
-    if not qualified:
-        raise RuntimeError(f"automated commit refused: {qualified_reason}")
     proc = _git(["diff", "--check", "--", *sorted(planned)], check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"git diff --check failed: {proc.stdout[-3000:]}")
@@ -2008,8 +3165,15 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
 
 
 def _requalification_delta_guard(state: dict) -> tuple[list[str], list[str]]:
-    """Require final requalification to cover only the recorded current delta."""
-    provenance = _reconciled_provenance_guard(state, "requalification")
+    """Require final qualification to cover exact current native provenance."""
+    if isinstance(state.get("approved_plan_artifact"), dict):
+        native = strict_native_provenance(
+            state, "requalification", require_current_delta=True, require_write=True,
+        )
+        planned = set(native["new_plan_paths"])
+    else:
+        provenance = _reconciled_provenance_guard(state, "requalification")
+        planned = set(provenance["new_plan_paths"])
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     if not checkpoint:
         raise RuntimeError("requalification requires a recovery checkpoint")
@@ -2018,7 +3182,6 @@ def _requalification_delta_guard(state: dict) -> tuple[list[str], list[str]]:
     } | {
         str(path) for path in checkpoint.get("baseline_untracked_paths") or []
     }
-    planned = set(provenance["new_plan_paths"])
     if not planned:
         raise RuntimeError("requalification requires recorded plan changes")
     overlap = sorted(baseline & planned)
@@ -2081,17 +3244,45 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reject_read_only_terminal(state: dict, action: str) -> None:
+    if state.get("status") == "READ_ONLY_COMPLETE":
+        raise RuntimeError(
+            f"{action} is prohibited for READ_ONLY_COMPLETE read-only terminal"
+        )
+
+
 def cmd_requalify(args: argparse.Namespace) -> int:
-    """Re-run final qualification and bind it to the exact current plan delta."""
+    """Re-run final qualification and bind it to exact native provenance."""
     init_files()
     state = load_state()
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("requalify hash does not match the current plan")
+    _reject_read_only_terminal(state, "requalify")
     if state.get("status") != "READY_TO_COMMIT":
         raise RuntimeError(f"requalify requires READY_TO_COMMIT, found {state.get('status')}")
+    # Check the exact current scope before spending gate time.  Executable
+    # plans always have a controller-bound artifact, so this invokes strict
+    # native provenance and never derives authority from filename projections.
+    # Artifact-less objects are non-executable diagnostic fixtures only.
+    if isinstance(state.get("approved_plan_artifact"), dict):
+        _requalification_delta_guard(state)
     passed, gates, durations, output = run_final_qualification(state)
-    planned = sorted({str(path) for path in state.get("plan_changed_files") or []})
-    fingerprint = plan_delta_fingerprint(state) if passed else None
+    provenance = None
+    fingerprint = None
+    planned: list[str] = []
+    if passed:
+        if isinstance(state.get("approved_plan_artifact"), dict):
+            provenance = strict_native_provenance(
+                state, "requalification result", require_current_delta=True, require_write=True,
+            )
+            fingerprint = str(provenance["current_sha256"])
+            planned = list(provenance["new_plan_paths"])
+        else:
+            # Artifact-less states are retained solely for non-executable
+            # controller diagnostic fixtures.  They cannot reach terminal
+            # admission, staging, commit, or push; retain their historical
+            # fingerprint seam without granting filename-list authority.
+            fingerprint = plan_delta_fingerprint(state)
     state["final_qualification"] = {
         "state": "PASS" if passed else "FAIL",
         "gates": gates,
@@ -2099,8 +3290,10 @@ def cmd_requalify(args: argparse.Namespace) -> int:
         "output": output[-6000:],
         "completed_at": utc_now(),
         "delta_fingerprint": fingerprint,
+        "native_provenance_sha256": provenance.get("binding_sha256") if provenance else None,
         "completion_summary": {
             "delta_fingerprint": fingerprint,
+            "native_provenance_sha256": provenance.get("binding_sha256") if provenance else None,
             "recorded_plan_paths": planned,
         } if passed else None,
     }
@@ -2112,7 +3305,7 @@ def cmd_requalify(args: argparse.Namespace) -> int:
         if output:
             print(output[-6000:])
         return 2
-    entries = change_entries(state.get("plan_changed_files") or [])
+    entries = change_entries(planned)
     state["completion_changes"] = {
         "entries": entries,
         "files": len(entries),
@@ -2122,8 +3315,8 @@ def cmd_requalify(args: argparse.Namespace) -> int:
     state["block_reason"] = None
     save_state(state)
     build_completion_report(state, gates)
-    live_write(f"final requalification PASS · delta={state['final_qualification']['delta_fingerprint'][:12]}", "READY")
-    print(f"REQUALIFIED plan={state['plan_hash']} delta={state['final_qualification']['delta_fingerprint']}")
+    live_write(f"final requalification PASS · delta={fingerprint[:12]}", "READY")
+    print(f"REQUALIFIED plan={state['plan_hash']} delta={fingerprint}")
     return 0
 
 
@@ -2133,15 +3326,27 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("finalize hash does not match the current plan")
     action = "push" if args.push else "commit" if args.commit else "review"
+    terminal_action = f"finalize --{action}" if action != "review" else "finalize review"
+    _reject_read_only_terminal(state, terminal_action)
     if action == "review":
         if state.get("status") not in {"READY_TO_COMMIT", "COMMITTED", "PUSHED"}:
             raise RuntimeError(f"finalize review requires READY_TO_COMMIT/COMMITTED/PUSHED, found {state.get('status')}")
-        qualified, qualified_reason = qualified_delta_matches(state)
-        if not qualified:
-            raise RuntimeError(f"finalize review refused: {qualified_reason}")
+        if state.get("status") == "READY_TO_COMMIT":
+            qualified, qualified_reason = qualified_delta_matches(state)
+            if not qualified:
+                raise RuntimeError(f"finalize review refused: {qualified_reason}")
+            review = finalization_review(state)
+        else:
+            provenance = _qualified_native_provenance(
+                state, "finalize review", require_current_delta=False, require_write=True,
+            )
+            sha = str(state.get("commit_sha") or "")
+            if not sha:
+                raise RuntimeError("finalize review requires recorded commit SHA")
+            _verify_commit_native_provenance(state, sha, provenance, "finalize review")
+            review = {"overlap": [], "planned": provenance["new_plan_paths"], "checkpoint": load_recovery_checkpoint(state.get("recovery_checkpoint"))}
         report = build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
         print(tui.completion_card(report))
-        review = finalization_review(state)
         if review.get("overlap"):
             checkpoint = review.get("checkpoint") or {}
             print(tui.commit_overlap_card(
@@ -2159,6 +3364,9 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     if action == "commit":
         if state.get("status") != "READY_TO_COMMIT":
             raise RuntimeError(f"finalize --commit requires READY_TO_COMMIT, found {state.get('status')}")
+        provenance = _qualified_native_provenance(
+            state, "automated commit", require_current_delta=True, require_write=True,
+        )
         planned, _baseline = _finalization_guard(state)
         _git(["add", "--", *planned])
         staged = sorted(line.strip() for line in _git(["diff", "--cached", "--name-only"], check=False).stdout.splitlines() if line.strip())
@@ -2171,6 +3379,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             _git(["reset"], check=False)
             raise RuntimeError(f"git commit failed ({proc.returncode}): {proc.stdout[-4000:]}")
         sha = git_head()
+        _verify_commit_native_provenance(state, sha, provenance, "automated commit")
         state["status"] = "COMMITTED"
         state["commit_sha"] = sha
         state["commit_message"] = message
@@ -2182,10 +3391,17 @@ def cmd_finalize(args: argparse.Namespace) -> int:
 
     if state.get("status") != "COMMITTED":
         raise RuntimeError(f"finalize --push requires COMMITTED, found {state.get('status')}")
+    provenance = _qualified_native_provenance(
+        state, "automated push", require_current_delta=False, require_write=True,
+    )
+    sha = str(state.get("commit_sha") or "")
+    if not sha:
+        raise RuntimeError("automated push requires recorded commit SHA")
+    _verify_commit_native_provenance(state, sha, provenance, "automated push")
     upstream = git_upstream()
     if not upstream or "/" not in upstream:
         raise RuntimeError("current branch has no configured upstream; push refused")
-    remote, remote_branch = upstream.split("/", 1)
+    remote, _remote_branch = upstream.split("/", 1)
     current_branch = git_branch()
     if not current_branch:
         raise RuntimeError("detached HEAD; push refused")
@@ -2208,9 +3424,10 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     state["pushed_at"] = utc_now()
     save_state(state)
     build_completion_report(state, list((state.get("final_qualification") or {}).get("gates") or []))
-    live_write(f"pushed commit {str(state.get('commit_sha') or '')[:12]} to configured upstream {upstream}", "COMPLETE")
+    live_write(f"pushed commit {sha[:12]} to configured upstream {upstream}", "COMPLETE")
     print(f"PUSHED plan={state['plan_hash']} upstream={upstream}")
     return 0
+
 
 def cmd_reconcile_commit(args: argparse.Namespace) -> int:
     """Adopt an already-created qualified commit after strict controller verification."""
@@ -2218,6 +3435,7 @@ def cmd_reconcile_commit(args: argparse.Namespace) -> int:
     state = load_state()
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("reconcile-commit hash does not match the current plan")
+    _reject_read_only_terminal(state, "reconcile-commit")
     verified = _verify_reconciled_commit(state, args.commit)
     note = " ".join(str(args.reason or "").split())
     if not note:
@@ -2244,16 +3462,21 @@ def cmd_reconcile_commit(args: argparse.Namespace) -> int:
 
 
 def cmd_reconcile_push(args: argparse.Namespace) -> int:
-    """Mark a reconciled/created commit PUSHED only after proving it exists upstream."""
+    """Mark a reconciled/created commit PUSHED only after native provenance proof."""
     init_files()
     state = load_state()
     if args.plan_hash != state.get("plan_hash"):
         raise RuntimeError("reconcile-push hash does not match the current plan")
+    _reject_read_only_terminal(state, "reconcile-push")
     if state.get("status") not in {"COMMITTED", "PUSHED"}:
         raise RuntimeError(f"reconcile-push requires COMMITTED/PUSHED, found {state.get('status')}")
     sha = str(state.get("commit_sha") or "").strip()
     if not sha:
         raise RuntimeError("no recorded commit SHA")
+    provenance = _qualified_native_provenance(
+        state, "reconciled push", require_current_delta=False, require_write=True,
+    )
+    _verify_commit_native_provenance(state, sha, provenance, "reconciled push")
     upstream = git_upstream()
     if not upstream or "/" not in upstream:
         raise RuntimeError("current branch has no configured upstream")
@@ -2341,7 +3564,6 @@ def cmd_adopt_test_reconciliation(args: argparse.Namespace) -> int:
         "prior_qualification_binding": prior_binding,
     }
     adoption["entry_hash"] = hashlib.sha256(json.dumps(adoption, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    remember_plan_files(state, [adopted_path])
     state["test_reconciliation_adoptions"] = [*adoptions, adoption]
 
     # `ready_to_commit_test_reconciliation_candidate` cannot produce a real
@@ -2350,6 +3572,12 @@ def cmd_adopt_test_reconciliation(args: argparse.Namespace) -> int:
     # but never allow this branch in a controller-derived invocation.  A real
     # adoption always immediately requalifies the expanded, guarded delta.
     if not state.get("recovery_checkpoint"):
+        # This is only reachable by an in-memory/mocked candidate: the real
+        # candidate derivation requires the checkpoint above.  It remains
+        # explicitly blocked and never gains validated plan ownership.
+        state["plan_changed_files"] = sorted(
+            set(state.get("plan_changed_files") or []) | {adopted_path}
+        )
         state["final_qualification"] = {
             "state": "STALE",
             "requalified_after": None,
@@ -2368,6 +3596,7 @@ def cmd_adopt_test_reconciliation(args: argparse.Namespace) -> int:
         print(f"TEST_ADOPTED plan={state['plan_hash']} path={adopted_path}; requalification required")
         return 0
 
+    remember_plan_files(state, [adopted_path])
     passed, gates, durations, output = run_final_qualification(state)
     resulting_fingerprint = plan_delta_fingerprint(state) if passed else None
     state["final_qualification"] = {
@@ -4455,10 +5684,19 @@ def cmd_propose(args: argparse.Namespace) -> int:
     state = load_state()
     policy = efficiency_policy.load_policy(ROOT)
     reserve_percent = float(policy["reserve_percent"])
-    if state.get("status") not in {"IDLE", "PLAN_COMPLETE", "PUSHED"}:
+    if state.get("status") not in {"IDLE", "PLAN_COMPLETE", "PUSHED", "READ_ONLY_COMPLETE"}:
         raise RuntimeError(f"cannot propose while status={state.get('status')}; finish or resolve the current plan first")
     retirement_record_id = str(getattr(args, "from_retirement", "") or "").strip() or None
     carry_forward = None
+    repository_authority = getattr(args, "repository_authority", None)
+    # The command-line interface always requires an explicit authority.  Keep
+    # the in-process replacement workflow usable for controller callers that
+    # predate that argument; it still receives a controller-injected authority
+    # and can never reach approval unbound.
+    if repository_authority is None and retirement_record_id and not hasattr(args, "repository_authority"):
+        repository_authority = "write"
+    if repository_authority not in REPOSITORY_AUTHORITIES:
+        raise RuntimeError("propose requires --repository-authority read-only or write")
     try:
         min_steps, max_steps = proposal_step_bounds(getattr(args, "min_steps", None), getattr(args, "max_steps", None))
     except (TypeError, ValueError) as exc:
@@ -4490,7 +5728,8 @@ def cmd_propose(args: argparse.Namespace) -> int:
         context="REPLACEMENT PLAN PROPOSAL" if carry_forward else "PLAN PROPOSAL",
     )
     plan["planning"] = {"min_steps": min_steps, "max_steps": max_steps}
-    validate_plan(plan)
+    controller_inject_repository_authority(plan, repository_authority)
+    validate_complete_plan(plan)
     digest = plan_hash(plan)
     if retirement_record_id and secrets.compare_digest(digest, str(manifest["plan_hash"])):
         raise RuntimeError("replacement proposal must produce a fresh plan hash")
@@ -4513,6 +5752,10 @@ def cmd_propose(args: argparse.Namespace) -> int:
         "proposal_previous_state": previous_state,
         "retirement_record_id": retirement_record_id,
         "recovery_checkpoint": None,
+        "approved_plan_artifact": None,
+        "approval_repository_evidence": None,
+        "operation_attributions": [],
+        "pending_step_delta_paths": [],
         "plan_changed_files": [],
         "plan_owned_files": [],
         "plan_carry_forward_files": [],
@@ -4559,7 +5802,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     state = load_state()
     if state.get("status") != "AWAITING_APPROVAL" or not state.get("plan"):
         raise RuntimeError("no plan is awaiting approval")
-    validate_plan(state["plan"])
+    validate_complete_plan(state["plan"], state.get("plan_hash"))
     expected = plan_hash(state["plan"])
     if args.plan_hash != expected or state.get("plan_hash") != expected:
         raise RuntimeError("approval hash does not match the proposed plan")
@@ -4575,9 +5818,15 @@ def cmd_approve(args: argparse.Namespace) -> int:
         # execution authority is granted; every dirty path has a final or
         # explicitly pending controller disposition before that point.
         candidates = replacement_dirty_inventory(manifest)
+    # Approval starts a fresh native authority ledger. Proposal state must never
+    # inherit operation evidence from a retired/completed plan.
+    state["operation_attributions"] = []
+    state["pending_step_delta_paths"] = []
+    bind_approved_plan_artifact(state)
     checkpoint = create_recovery_checkpoint(state)
     state["status"] = "APPROVED"
     state["recovery_checkpoint"] = checkpoint["id"]
+    state["approval_repository_evidence"] = checkpoint["repository_evidence"]
     state["plan_changed_files"] = []
     state["plan_owned_files"] = []
     state["plan_carry_forward_files"] = []
@@ -4594,6 +5843,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
         [
             f"Plan {expected}",
             f"Steps {len(state['plan']['steps'])}",
+            f"Repository authority {state['plan'][REPOSITORY_AUTHORITY_FIELD]}",
             f"Recovery {checkpoint['id']}",
             f"Git ref {checkpoint['ref']}",
             "Execution may now start safely.",
@@ -4615,7 +5865,7 @@ def cmd_reject(args: argparse.Namespace) -> int:
 
     current_usage = state.get("codex_usage")
     previous = state.get("proposal_previous_state")
-    if isinstance(previous, dict) and previous.get("status") in {"IDLE", "PLAN_COMPLETE", "PUSHED"}:
+    if isinstance(previous, dict) and previous.get("status") in {"IDLE", "PLAN_COMPLETE", "PUSHED", "READ_ONLY_COMPLETE"}:
         restored = dict(previous)
         if isinstance(current_usage, dict):
             restored["codex_usage"] = current_usage
@@ -4713,65 +5963,42 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
     old_loops = int(state.get("loop_count") or 0)
     steps = list(((state.get("plan") or {}).get("steps") or []))
 
-    recorded_paths = set(state.get("plan_changed_files") or []) | set(state.get("plan_owned_files") or [])
-    records = retirement_path_records(state, recorded_paths)
-    unsafe = [item["path"] for item in records if not item["plan_owned"] or item["baseline"] != "absent" or item["unexpected"]]
-
-    reconcile_restored = bool(getattr(args, "reconcile_restored", False))
-    restored_reconciliation = False
-
-    if rollback and unsafe:
-        if not reconcile_restored:
-            raise RuntimeError(f"retire-plan refuses ambiguous or unowned paths: {unsafe}")
-
-        matched, detail = restored_retirement_paths_match_checkpoint(
-            state,
-            checkpoint,
-            records,
-        )
-        if not matched:
-            raise RuntimeError(
-                f"retire-plan restored reconciliation refused: {detail}; "
-                f"unsafe paths: {unsafe}"
-            )
-
-        restored_reconciliation = True
+    # Rollback obtains its entire target set from native operation attribution.
+    # Carry-forward still needs immutable inventory evidence for replacement
+    # reconciliation; its summary-path projection grants no rollback authority.
+    carry_forward_paths = (
+        set(state.get("plan_changed_files") or [])
+        | set(state.get("plan_owned_files") or [])
+        | set(state.get("plan_carry_forward_files") or [])
+    )
+    records = retirement_attribution_records(state) if rollback else retirement_path_records(state, carry_forward_paths)
 
     before = repo_snapshot()
 
-    if restored_reconciliation:
-        # Operator already restored every recorded plan path to the exact
-        # approval checkpoint. Retirement is therefore intentionally a no-op.
-        delete_paths: list[str] = []
-        restore_paths: list[str] = []
-    else:
-        delete_paths = [
-            item["path"]
-            for item in records
-            if item["current"] != "missing"
-        ]
-        restore_paths: list[str] = []
+    restore_paths = [item["path"] for item in records if item["baseline"] == "tracked"]
+    delete_paths = [item["path"] for item in records if item["baseline"] == "absent"]
     if rollback:
         print("ROLLBACK PREVIEW")
         print(f"Recovery checkpoint: {checkpoint['id']} ({recovery_ref})")
-        if restored_reconciliation:
-            print("Reconciliation: RECORDED_PATHS_RESTORED_TO_APPROVAL_CHECKPOINT")
-            print(
-                "Historical unsafe paths: "
-                + (", ".join(sorted(unsafe)) if unsafe else "(none)")
-            )
         print("Restore paths: " + (", ".join(restore_paths) if restore_paths else "(none)"))
         print("Delete paths: " + (", ".join(delete_paths) if delete_paths else "(none)"))
         if str(getattr(args, "confirm", "") or "") != "ROLLBACK":
             print("No files changed. Re-run with --confirm ROLLBACK to execute this exact rollback.")
             return 0
-        for path in delete_paths:
-            record = next(item for item in records if item["path"] == path)
-            if not retirement_fingerprint_matches(record["evidence"]):
-                raise RuntimeError(f"retire-plan rollback path changed after preview evidence: {path}")
-            (ROOT / path).unlink()
+        for record in records:
+            if not retirement_fingerprint_matches(record["before"]):
+                raise RuntimeError(f"retire-plan rollback path changed after preview evidence: {record['path']}")
+        for record in records:
+            record["after"] = _restore_attributed_retirement_path(recovery_ref, record)
+            record["restoration"] = {
+                "disposition": "restored",
+                "action": "checkout" if record["baseline"] == "tracked" else "delete",
+                "checkpoint": checkpoint["id"],
+            }
         disposition, operations = "ROLLED_BACK", {"restore": restore_paths, "delete": delete_paths, "preserved": []}
     else:
+        # Carry-forward remains non-mutating.  Its records are preservation
+        # inventory only and cannot be consumed as native rollback authority.
         disposition, operations = "RETIRED_WITH_CARRY_FORWARD", {"restore": [], "delete": [], "preserved": [item["path"] for item in records]}
     after = repo_snapshot()
     if carry_forward and after != before:
@@ -5397,10 +6624,21 @@ def finalize_completed_plan(state: dict) -> int:
     except RuntimeError as exc:
         return _block_terminal_qualification(state, stage="qualification-guard", error=str(exc))
 
+    provenance = None
     fingerprint = None
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    repository_authority = str(plan.get(REPOSITORY_AUTHORITY_FIELD) or "")
     if passed:
         try:
-            fingerprint = plan_delta_fingerprint(state)
+            if repository_authority == "read-only":
+                provenance = verified_read_only_completion(
+                    state, "READ_ONLY_COMPLETE admission",
+                )
+            else:
+                provenance = strict_native_provenance(
+                    state, "READY_TO_COMMIT admission", require_current_delta=True, require_write=True,
+                )
+            fingerprint = str(provenance["current_sha256"])
         except RuntimeError as exc:
             return _block_terminal_qualification(
                 state,
@@ -5418,6 +6656,12 @@ def finalize_completed_plan(state: dict) -> int:
         "output": final_output[-6000:],
         "completed_at": utc_now(),
         "delta_fingerprint": fingerprint,
+        "native_provenance_sha256": provenance.get("binding_sha256") if provenance else None,
+        "completion_summary": {
+            "delta_fingerprint": fingerprint,
+            "native_provenance_sha256": provenance.get("binding_sha256"),
+            "recorded_plan_paths": list(provenance.get("new_plan_paths") or []),
+        } if provenance else None,
     }
     state["block_reason"] = None
     try:
@@ -5445,13 +6689,43 @@ def finalize_completed_plan(state: dict) -> int:
             print(f"Report: {report['markdown_path']}")
         return 2
 
-    final_entries = change_entries(state.get("plan_changed_files") or [])
+    final_paths = list(provenance.get("new_plan_paths") or [])
+    final_entries = change_entries(final_paths)
     state["completion_changes"] = {
         "entries": final_entries,
         "files": len(final_entries),
         "added": sum(int(item.get("added") or 0) for item in final_entries),
         "removed": sum(int(item.get("removed") or 0) for item in final_entries),
     }
+    if repository_authority == "read-only":
+        state["status"] = "READ_ONLY_COMPLETE"
+        save_state(state)
+        report = build_completion_report(state, final_gates)
+        with JOURNAL.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"## Read-only plan complete — {utc_now()}\n\n"
+                f"- Plan: `{state['plan_hash']}`\n"
+                f"- Loops: {state['loop_count']}\n"
+                f"- Steps: {len(state['plan']['steps'])}\n"
+                "- Final qualification: PASS\n"
+                "- Status: READ_ONLY_COMPLETE\n"
+                "- Repository delta: zero\n"
+                "- Operation attribution: zero\n"
+                "- Plan ownership: zero\n"
+                f"- Completion report: `{report['markdown_path']}`\n"
+                f"- Recovery checkpoint: `{state.get('recovery_checkpoint')}`\n"
+                f"- Native provenance: `{provenance['binding_sha256']}`\n"
+                "- Next action: none; commit/push/reconciliation are prohibited\n\n"
+            )
+        live_write(
+            f"read-only plan complete · final qualification PASS · provenance={provenance['binding_sha256'][:12]} "
+            f"· report={report['markdown_path']} · READ_ONLY_COMPLETE",
+            "COMPLETE",
+        )
+        print(tui.completion_card(report))
+        print("READ_ONLY_COMPLETE: no commit or push action is required or permitted.")
+        return 0
+
     state["status"] = "READY_TO_COMMIT"
     save_state(state)
     report = build_completion_report(state, final_gates)
@@ -5465,10 +6739,12 @@ def finalize_completed_plan(state: dict) -> int:
             "- Status: READY_TO_COMMIT\n"
             f"- Completion report: `{report['markdown_path']}`\n"
             f"- Recovery checkpoint: `{state.get('recovery_checkpoint')}`\n"
+            f"- Native provenance: `{provenance['binding_sha256']}`\n"
             f"- Next action: python3 scripts/ralph.py finalize {state['plan_hash']}\n\n"
         )
     live_write(
-        f"plan complete · final qualification PASS · report={report['markdown_path']} · READY_TO_COMMIT",
+        f"plan complete · final qualification PASS · provenance={provenance['binding_sha256'][:12]} "
+        f"· report={report['markdown_path']} · READY_TO_COMMIT",
         "READY",
     )
     print(tui.completion_card(report))
@@ -5489,9 +6765,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     save_state(state)
     if state.get("status") not in {"APPROVED", "RUNNING", "PAUSED_USAGE_LIMIT"}:
         raise RuntimeError(f"run requires APPROVED/RUNNING/PAUSED_USAGE_LIMIT status, found {state.get('status')}")
-    if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
-        block(state, "approved plan file changed")
-        raise RuntimeError("approved plan file changed; blocked for human review")
+    try:
+        validate_complete_plan(state["plan"], state.get("plan_hash"))
+        sandbox = sandbox_for_approved_plan(state["plan"], state.get("plan_hash"))
+    except (TypeError, ValueError) as exc:
+        block(state, f"approved plan repository authority is invalid: {exc}")
+        raise RuntimeError("approved plan repository authority is invalid; blocked for human review") from exc
+    try:
+        verify_approval_execution_evidence(state)
+    except RuntimeError as exc:
+        block(state, str(exc))
+        raise RuntimeError(f"{exc}; blocked for human review") from exc
     if state.get("retirement_record_id") and not refresh_replacement_dirty_inventory(state):
         block(state, "replacement dirty-path inventory changed after approval; refreshed dispositions require human review")
         raise RuntimeError("replacement dirty-path inventory changed after approval; execution refused")
@@ -5499,11 +6783,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     if unresolved:
         block(state, "replacement dirty-path inventory has unresolved dispositions: " + ", ".join(unresolved))
         raise RuntimeError("replacement dirty-path inventory requires explicit dispositions before execution")
-    if not state.get("recovery_checkpoint"):
-        checkpoint = create_recovery_checkpoint(state)
-        state["recovery_checkpoint"] = checkpoint["id"]
-        save_state(state)
-
     loops_this_run = 0
     while state["current_step"] <= len(state["plan"]["steps"]):
         policy = efficiency_policy.load_policy(ROOT)
@@ -5543,7 +6822,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             repair=repair_no, quota=quota, status=str(state.get("status") or "RUNNING"),
             efficiency=str(efficiency_state.get("status") or "PASS"),
             recovery=str(state.get("recovery_checkpoint") or "-"),
-            changed_files=len(state.get("plan_changed_files") or []),
+            changed_files=len(validated_plan_paths(state)),
             test_policy=str(step.get("test_change_policy") or "none"),
             progress=plan_progress_rows(state),
             acceptance=list(step.get("acceptance") or []),
@@ -5558,7 +6837,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         authority = authority_snapshot()
         protected_before = protected_snapshot()
         try:
-            result = run_codex(step_prompt(state, step, active_fp, repair_no), RESULT_SCHEMA, "workspace-write", context=f"LOOP {loop_no:04d} STEP {step['id']} {'REPAIR' if active_fp else 'IMPLEMENT'}")
+            result = run_codex(step_prompt(state, step, active_fp, repair_no), RESULT_SCHEMA, sandbox, context=f"LOOP {loop_no:04d} STEP {step['id']} {'REPAIR' if active_fp else 'IMPLEMENT'}")
             append_usage_ledger(
                 result.get("_ralph_metrics") if isinstance(result, dict) else {},
                 plan_hash_value=str(state.get("plan_hash") or ""),
@@ -5593,6 +6872,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             if not granted:
                 restore_authority(authority)
                 state = load_state()
+                # The restoration guard is not a substitute for the required
+                # checkpoint comparison; record it even on this refusal path.
+                verification = record_post_turn_repository_verification(
+                    state, step, sandbox, files, loop=loop_no,
+                )
                 candidate_paths = sorted(
                     path for path in changed_authority
                     if path != ".ralph"
@@ -5612,6 +6896,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 state["self_hosting_candidate"] = candidate
                 detail = f"authority paths {changed_authority}"
                 reason = f"Codex changed {detail}; original contents restored; {grant_reason}"
+                if verification["state"] == "REFUSED":
+                    reason += f"; post-turn checkpoint verification: {verification['error']}"
                 live_write(reason, "POLICY")
                 append_journal(loop_no, step["id"], "policy", "BLOCKED", summary=reason, files=files, repair=repair_no, next_action="human review", change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no))
                 block(state, "Codex attempted to change RALPH controller/tooling authority")
@@ -5628,7 +6914,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         if protected or test_violations:
             if protected:
                 restore_protected(protected_before, protected)
+            verification = record_post_turn_repository_verification(
+                state, step, sandbox, files, loop=loop_no,
+            )
             reason = "policy violation: " + "; ".join(filter(None, [f"protected paths {protected}" if protected else "", f"test paths {test_violations}" if test_violations else ""]))
+            if verification["state"] == "REFUSED":
+                reason += f"; post-turn checkpoint verification: {verification['error']}"
             origins = {path: plan_baseline_path_kind(state, path) for path in test_violations}
             print(tui.policy_gate_card(
                 gate_id=gate_id_for_state(state),
@@ -5646,7 +6937,55 @@ def cmd_run(args: argparse.Namespace) -> int:
             block(state, reason)
             return 2
 
-        remember_plan_files(state, files)
+        # A fresh checkpoint comparison is required before *every* result
+        # disposition.  It is intentionally after immediate restore guards so
+        # their existing protective behavior remains intact, and before
+        # continuation, controller gates, acceptance, progression, or terminal
+        # readiness can consume the model result.
+        verification = record_post_turn_repository_verification(
+            state, step, sandbox, files, loop=loop_no,
+        )
+        if verification["state"] == "REFUSED":
+            reason = str(verification["error"])
+            append_journal(
+                loop_no, step["id"], "post-turn-verification", "BLOCKED",
+                summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []),
+                next_action="human review checkpoint-relative repository mismatch",
+                change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no),
+            )
+            live_write(f"loop={loop_no:04d} checkpoint verification refused: {reason}", "VERIFY")
+            block(state, reason)
+            return 2
+        _remember_pending_step_paths(
+            state, int(step["id"]),
+            set(files) & set(verification.get("new_project_delta") or []),
+        )
+        try:
+            attribution = verified_attribution_result(
+                state, step, verification, files, loop=loop_no, phase=phase,
+            )
+        except RuntimeError as exc:
+            reason = str(exc)
+            append_journal(
+                loop_no, step["id"], "verified-attribution", "BLOCKED",
+                summary=reason, files=files, repair=repair_no, ideas=result.get("ideas", []),
+                next_action="human review verified operation attribution",
+                change_class=change_class, stats=loop_stats(loop_started, result, repair=repair_no),
+            )
+            block(state, reason)
+            return 2
+        # From this point onward, no acceptance-facing control may consume the
+        # raw before/after path list.  It is evidence only; attribution is the
+        # controller's verified and checkpoint-bound authority boundary.
+        files = list(attribution["paths"])
+        change_class = classify_changes(files)
+        save_state(state)
+        live_write(
+            f"loop={loop_no:04d} checkpoint verification=PASS sandbox={sandbox} "
+            f"delta={len(verification['new_project_delta'])}",
+            "VERIFY",
+        )
+
         save_state(state)
         entries = change_entries(files, base_ref=loop_git_base)
         if entries:
@@ -5713,8 +7052,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "mode": mode,
                 "findings": runaway or efficiency,
             }
+            record_accepted_operations(state, attribution)
+            remember_plan_files(state, files)
             update_context_after_pass(state, step, result, files)
-            record_step_result(state, step, "PASS", summary=result.get("summary", ""), files=files, gates=gates, stats=stats)
+            record_step_result(
+                state, step, "PASS", summary=result.get("summary", ""), files=files,
+                gates=gates, stats=stats, attribution=attribution,
+            )
+            _clear_pending_step_paths(state)
             entry_stats = change_entries(files, base_ref=loop_git_base)
             print(tui.result_card(
                 result="PASS",
@@ -5761,6 +7106,172 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 
+def cmd_recover_self_upgrade(args: argparse.Namespace) -> int:
+    """Recover one active native plan after its controller attribution schema changed in-process.
+
+    This is deliberately an explicit operator repair, not a compatibility path in
+    normal execution. It reconstructs only evidence that can be proven from the
+    active plan/checkpoint, accepted step results, exact self-hosting grants and
+    current checkpoint-relative repository evidence.
+    """
+    init_files()
+    state = load_state()
+    expected = str(state.get("plan_hash") or "")
+    if not expected or not secrets.compare_digest(str(args.plan_hash or ""), expected):
+        raise RuntimeError("recover-self-upgrade hash does not match the active plan")
+    if str(args.confirm or "") != "RECOVER":
+        raise RuntimeError("recover-self-upgrade requires --confirm RECOVER")
+    if state.get("status") not in {"APPROVED", "RUNNING", "BLOCKED_HUMAN"}:
+        raise RuntimeError(f"recover-self-upgrade requires active approved/running/blocked plan, found {state.get('status')}")
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    if not checkpoint_id or str(args.checkpoint or "") != checkpoint_id:
+        raise RuntimeError("recover-self-upgrade requires the exact active recovery checkpoint")
+    validate_complete_plan(state["plan"], expected)
+    verify_approval_execution_evidence(state)
+
+    current_step = int(state.get("current_step") or 0)
+    steps = list(((state.get("plan") or {}).get("steps") or []))
+    if not (1 <= current_step <= len(steps)):
+        raise RuntimeError("recover-self-upgrade cannot resolve current approved step")
+    current_step_def = steps[current_step - 1]
+    accepted = _accepted_step_results_by_id(state)
+    if not accepted or max(accepted) >= current_step:
+        raise RuntimeError("recover-self-upgrade requires completed accepted steps strictly before the current step")
+
+    pending = sorted({
+        _normalize_repo_path(str(path))
+        for path in list(args.pending_path or [])
+        if _normalize_repo_path(str(path))
+    })
+    repository = recompute_repository_against_approval_checkpoint(state)
+    if repository.get("changed_approval_residue"):
+        raise RuntimeError(f"recover-self-upgrade refuses changed approval residue: {repository['changed_approval_residue']}")
+    current_delta = {
+        _normalize_repo_path(str(path))
+        for path in repository.get("new_project_delta") or []
+        if _normalize_repo_path(str(path))
+    }
+    if not set(pending).issubset(current_delta):
+        raise RuntimeError("recover-self-upgrade pending paths must be current checkpoint-relative delta")
+    for path in pending:
+        if is_protected_path(path) or _is_runtime_authority_path(path) or path in approval_baseline_residue_paths(state):
+            raise RuntimeError(f"recover-self-upgrade refuses pending protected/runtime/residue path: {path}")
+        if path == "tests" or path.startswith("tests/"):
+            policy = str(current_step_def.get("test_change_policy") or "none")
+            baseline = plan_baseline_path_kind(state, path)
+            if policy == "none" or (policy == "add-only" and baseline != "absent"):
+                raise RuntimeError(f"recover-self-upgrade pending test path violates current step policy {policy}: {path}")
+    pending_tooling = [path for path in pending if is_tooling_path(path)]
+    if pending_tooling:
+        allowed, reason = self_hosting_grant_allows(state, current_step, pending_tooling)
+        if not allowed:
+            raise RuntimeError(f"recover-self-upgrade pending tooling lacks current exact authority: {reason}")
+
+    source_records = state.get("operation_attributions")
+    if not isinstance(source_records, list):
+        raise RuntimeError("recover-self-upgrade requires an operation attribution list")
+    repaired: list[dict] = []
+    foreign_removed = 0
+    converted = 0
+    for raw in source_records:
+        if not isinstance(raw, dict):
+            raise RuntimeError("recover-self-upgrade found malformed operation attribution")
+        if raw.get("plan_hash") != expected:
+            foreign_removed += 1
+            continue
+        schema = raw.get("schema")
+        if schema == OPERATION_ATTRIBUTION_SCHEMA:
+            repaired.append(_json_copy(raw))
+            continue
+        if schema != "zen_ralph_operation_attribution_v1":
+            raise RuntimeError(f"recover-self-upgrade refuses unsupported attribution schema: {schema}")
+        if raw.get("checkpoint") != checkpoint_id:
+            raise RuntimeError("recover-self-upgrade refuses current-plan v1 attribution from another checkpoint")
+        origin = _legacy_v1_origin_step(state, raw)
+        if int(origin["id"]) not in accepted:
+            raise RuntimeError("recover-self-upgrade refuses v1 attribution from an unaccepted step")
+        path = _normalize_repo_path(str(raw.get("path") or ""))
+        fingerprint = raw.get("current_fingerprint")
+        if not path or not isinstance(fingerprint, dict):
+            raise RuntimeError("recover-self-upgrade found incomplete v1 attribution")
+        native = _native_recovery_record(
+            state, origin, path, fingerprint, loop=int(raw.get("loop") or 0),
+            source="accepted-v1-operation",
+        )
+        if native["baseline_kind"] != raw.get("baseline_kind") or native["operation"] != raw.get("operation"):
+            raise RuntimeError(f"recover-self-upgrade v1 operation no longer matches checkpoint semantics: {path}")
+        repaired.append(native)
+        converted += 1
+
+    prospective = dict(state)
+    prospective["operation_attributions"] = repaired
+    # Validate every retained/converted record before using it as recovery evidence.
+    _validated_operation_records(prospective)
+    latest = _latest_operation_records_by_path(prospective)
+    synthetic = 0
+    recovery_loop = int(state.get("loop_count") or 0)
+    for path in sorted(current_delta - set(pending)):
+        fingerprint = retirement_path_fingerprint(path)
+        existing = latest.get(path)
+        if existing is not None and existing.get("current_fingerprint") == fingerprint:
+            continue
+        origin, accepted_loop = _accepted_origin_for_recovery(state, path, accepted)
+        record = _native_recovery_record(
+            state, origin, path, fingerprint, loop=recovery_loop,
+            source=f"accepted-step-current-delta:accepted-loop={accepted_loop}",
+        )
+        repaired.append(record)
+        prospective["operation_attributions"] = repaired
+        _validated_operation_records(prospective)
+        latest = _latest_operation_records_by_path(prospective)
+        synthetic += 1
+
+    state["operation_attributions"] = repaired
+    validated = _validated_operation_records(state)
+    state["plan_changed_files"] = sorted({str(item["path"]) for item in validated})
+    state["plan_owned_files"] = sorted({str(item["path"]) for item in validated if item["baseline_kind"] == "absent"})
+    if pending:
+        state["pending_step_delta_paths"] = {"step": current_step, "paths": pending, "updated_at": utc_now()}
+    else:
+        _clear_pending_step_paths(state)
+    state["status"] = "APPROVED"
+    state["block_reason"] = None
+    state["self_upgrade_recovery"] = {
+        "schema": "zen_ralph_self_upgrade_recovery_v1",
+        "plan_hash": expected,
+        "checkpoint": checkpoint_id,
+        "step": current_step,
+        "foreign_records_removed": foreign_removed,
+        "v1_records_converted": converted,
+        "current_records_synthesized": synthetic,
+        "pending_current_step_paths": pending,
+        "recovered_at": utc_now(),
+    }
+    save_state(state)
+    plan_control_event(
+        state, "self_upgrade_recovery",
+        f"controller self-upgrade attribution recovered at step {current_step}",
+        step=current_step, foreign_removed=foreign_removed, converted=converted, synthetic=synthetic,
+        pending=len(pending),
+    )
+    append_journal(
+        int(state.get("loop_count") or 0), current_step, "operator-self-upgrade-recovery", "RECOVERED",
+        summary=(
+            f"Recovered active native attribution after controller schema transition; "
+            f"removed_foreign={foreign_removed} converted_v1={converted} synthesized={synthetic} "
+            f"pending_current_step={pending}"
+        ),
+        files=sorted(current_delta),
+        next_action="resume the same approved step under the current controller",
+    )
+    print(
+        f"SELF_UPGRADE_RECOVERED plan={expected} checkpoint={checkpoint_id} step={current_step} "
+        f"removed_foreign={foreign_removed} converted_v1={converted} synthesized={synthetic} "
+        f"pending={','.join(pending) if pending else '-'} status=APPROVED"
+    )
+    return 0
+
+
 def cmd_recover_validation_block(args: argparse.Namespace) -> int:
     """Human-triggered controller qualification for a validation-only historical block."""
     init_files()
@@ -5773,14 +7284,30 @@ def cmd_recover_validation_block(args: argparse.Namespace) -> int:
         reconciliation_snapshot(state)
     if not is_recoverable_validation_block(state.get("block_reason") or ""):
         raise RuntimeError("current block is not classified as a recoverable validation-only block")
-    if PLAN.read_text(encoding="utf-8") != render_plan(state["plan"]):
-        raise RuntimeError("approved plan file changed; recovery refused")
+    try:
+        validate_complete_plan(state["plan"], state.get("plan_hash"))
+        verify_approval_execution_evidence(state)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        block(state, str(exc))
+        raise RuntimeError(f"{exc}; recovery blocked for human review") from exc
 
     step = state["plan"]["steps"][state["current_step"] - 1]
     files = git_changed_paths()
     if not files:
         raise RuntimeError("no working-tree changes found to qualify")
     validate_recovery_paths(files, step)
+    verification = record_post_turn_repository_verification(
+        state, step, "workspace-write", files, loop=int(state.get("loop_count") or 0),
+    )
+    if verification["state"] == "REFUSED":
+        reason = str(verification["error"])
+        block(state, reason)
+        raise RuntimeError(f"recovery qualification refused: {reason}")
+    attribution = verified_attribution_result(
+        state, step, verification, files,
+        loop=int(state.get("loop_count") or 0), phase="human-qualification",
+    )
+    files = list(attribution["paths"])
     change_class = classify_changes(files)
     if change_class != "product-development":
         raise RuntimeError(f"recovery requires product-development changes only, found {change_class}")
@@ -5814,7 +7341,12 @@ def cmd_recover_validation_block(args: argparse.Namespace) -> int:
         state["active_failure"] = None
         state["block_reason"] = None
         state["last_efficiency"] = {"status": "PASS", "findings": []}
+        record_accepted_operations(state, attribution)
         update_context_after_pass(state, step, result, files)
+        record_step_result(
+            state, step, "PASS", summary=result["summary"], files=files, gates=gates,
+            stats=stats, attribution=attribution,
+        )
         state["current_step"] += 1
         state["status"] = "APPROVED"
         save_state(state)
@@ -5845,6 +7377,11 @@ def build_parser() -> argparse.ArgumentParser:
     propose = sub.add_parser("propose")
     propose.add_argument("--goal")
     propose.add_argument("--from-retirement", metavar="RT_ID")
+    # Runtime admission in ``cmd_propose`` owns this requirement.  Keeping the
+    # parser permissive lets callers inspect proposal-only options (such as
+    # planning bounds) without implying that a proposal can be admitted
+    # unbound.
+    propose.add_argument("--repository-authority", choices=sorted(REPOSITORY_AUTHORITIES))
     propose.add_argument("--min-steps", type=int, default=PLAN_MIN_STEPS_DEFAULT)
     propose.add_argument("--max-steps", type=int, default=PLAN_MAX_STEPS_DEFAULT)
     propose.set_defaults(func=cmd_propose)
@@ -5983,6 +7520,18 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_gate.add_argument("--gate", required=True, help="exact current human-gate ID, for example HG-0015-04")
     resolve_gate.add_argument("--reason", required=True, help="human evidence/action satisfying the approved gate")
     resolve_gate.set_defaults(func=cmd_resolve_gate)
+    self_upgrade_recover = sub.add_parser(
+        "recover-self-upgrade",
+        help="operator-confirmed repair for an active plan stranded by a controller attribution-schema self-upgrade",
+    )
+    self_upgrade_recover.add_argument("plan_hash")
+    self_upgrade_recover.add_argument("--checkpoint", required=True, help="exact active recovery checkpoint ID")
+    self_upgrade_recover.add_argument(
+        "--pending-path", action="append", default=[], metavar="PATH",
+        help="exact current-step operator bootstrap path to leave pending rather than retroactively accepting; repeat as needed",
+    )
+    self_upgrade_recover.add_argument("--confirm", required=True, help="must be RECOVER")
+    self_upgrade_recover.set_defaults(func=cmd_recover_self_upgrade)
     recover = sub.add_parser("recover-validation-block")
     recover.add_argument("plan_hash")
     recover.set_defaults(func=cmd_recover_validation_block)
@@ -6040,6 +7589,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _fail_closed_unhandled_run_exception(args: argparse.Namespace, exc: Exception) -> None:
+    """Never leave durable RUNNING state behind after the run process exits."""
+    if getattr(args, "command", None) != "run":
+        return
+    try:
+        state = load_state()
+    except Exception:
+        return
+    if state.get("status") != "RUNNING":
+        return
+    reason = f"controller runtime exception: {exc}"
+    state["status"] = "BLOCKED_HUMAN"
+    state["block_reason"] = reason[:2000]
+    save_state(state)
+    try:
+        plan_control_event(
+            state, "controller_exception",
+            "run process failed closed instead of leaving stale RUNNING state",
+            step=int(state.get("current_step") or 0),
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if getattr(args, "max_loops", 1) < 1:
@@ -6053,6 +7626,7 @@ def main() -> int:
     try:
         return args.func(args)
     except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        _fail_closed_unhandled_run_exception(args, exc)
         print(f"RALPH-Lite: {exc}", file=sys.stderr)
         return 2
 

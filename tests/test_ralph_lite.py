@@ -52,10 +52,25 @@ class PlanTests(unittest.TestCase):
 
     def test_rendered_plan_binds_human_gate_to_hash(self):
         plan = valid_plan()
+        ralph.controller_inject_repository_authority(plan, "write")
         digest = ralph.plan_hash(plan)
         rendered = ralph.render_plan(plan)
         self.assertIn(digest, rendered)
+        self.assertIn("Repository authority:** `write`", rendered)
         self.assertIn(f"approve {digest}", rendered)
+
+    def test_complete_plan_requires_controller_authority_outside_model_schema(self):
+        self.assertNotIn(ralph.REPOSITORY_AUTHORITY_FIELD, ralph.PLAN_SCHEMA["properties"])
+        self.assertNotIn(ralph.REPOSITORY_AUTHORITY_FIELD, ralph.RESULT_SCHEMA["properties"])
+        with self.assertRaisesRegex(ValueError, "controller-injected repository authority"):
+            ralph.validate_complete_plan(valid_plan())
+
+    def test_unbound_plan_is_refused_for_validation_and_sandbox_selection(self):
+        plan = valid_plan()
+        with self.assertRaisesRegex(ValueError, "controller-injected repository authority"):
+            ralph.validate_complete_plan(plan, "f" * 64)
+        with self.assertRaisesRegex(ValueError, "controller-injected repository authority"):
+            ralph.sandbox_for_approved_plan(plan, "f" * 64)
 
     def test_plan_delta_fingerprint_refuses_unqualified_reconciliation_residue(self):
         state = {
@@ -306,7 +321,10 @@ class ContextTests(unittest.TestCase):
                 }
                 prompt = ralph.step_prompt(state, step, None, 0)
                 self.assertIn("address-list takes precedence over DNS", prompt)
-                self.assertIn("HARD BUDGET: use at most 6 shell command executions", prompt)
+                policy = ralph.efficiency_policy.load_policy(ralph.ROOT)
+                mode = ralph._efficiency_mode(str(policy.get("mode") or "NORMAL"))
+                command_budget = ralph.efficiency_policy.limits(policy, mode)["prompt_commands"]
+                self.assertIn(f"HARD BUDGET: use at most {command_budget} shell command executions", prompt)
                 self.assertIn("Batch related reads into one discovery command", prompt)
                 self.assertIn("Normally inspect no more than 6-8 relevant files", prompt)
                 self.assertIn("Do not broadly scan docs/", prompt)
