@@ -187,12 +187,16 @@ def validate_plan(plan: dict) -> None:
 
 
 def validate_complete_plan(plan: dict, expected_hash: str | None = None) -> None:
-    """Validate the controller-completed approval candidate and its authority."""
+    """Validate the controller-completed approval candidate and its bound identity."""
     validate_plan(plan)
     authority = plan.get(REPOSITORY_AUTHORITY_FIELD) if isinstance(plan, dict) else None
-    if authority in REPOSITORY_AUTHORITIES:
-        return
-    raise ValueError("plan is missing controller-injected repository authority")
+    if authority not in REPOSITORY_AUTHORITIES:
+        raise ValueError("plan is missing controller-injected repository authority")
+    if expected_hash is not None:
+        expected = str(expected_hash or "").strip()
+        actual = plan_hash(plan)
+        if not expected or not secrets.compare_digest(actual, expected):
+            raise ValueError("approved plan hash does not match controller state")
 
 
 def sandbox_for_approved_plan(plan: dict, expected_hash: str | None = None) -> str:
@@ -770,17 +774,28 @@ def _checkpoint_identity(checkpoint_id: str, checkpoint: dict) -> dict:
     return identity
 
 
-def _self_hosting_grants_for_origin(state: dict, step_no: int, path: str) -> list[dict]:
-    """Return durable grants that explicitly cover one originating tooling path."""
+def _self_hosting_grants_for_origin(
+    state: dict, step_no: int, path: str, *, operation_loop: int | None = None,
+) -> list[dict]:
+    """Return gate-bound grants that can cover one originating tooling path."""
     if not is_tooling_path(path):
         return []
     candidates: list[dict] = []
     active = state.get("self_hosting_grant")
     history = state.get("self_hosting_grant_history")
+    max_live_loop = int(state.get("loop_count") or 0)
     for raw in [active, *((history if isinstance(history, list) else []))]:
         if not isinstance(raw, dict):
             continue
         if raw.get("plan_hash") != state.get("plan_hash") or int(raw.get("step") or 0) != int(step_no):
+            continue
+        gate_loop = _self_hosting_gate_loop(raw, step_no)
+        if gate_loop is None:
+            continue
+        if operation_loop is not None:
+            if gate_loop >= int(operation_loop):
+                continue
+        elif gate_loop > max_live_loop:
             continue
         paths = sorted({_normalize_repo_path(str(item)) for item in raw.get("paths") or [] if str(item).strip()})
         if path not in paths:
@@ -788,26 +803,21 @@ def _self_hosting_grants_for_origin(state: dict, step_no: int, path: str) -> lis
         candidate = _json_copy(raw)
         if candidate not in candidates:
             candidates.append(candidate)
-    candidates.sort(key=lambda item: str(item.get("granted_at") or ""))
+    candidates.sort(key=lambda item: (_self_hosting_gate_loop(item, step_no) or -1, str(item.get("granted_at") or "")))
     return candidates
 
 
-def _origin_self_hosting_grant(state: dict, origin_step: dict, path: str) -> dict | None:
+def _origin_self_hosting_grant(
+    state: dict, origin_step: dict, path: str, *, operation_loop: int | None = None,
+) -> dict | None:
     if not is_tooling_path(path):
         return None
     step_no = int(origin_step["id"])
-    grants = _self_hosting_grants_for_origin(state, step_no, path)
+    grants = _self_hosting_grants_for_origin(
+        state, step_no, path, operation_loop=operation_loop,
+    )
     if not grants:
-        raise RuntimeError("operation attribution has no applicable durable self-hosting grant")
-    # Prefer the currently active exact grant when it is applicable. Otherwise
-    # use the newest durable grant for the originating step. This is critical
-    # when validating accepted operations after the controller has moved on to
-    # a later step and the active grant has changed.
-    active = state.get("self_hosting_grant") if isinstance(state.get("self_hosting_grant"), dict) else None
-    if active is not None:
-        active_copy = _json_copy(active)
-        if active_copy in grants:
-            return active_copy
+        raise RuntimeError("operation attribution has no applicable gate-bound self-hosting grant")
     return grants[-1]
 
 
@@ -878,7 +888,10 @@ def _validated_operation_records(state: dict) -> list[dict]:
             history = state.get("self_hosting_grant_history") if isinstance(state.get("self_hosting_grant_history"), list) else []
             if not isinstance(grant, dict) or grant not in history or record["self_hosting_grant_sha256"] != _evidence_digest(grant):
                 raise RuntimeError("operation attribution self-hosting grant is missing or altered")
-            allowed, reason = self_hosting_grant_allows({**state, "self_hosting_grant": grant}, int(origin["id"]), [path])
+            allowed, reason = self_hosting_grant_allows(
+                {**state, "self_hosting_grant": grant}, int(origin["id"]), [path],
+                operation_loop=int(record["loop"]),
+            )
             if not allowed:
                 raise RuntimeError(f"operation attribution self-hosting grant is stale: {reason}")
         elif grant is not None or record["self_hosting_grant_sha256"] is not None:
@@ -889,6 +902,17 @@ def _validated_operation_records(state: dict) -> list[dict]:
         fingerprints = verification.get("current_fingerprints")
         if not isinstance(fingerprints, dict) or fingerprints.get(path) != fingerprint:
             raise RuntimeError("operation attribution current fingerprint evidence is stale or altered")
+        recovery = verification.get("recovery")
+        if recovery is not None:
+            accepted_origin = recovery.get("accepted_origin") if isinstance(recovery, dict) else None
+            if (
+                not isinstance(recovery, dict)
+                or recovery.get("schema") != "zen_ralph_self_upgrade_attribution_recovery_v1"
+                or not isinstance(accepted_origin, dict)
+                or int(accepted_origin.get("step") or 0) != int(origin["id"])
+                or int(accepted_origin.get("loop") or -1) != int(record["loop"])
+            ):
+                raise RuntimeError("operation attribution recovery accepted-loop origin is missing or altered")
         reconciliation = record["reconciliation_evidence"]
         if reconciliation != _reconciliation_evidence(state):
             raise RuntimeError("operation attribution reconciliation evidence is stale or altered")
@@ -1205,7 +1229,7 @@ def verified_attribution_result(
         if not isinstance(current, dict) or current != retirement_path_fingerprint(raw_path):
             raise RuntimeError(f"verified attribution current fingerprint is missing or stale: {raw_path}")
         operation = "create" if baseline_kind == "absent" and current["kind"] != "missing" else ("delete" if current["kind"] == "missing" else "edit")
-        grant = _origin_self_hosting_grant(state, origin_step, raw_path)
+        grant = _origin_self_hosting_grant(state, origin_step, raw_path, operation_loop=loop)
         record = {
             "schema": OPERATION_ATTRIBUTION_SCHEMA,
             "plan_hash": state["plan_hash"],
@@ -1300,6 +1324,7 @@ def _step_by_id(state: dict, step_no: int) -> dict:
 
 def _recovery_verification_for_path(
     state: dict, origin_step: dict, path: str, fingerprint: dict, *, loop: int, source: str,
+    accepted_loop: int | None = None,
 ) -> dict:
     verification = {
         "schema": "zen_ralph_post_turn_repository_verification_v1",
@@ -1316,6 +1341,10 @@ def _recovery_verification_for_path(
         "recovery": {
             "schema": "zen_ralph_self_upgrade_attribution_recovery_v1",
             "source": source,
+            "accepted_origin": {
+                "step": int(origin_step["id"]),
+                "loop": int(loop if accepted_loop is None else accepted_loop),
+            },
             "recovered_at": utc_now(),
         },
     }
@@ -1327,6 +1356,7 @@ def _recovery_verification_for_path(
 
 def _native_recovery_record(
     state: dict, origin_step: dict, path: str, fingerprint: dict, *, loop: int, source: str,
+    accepted_loop: int | None = None,
 ) -> dict:
     checkpoint_id = str(state.get("recovery_checkpoint") or "")
     checkpoint = verify_approval_execution_evidence(state)
@@ -1340,9 +1370,10 @@ def _native_recovery_record(
     operation = "create" if baseline_kind == "absent" and fingerprint["kind"] != "missing" else (
         "delete" if fingerprint["kind"] == "missing" else "edit"
     )
-    grant = _origin_self_hosting_grant(state, origin_step, path)
+    grant = _origin_self_hosting_grant(state, origin_step, path, operation_loop=loop)
     verification = _recovery_verification_for_path(
         state, origin_step, path, fingerprint, loop=loop, source=source,
+        accepted_loop=accepted_loop,
     )
     record = {
         "schema": OPERATION_ATTRIBUTION_SCHEMA,
@@ -1390,13 +1421,13 @@ def _accepted_origin_for_recovery(state: dict, path: str, accepted: dict[int, di
         if path == "tests" or path.startswith("tests/"):
             if policy == "none" or (policy == "add-only" and baseline != "absent"):
                 continue
+        attr = result.get("attribution") if isinstance(result.get("attribution"), dict) else {}
+        loop = int(attr.get("loop") or result.get("loop") or 0)
         if is_tooling_path(path):
-            if not _self_hosting_grants_for_origin(state, step_no, path):
+            if not _self_hosting_grants_for_origin(state, step_no, path, operation_loop=loop):
                 continue
         elif path not in {_normalize_repo_path(str(item)) for item in result.get("files") or []}:
             continue
-        attr = result.get("attribution") if isinstance(result.get("attribution"), dict) else {}
-        loop = int(attr.get("loop") or result.get("loop") or 0)
         candidates.append((step_no, step, loop))
     if not candidates:
         raise RuntimeError(f"self-upgrade recovery cannot prove an accepted origin for: {path}")
@@ -2362,6 +2393,12 @@ def authorized_self_hosting_paths(state: dict) -> set[str]:
     history = state.get("self_hosting_grant_history") if isinstance(state.get("self_hosting_grant_history"), list) else []
     for grant in history:
         if not isinstance(grant, dict) or str(grant.get("plan_hash") or "") != plan_digest:
+            continue
+        try:
+            step_no = int(grant.get("step") or 0)
+        except (TypeError, ValueError):
+            continue
+        if step_no < 1 or _self_hosting_gate_loop(grant, step_no) is None:
             continue
         for raw in grant.get("paths") or []:
             path = _normalize_repo_path(str(raw))
@@ -3911,8 +3948,18 @@ def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
 
 def authority_snapshot() -> dict[Path, bytes | None]:
     runtime_paths = {STATE, PLAN, IDEAS, JOURNAL, POLICY, CONTEXT}
-    tooling_paths = {ROOT / rel for rel in TOOLING_PATHS if not rel.startswith(".ralph/")}
-    paths = runtime_paths | tooling_paths
+    registered = {ROOT / rel for rel in TOOLING_PATHS if not rel.startswith(".ralph/")}
+    discovered: set[Path] = set()
+    for path in ROOT.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            rel = path.relative_to(ROOT).as_posix()
+        except ValueError:
+            continue
+        if is_tooling_path(rel):
+            discovered.add(path)
+    paths = runtime_paths | registered | discovered
     return {path: path.read_bytes() if path.exists() else None for path in paths}
 
 
@@ -3936,7 +3983,17 @@ def authority_changed_paths(snapshot: dict[Path, bytes | None]) -> list[str]:
     return sorted(changed)
 
 
-def self_hosting_grant_allows(state: dict, step_no: int, changed: Iterable[str]) -> tuple[bool, str]:
+def _self_hosting_gate_loop(grant: dict, step_no: int) -> int | None:
+    gate_id = str(grant.get("gate_id") or "")
+    match = re.fullmatch(r"HG-(\d+)-(\d+)", gate_id)
+    if match is None or int(match.group(2)) != int(step_no):
+        return None
+    return int(match.group(1))
+
+
+def self_hosting_grant_allows(
+    state: dict, step_no: int, changed: Iterable[str], *, operation_loop: int | None = None,
+) -> tuple[bool, str]:
     paths = sorted({_normalize_repo_path(str(path)) for path in changed if str(path).strip()})
     if not paths:
         return False, "no authority paths changed"
@@ -3947,7 +4004,15 @@ def self_hosting_grant_allows(state: dict, step_no: int, changed: Iterable[str])
         return False, "self-hosting grant plan hash does not match active plan"
     if int(grant.get("step") or 0) != int(step_no):
         return False, "self-hosting grant is not for the current step"
-    allowed = {str(path) for path in grant.get("paths") or []}
+    gate_loop = _self_hosting_gate_loop(grant, step_no)
+    if gate_loop is None:
+        return False, "self-hosting grant gate does not match its approved step"
+    if operation_loop is not None and gate_loop >= int(operation_loop):
+        return False, "self-hosting grant was not issued before the attributed operation"
+    state_loop = int(state.get("loop_count") or 0)
+    if operation_loop is None and gate_loop > state_loop:
+        return False, "self-hosting grant gate is from a future controller loop"
+    allowed = {_normalize_repo_path(str(path)) for path in grant.get("paths") or []}
     runtime = [path for path in paths if path == ".ralph" or path.startswith(".ralph/")]
     if runtime:
         return False, f"RALPH runtime authority is never self-hosting writable: {runtime}"
@@ -3960,6 +4025,12 @@ def self_hosting_grant_allows(state: dict, step_no: int, changed: Iterable[str])
     extra = sorted(set(paths) - allowed)
     if extra:
         return False, f"authority changes exceed exact self-hosting grant: {extra}"
+    for path in paths:
+        grants = _self_hosting_grants_for_origin(
+            state, step_no, path, operation_loop=operation_loop,
+        )
+        if grants and _evidence_digest(grants[-1]) != _evidence_digest(grant):
+            return False, f"self-hosting grant is stale for gate/path scope: {path}"
     return True, f"exact self-hosting grant permits {paths}"
 
 
@@ -3991,11 +4062,17 @@ def restore_protected(snapshot: dict[Path, bytes], changed: Iterable[str] = ()) 
         path.write_bytes(content)
 
 
-def restore_authority(snapshot: dict[Path, bytes | None]) -> None:
+def restore_authority(snapshot: dict[Path, bytes | None], changed: Iterable[str] = ()) -> None:
+    original = set(snapshot)
+    for rel in changed:
+        path = ROOT / _normalize_repo_path(str(rel))
+        if path not in original and is_tooling_path(_normalize_repo_path(str(rel))):
+            path.unlink(missing_ok=True)
     for path, content in snapshot.items():
         if content is None:
             path.unlink(missing_ok=True)
         else:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
 
 
@@ -4020,7 +4097,15 @@ def is_protected_path(path: str) -> bool:
 
 
 def is_tooling_path(path: str) -> bool:
-    return path in TOOLING_PATHS
+    normalized = _normalize_repo_path(path)
+    if normalized in TOOLING_PATHS:
+        return True
+    candidate = Path(normalized)
+    if candidate.parent.as_posix() == "scripts" and candidate.suffix == ".py" and candidate.name.startswith("ralph"):
+        return True
+    if candidate.parent.as_posix() == "tests" and candidate.suffix == ".py" and candidate.name.startswith("test_ralph"):
+        return True
+    return False
 
 
 def classify_changes(paths: Iterable[str]) -> str:
@@ -6861,6 +6946,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not ensure_codex_usage_capacity(state, wait=args.wait_for_limits, poll_seconds=args.usage_poll_seconds):
             return 0
         state = load_state()
+        try:
+            validate_complete_plan(state["plan"], state.get("plan_hash"))
+            sandbox = sandbox_for_approved_plan(state["plan"], state.get("plan_hash"))
+        except (KeyError, TypeError, ValueError) as exc:
+            block(state, f"approved plan identity/authority is invalid before model admission: {exc}")
+            raise RuntimeError("approved plan identity/authority changed before model admission; blocked for human review") from exc
         if loops_this_run >= args.max_loops:
             state["status"] = "APPROVED"
             save_state(state)
@@ -6935,11 +7026,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         change_class = classify_changes(files)
         tooling_changed = [path for path in files if is_tooling_path(path)]
 
-        changed_authority = authority_changed_paths(authority)
+        changed_authority = sorted(set(authority_changed_paths(authority)) | {
+            path for path in files if is_tooling_path(path)
+        })
         if changed_authority:
             granted, grant_reason = self_hosting_grant_allows(state, int(step["id"]), changed_authority)
             if not granted:
-                restore_authority(authority)
+                restore_authority(authority, changed_authority)
                 state = load_state()
                 # The restoration guard is not a substitute for the required
                 # checkpoint comparison; record it even on this refusal path.
@@ -7266,6 +7359,7 @@ def cmd_recover_self_upgrade(args: argparse.Namespace) -> int:
         native = _native_recovery_record(
             state, origin, path, fingerprint, loop=int(raw.get("loop") or 0),
             source="accepted-v1-operation",
+            accepted_loop=int(raw.get("loop") or 0),
         )
         if native["baseline_kind"] != raw.get("baseline_kind") or native["operation"] != raw.get("operation"):
             raise RuntimeError(f"recover-self-upgrade v1 operation no longer matches checkpoint semantics: {path}")
@@ -7278,7 +7372,6 @@ def cmd_recover_self_upgrade(args: argparse.Namespace) -> int:
     _validated_operation_records(prospective)
     latest = _latest_operation_records_by_path(prospective)
     synthetic = 0
-    recovery_loop = int(state.get("loop_count") or 0)
     for path in sorted(current_delta - set(pending)):
         fingerprint = retirement_path_fingerprint(path)
         existing = latest.get(path)
@@ -7286,8 +7379,9 @@ def cmd_recover_self_upgrade(args: argparse.Namespace) -> int:
             continue
         origin, accepted_loop = _accepted_origin_for_recovery(state, path, accepted)
         record = _native_recovery_record(
-            state, origin, path, fingerprint, loop=recovery_loop,
+            state, origin, path, fingerprint, loop=accepted_loop,
             source=f"accepted-step-current-delta:accepted-loop={accepted_loop}",
+            accepted_loop=accepted_loop,
         )
         repaired.append(record)
         prospective["operation_attributions"] = repaired

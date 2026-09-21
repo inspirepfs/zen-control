@@ -87,6 +87,57 @@ class SelfHostingGrantContractTests(unittest.TestCase):
                 continue
             self.assertIn(ralph.ROOT / rel, snapshot, rel)
 
+    def test_structural_controller_paths_are_authority_even_when_not_registered(self):
+        self.assertTrue(ralph.is_tooling_path("scripts/ralph_profile.py"))
+        self.assertTrue(ralph.is_tooling_path("tests/test_ralph_web_plan_bounds.py"))
+        snapshot = ralph.authority_snapshot()
+        self.assertIn(ralph.ROOT / "scripts/ralph_profile.py", snapshot)
+        self.assertIn(ralph.ROOT / "tests/test_ralph_web_plan_bounds.py", snapshot)
+
+    def test_cross_gate_grant_is_rejected_live_but_historical_gate_remains_valid(self):
+        state = self.state()
+        older = {
+            "plan_hash": "plan-123", "step": 2, "gate_id": "HG-0007-02",
+            "paths": ["scripts/ralph.py"], "granted_at": "2026-09-20T00:07:00+00:00",
+        }
+        newer = {
+            "plan_hash": "plan-123", "step": 2, "gate_id": "HG-0008-02",
+            "paths": ["scripts/ralph.py"], "granted_at": "2026-09-20T00:08:00+00:00",
+        }
+        state["loop_count"] = 9
+        state["self_hosting_grant_history"] = [older, newer]
+        state["self_hosting_grant"] = older
+        allowed, reason = ralph.self_hosting_grant_allows(state, 2, ["scripts/ralph.py"])
+        self.assertFalse(allowed)
+        self.assertIn("stale for gate/path scope", reason)
+
+        historical = dict(state)
+        historical["self_hosting_grant"] = older
+        allowed, reason = ralph.self_hosting_grant_allows(
+            historical, 2, ["scripts/ralph.py"], operation_loop=8,
+        )
+        self.assertTrue(allowed, reason)
+        allowed, reason = ralph.self_hosting_grant_allows(
+            historical, 2, ["scripts/ralph.py"], operation_loop=9,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("stale for gate/path scope", reason)
+
+    def test_restore_authority_deletes_unregistered_new_controller_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "scripts" / "ralph_profile.py"
+            profile.parent.mkdir(parents=True)
+            profile.write_text("baseline\n", encoding="utf-8")
+            snapshot = {profile: profile.read_bytes()}
+            created = root / "scripts" / "ralph_shadow.py"
+            created.write_text("created\n", encoding="utf-8")
+            profile.write_text("changed\n", encoding="utf-8")
+            with mock.patch.object(ralph, "ROOT", root):
+                ralph.restore_authority(snapshot, ["scripts/ralph_profile.py", "scripts/ralph_shadow.py"])
+            self.assertEqual("baseline\n", profile.read_text(encoding="utf-8"))
+            self.assertFalse(created.exists())
+
 
 class AuthorizeSelfHostingCommandTests(unittest.TestCase):
     def base_state(self):
@@ -242,7 +293,7 @@ class FinalizationSelfHostingTests(unittest.TestCase):
                 "plan_hash": "plan-123",
                 "step": 1,
                 "gate_id": "HG-0001-01",
-                "paths": ["scripts/ralph.py"],
+                "paths": ["scripts/ralph.py", "tests/test_ralph_web_live_refresh.py"],
             }],
             "final_qualification": {"state": "PASS", "delta_fingerprint": "abc"},
         })
@@ -253,7 +304,14 @@ class FinalizationSelfHostingTests(unittest.TestCase):
         state["self_hosting_grant_history"].append({
             "plan_hash": "other-plan", "paths": ["scripts/ralph_web.py"]
         })
-        self.assertEqual(ralph.authorized_self_hosting_paths(state), {"scripts/ralph.py"})
+        state["self_hosting_grant_history"].append({
+            "plan_hash": "plan-123", "step": 1, "gate_id": "HG-stale",
+            "paths": ["scripts/ralph_web.py"],
+        })
+        self.assertEqual(
+            ralph.authorized_self_hosting_paths(state),
+            {"scripts/ralph.py", "tests/test_ralph_web_live_refresh.py"},
+        )
 
     def test_qualified_delta_requires_bound_matching_fingerprint(self):
         state = self.state()
@@ -335,9 +393,9 @@ class BootstrapSourceFlowTests(unittest.TestCase):
 
     def test_run_checks_exact_grant_before_restoring_authority(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
-        changed = source.index("changed_authority = authority_changed_paths(authority)")
+        changed = source.index("changed_authority = sorted(set(authority_changed_paths(authority))")
         granted = source.index("self_hosting_grant_allows", changed)
-        restore = source.index("restore_authority(authority)", granted)
+        restore = source.index("restore_authority(authority, changed_authority)", granted)
         remember = source.index("remember_plan_files(state, files)", restore)
         self.assertLess(changed, granted)
         self.assertLess(granted, restore)
@@ -360,7 +418,7 @@ class BootstrapSourceFlowTests(unittest.TestCase):
 
     def test_authority_block_persists_controller_candidate_after_restoration(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
-        restore = source.index("restore_authority(authority)")
+        restore = source.index("restore_authority(authority, changed_authority)")
         candidate_paths = source.index("candidate_paths = sorted", restore)
         candidate_state = source.index('state["self_hosting_candidate"] = candidate', candidate_paths)
         blocked = source.index('block(state, "Codex attempted to change RALPH controller/tooling authority")', candidate_state)

@@ -543,7 +543,7 @@ class NativeAttributionTests(unittest.TestCase):
             path = "scripts/ralph.py"
             (repo.root / path).parent.mkdir(exist_ok=True)
             (repo.root / path).write_text("controller = 2\n", encoding="utf-8")
-            grant = {"plan_hash": state["plan_hash"], "step": 1, "gate_id": "HG-test", "paths": [path], "reason": "test", "granted_at": "2026-09-20T00:00:00+00:00"}
+            grant = {"plan_hash": state["plan_hash"], "step": 1, "gate_id": "HG-0003-01", "paths": [path], "reason": "test", "granted_at": "2026-09-20T00:00:00+00:00"}
             state["self_hosting_grant"] = dict(grant)
             state["self_hosting_grant_history"] = [dict(grant)]
             attribution = ralph.verified_attribution_result(
@@ -653,6 +653,23 @@ class SelfUpgradeRecoveryTests(unittest.TestCase):
             self.assertTrue(all(item["schema"] == ralph.OPERATION_ATTRIBUTION_SCHEMA for item in recovered["operation_attributions"]))
             self.assertTrue(all(item["plan_hash"] == state["plan_hash"] for item in recovered["operation_attributions"]))
             self.assertEqual(["tests/test_ralph_lite.py"], ralph.current_attributed_paths(recovered))
+            recovered_lite = next(
+                item for item in recovered["operation_attributions"]
+                if item["path"] == "tests/test_ralph_lite.py"
+            )
+            self.assertEqual(197, recovered_lite["loop"])
+            self.assertIn("accepted-loop=197", recovered_lite["controller_verification"]["recovery"]["source"])
+            self.assertEqual(
+                {"step": 1, "loop": 197},
+                recovered_lite["controller_verification"]["recovery"]["accepted_origin"],
+            )
+            original_accepted_origin = dict(recovered_lite["controller_verification"]["recovery"]["accepted_origin"])
+            recovered_lite["controller_verification"]["recovery"]["accepted_origin"]["loop"] = 198
+            recovered_lite["record_sha256"] = ralph._operation_record_hash(recovered_lite)
+            with self.assertRaisesRegex(RuntimeError, "recovery accepted-loop origin is missing or altered"):
+                ralph.validated_plan_paths(recovered)
+            recovered_lite["controller_verification"]["recovery"]["accepted_origin"] = original_accepted_origin
+            recovered_lite["record_sha256"] = ralph._operation_record_hash(recovered_lite)
 
             verification = ralph.verify_post_turn_repository_state(
                 recovered, recovered["plan"]["steps"][2], "workspace-write", [],
@@ -1223,6 +1240,61 @@ class RunLoopSandboxVerificationTests(unittest.TestCase):
             "ideas": [], "context": {"files_inspected": [], "relevant_files": [], "accepted_findings": []},
         }
 
+    def test_run_revalidates_plan_hash_after_usage_wait_before_model_admission(self):
+        with RepoHarness(self):
+            plan = valid_plan()
+            plan["repository_authority"] = "write"
+            self._approved_state(plan)
+
+            def mutate_after_initial_validation(*_args, **_kwargs):
+                state = ralph.load_state()
+                state["plan"]["repository_authority"] = "read-only"
+                ralph.save_state(state)
+                return True
+
+            with (
+                mock.patch.object(ralph, "ensure_codex_usage_capacity", side_effect=mutate_after_initial_validation),
+                mock.patch.object(ralph, "run_codex") as run_codex,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed before model admission"):
+                    ralph.cmd_run(self._args())
+            run_codex.assert_not_called()
+            blocked = ralph.load_state()
+            self.assertEqual("BLOCKED_HUMAN", blocked["status"])
+            self.assertIn("approved plan hash does not match controller state", blocked["block_reason"])
+
+    def test_ungranted_structural_tooling_is_restored_origin_completely(self):
+        with RepoHarness(self) as repo:
+            profile = repo.root / "scripts" / "ralph_profile.py"
+            profile.parent.mkdir(parents=True, exist_ok=True)
+            profile.write_text("baseline profile\n", encoding="utf-8")
+            repo.git("add", "scripts/ralph_profile.py")
+            repo.git("commit", "-qm", "controller profile baseline")
+            plan = valid_plan()
+            plan["repository_authority"] = "write"
+            self._approved_state(plan)
+
+            def fake_codex(*_args, **_kwargs):
+                profile.write_text("unauthorized profile change\n", encoding="utf-8")
+                created = repo.root / "scripts" / "ralph_shadow.py"
+                created.write_text("unauthorized new controller module\n", encoding="utf-8")
+                return self._result()
+
+            with (
+                mock.patch.object(ralph, "ensure_codex_usage_capacity", return_value=True),
+                mock.patch.object(ralph, "run_codex", side_effect=fake_codex),
+                mock.patch.object(ralph, "run_gates") as gates,
+            ):
+                self.assertEqual(2, ralph.cmd_run(self._args()))
+            gates.assert_not_called()
+            self.assertEqual("baseline profile\n", profile.read_text(encoding="utf-8"))
+            self.assertFalse((repo.root / "scripts" / "ralph_shadow.py").exists())
+            blocked = ralph.load_state()
+            self.assertEqual(
+                ["scripts/ralph_profile.py", "scripts/ralph_shadow.py"],
+                blocked["self_hosting_candidate"]["paths"],
+            )
+
     def test_read_only_sandbox_refuses_checkpoint_delta_before_continuation(self):
         with RepoHarness(self) as repo:
             operator = repo.root / "operator.txt"
@@ -1305,9 +1377,13 @@ class RunLoopSandboxVerificationTests(unittest.TestCase):
             state = ralph.load_state()
             granted_paths = ["scripts/ralph.py", "tests/test_ralph_lifecycle.py"]
             self.assertTrue(all(ralph.is_tooling_path(path) for path in granted_paths))
-            state["self_hosting_grant"] = {
-                "plan_hash": state["plan_hash"], "step": 1, "paths": granted_paths,
+            state["loop_count"] = 7
+            grant = {
+                "plan_hash": state["plan_hash"], "step": 1, "gate_id": "HG-0007-01",
+                "paths": granted_paths, "reason": "test", "granted_at": "2026-09-20T00:07:00+00:00",
             }
+            state["self_hosting_grant"] = grant
+            state["self_hosting_grant_history"] = [dict(grant)]
             ralph.save_state(state)
 
             def fake_codex(*_args, **_kwargs):
