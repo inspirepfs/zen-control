@@ -231,6 +231,23 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(snap["controller_output_source"], "controller-live")
             self.assertEqual(snap["live_log"], ["controller-live"])
 
+    def test_snapshot_exposes_bounded_interrupted_run_recovery_evidence(self):
+        with WebHarness() as h:
+            h.state(
+                current_step=2,
+                pending_step_delta_paths={"step": 2, "paths": ["pending.py"]},
+                interrupted_run_recovery={
+                    "schema": "zen_ralph_interrupted_run_recovery_v1",
+                    "action": "RESUMED", "loop": 231, "checkpoint": "RP-TEST",
+                    "sha256": "c" * 64, "detail": "private detail not exposed",
+                },
+            )
+            recovery = web.snapshot()["controller"]["interrupted_run_recovery"]
+            self.assertEqual(recovery, {
+                "action": "RESUMED", "loop": 231, "checkpoint": "RP-TEST", "sha256": "c" * 64,
+            })
+            self.assertEqual(web.snapshot()["controller"]["pending_current_step_paths"], ["pending.py"])
+
     def test_snapshot_exposes_controller_reconciliation_without_web_reclassification(self):
         with WebHarness() as h:
             h.state(retirement_record_id="RT-1", carry_forward_candidates=[])
@@ -279,6 +296,32 @@ class ActionAuthorityTests(unittest.TestCase):
             self.base_state(),
         )
         self.assertEqual(request.argv[request.argv.index("--efficiency-mode") + 1], "off")
+
+    def test_interrupted_run_recovery_is_checkpoint_pending_and_confirmation_bound(self):
+        state = {
+            "status": "RUNNING", "plan_hash": "b" * 64, "recovery_checkpoint": "RP-TEST",
+            "current_step": 2, "pending_step_delta_paths": {"step": 2, "paths": ["pending.py"]},
+        }
+        payload = {"action": "recover_interrupted_run", "confirm": "RECOVER", "pending_paths": ["pending.py"]}
+        req = web.command_for_action(payload, state)
+        self.assertEqual(req.argv, [
+            "recover-interrupted-run", "b" * 64, "--checkpoint", "RP-TEST",
+            "--pending-path", "pending.py", "--confirm", "RECOVER",
+        ])
+        self.assertEqual(req.activity, "RECOVERING")
+        blocked = {
+            **state, "status": "BLOCKED_HUMAN",
+            "block_reason": "controller interrupted: operator keyboard interrupt",
+        }
+        self.assertEqual(web.command_for_action(payload, blocked).argv, req.argv)
+        with self.assertRaisesRegex(web.WebConsoleError, "confirm=RECOVER"):
+            web.command_for_action({"action": "recover_interrupted_run", "pending_paths": ["pending.py"]}, state)
+        with self.assertRaisesRegex(web.WebConsoleError, "exact controller pending paths"):
+            web.command_for_action({"action": "recover_interrupted_run", "confirm": "RECOVER", "pending_paths": []}, state)
+        with self.assertRaisesRegex(web.WebConsoleError, "not an interrupted controller run"):
+            web.command_for_action(payload, {**blocked, "block_reason": "unrelated evidence gate"})
+        with self.assertRaisesRegex(web.WebConsoleError, "requires RUNNING or BLOCKED_HUMAN"):
+            web.command_for_action(payload, {**state, "status": "APPROVED"})
 
     def test_efficiency_update_is_available_without_active_plan_and_is_atomic_cli_action(self):
         request = web.command_for_action(

@@ -996,13 +996,15 @@ class ProposalLifecycleTests(unittest.TestCase):
                 proposal = valid_plan()
                 proposal["goal"] = "Replacement proposal"
                 proposal_hash = ralph.plan_hash(proposal)
+                snapshot = ralph._proposal_previous_state_snapshot(previous)
                 pending = dict(previous)
                 pending.update({
                     "status": "AWAITING_APPROVAL",
                     "plan_hash": proposal_hash,
                     "plan": proposal,
                     "current_step": 1,
-                    "proposal_previous_state": previous,
+                    "proposal_previous_state": snapshot,
+                    "proposal_previous_state_sha256": ralph._evidence_digest(snapshot),
                     "codex_usage": {"schema": "zen_codex_usage_v1"},
                 })
                 ralph.save_state(pending)
@@ -1017,6 +1019,60 @@ class ProposalLifecycleTests(unittest.TestCase):
                 self.assertEqual(restored["codex_usage"]["schema"], "zen_codex_usage_v1")
                 self.assertEqual(ralph.PLAN.read_text(encoding="utf-8"), ralph.render_plan(old_plan))
                 self.assertIn("Execution authority granted: no", ralph.JOURNAL.read_text(encoding="utf-8"))
+            finally:
+                ralph.STATE = saved["STATE"]
+                ralph.PLAN = saved["PLAN"]
+                ralph.JOURNAL = saved["JOURNAL"]
+                ralph.init_files = saved["init_files"]
+
+
+    def test_proposal_previous_state_is_hash_bound_and_never_restores_runtime_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = self._with_paths(td)
+            try:
+                root = Path(td)
+                ralph.STATE = root / "state.json"
+                ralph.PLAN = root / "plan.md"
+                ralph.JOURNAL = root / "journal.md"
+                ralph.JOURNAL.write_text("", encoding="utf-8")
+                ralph.init_files = lambda: None
+                previous = ralph.default_state()
+                previous.update({
+                    "status": "PUSHED",
+                    "controller_runtime": {"pid": 424242, "command": "propose"},
+                    "loop_count": 17,
+                })
+                snapshot = ralph._proposal_previous_state_snapshot(previous)
+                self.assertEqual(ralph.PROPOSAL_PREVIOUS_STATE_SCHEMA, snapshot["schema"])
+                self.assertNotIn("controller_runtime", snapshot["state"])
+                proposal = valid_plan()
+                ralph.controller_inject_repository_authority(proposal, "write")
+                proposal_hash = ralph.plan_hash(proposal)
+                pending = ralph.default_state()
+                pending.update({
+                    "status": "AWAITING_APPROVAL",
+                    "plan_hash": proposal_hash,
+                    "plan": proposal,
+                    "proposal_previous_state": snapshot,
+                    "proposal_previous_state_sha256": ralph._evidence_digest(snapshot),
+                })
+                ralph.save_state(pending)
+                ralph.PLAN.write_text(ralph.render_plan(proposal), encoding="utf-8")
+
+                tampered = ralph.load_state()
+                tampered["proposal_previous_state"]["state"]["loop_count"] = 99
+                ralph.save_state(tampered)
+                with self.assertRaisesRegex(RuntimeError, "snapshot is stale or altered"):
+                    ralph.cmd_reject(type("Args", (), {"plan_hash": proposal_hash, "reason": "reject"})())
+
+                pending["proposal_previous_state"] = snapshot
+                ralph.save_state(pending)
+                self.assertEqual(0, ralph.cmd_reject(type("Args", (), {"plan_hash": proposal_hash, "reason": "reject"})()))
+                restored = ralph.load_state()
+                self.assertEqual("PUSHED", restored["status"])
+                self.assertEqual(17, restored["loop_count"])
+                self.assertIsNone(restored.get("controller_runtime"))
+                self.assertNotIn("proposal_previous_state_sha256", restored)
             finally:
                 ralph.STATE = saved["STATE"]
                 ralph.PLAN = saved["PLAN"]
@@ -1080,3 +1136,125 @@ class ProposalLifecycleTests(unittest.TestCase):
                 self.assertEqual(ralph.live_usage_by_loop()[9]["input"], 389806)
             finally:
                 ralph.LIVE = old_live
+
+
+class InterruptedRunRecoveryContractTests(unittest.TestCase):
+    def _state(self, status="RUNNING"):
+        plan = {
+            "goal": "D3 recovery",
+            "repository_authority": "write",
+            "planning": {"min_steps": 1, "max_steps": 1},
+            "steps": [{
+                "id": 1, "title": "Recover", "objective": "Recover",
+                "acceptance": ["Recovered"], "test_change_policy": "modify",
+            }],
+        }
+        return {
+            **ralph.default_state(),
+            "status": status,
+            "plan": plan,
+            "plan_hash": ralph.plan_hash(plan),
+            "current_step": 1,
+            "loop_count": 232,
+            "recovery_checkpoint": "RP-D3",
+            "pending_step_delta_paths": {"step": 1, "paths": ["pending.py"]},
+        }
+
+    def test_run_refuses_durable_running_before_model_admission(self):
+        state = self._state()
+        args = argparse.Namespace(color="never", efficiency_mode=None)
+        with (
+            mock.patch.object(ralph, "init_files"),
+            mock.patch.object(ralph, "load_state", return_value=state),
+            mock.patch.object(ralph, "save_state"),
+            mock.patch.object(ralph.efficiency_policy, "load_policy", return_value={"mode": "RELAXED"}),
+            mock.patch.object(ralph, "run_codex") as run_codex,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "refuses durable RUNNING"):
+                ralph.cmd_run(args)
+        run_codex.assert_not_called()
+
+    def test_run_refuses_live_runtime_separately_from_durable_admission(self):
+        state = self._state(status="APPROVED")
+        args = argparse.Namespace(color="never", efficiency_mode=None)
+        with (
+            mock.patch.object(ralph, "init_files"),
+            mock.patch.object(ralph, "load_state", return_value=state),
+            mock.patch.object(ralph, "controller_runtime_status", return_value={"active": True, "pid": 4242, "command": "run"}),
+            mock.patch.object(ralph, "run_codex") as run_codex,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "refuses live controller runtime"):
+                ralph.cmd_run(args)
+        run_codex.assert_not_called()
+
+    def test_interrupted_evidence_requires_dead_runtime_and_exact_declared_delta(self):
+        state = self._state()
+        verification = {"new_project_delta": ["owned.py", "pending.py"]}
+        with (
+            mock.patch.object(ralph, "controller_runtime_status", return_value={"active": False, "pid": None}),
+            mock.patch.object(ralph, "validate_complete_plan"),
+            mock.patch.object(ralph, "verify_approval_execution_evidence", return_value={"id": "RP-D3"}),
+            mock.patch.object(ralph, "sandbox_for_approved_plan", return_value="workspace-write"),
+            mock.patch.object(ralph, "verify_post_turn_repository_state", return_value=verification),
+            mock.patch.object(ralph, "current_attributed_paths", return_value=["owned.py"]),
+        ):
+            evidence = ralph._interrupted_run_recovery_evidence(state, "RP-D3", {"pending.py"})
+            self.assertEqual(evidence["pending_current_step_paths"], ["pending.py"])
+            with mock.patch.object(ralph, "verify_post_turn_repository_state", return_value={"new_project_delta": ["owned.py", "foreign.py"]}):
+                with self.assertRaisesRegex(RuntimeError, "unverified repository delta"):
+                    ralph._interrupted_run_recovery_evidence(state, "RP-D3", {"pending.py"})
+        with mock.patch.object(ralph, "controller_runtime_status", return_value={"active": True, "pid": 4242}):
+            with self.assertRaisesRegex(RuntimeError, "active controller runtime"):
+                ralph._interrupted_run_recovery_evidence(state, "RP-D3", {"pending.py"})
+
+        state["controller_runtime"] = {"pid": "not-a-pid", "command": "run"}
+        with mock.patch.object(ralph, "controller_runtime_status", return_value={"active": False, "pid": None}):
+            with self.assertRaisesRegex(RuntimeError, "malformed controller runtime"):
+                ralph._interrupted_run_recovery_evidence(state, "RP-D3", {"pending.py"})
+
+    def test_recovery_requires_exact_pending_declaration_invalidates_terminal_and_is_idempotent(self):
+        state = self._state()
+        state["final_qualification"] = {"state": "PASS", "delta_fingerprint": "stale"}
+        state["completion_changes"] = {"files": 1}
+        state["commit_sha"] = "deadbeef"
+        state["push_upstream"] = "origin/main"
+        args = argparse.Namespace(
+            plan_hash=state["plan_hash"], checkpoint="RP-D3",
+            pending_path=["pending.py"], confirm="RECOVER",
+        )
+        with (
+            mock.patch.object(ralph, "init_files"),
+            mock.patch.object(ralph, "load_state", side_effect=lambda: state),
+            mock.patch.object(ralph, "save_state"),
+            mock.patch.object(ralph, "_interrupted_run_recovery_evidence", return_value={"new_project_delta": ["pending.py"]}),
+            mock.patch.object(ralph, "plan_control_event"),
+            mock.patch.object(ralph, "append_journal"),
+            mock.patch.object(ralph, "live_write"),
+        ):
+            self.assertEqual(0, ralph.cmd_recover_interrupted_run(args))
+            self.assertEqual("APPROVED", state["status"])
+            self.assertEqual(232, state["loop_count"])
+            self.assertEqual(1, state["current_step"])
+            self.assertEqual("STALE", state["final_qualification"]["state"])
+            self.assertIsNone(state["completion_changes"])
+            self.assertIsNone(state["commit_sha"])
+            self.assertIsNone(state["push_upstream"])
+            self.assertEqual(0, ralph.cmd_recover_interrupted_run(args))
+            self.assertEqual(232, state["loop_count"])
+
+        wrong = self._state()
+        bad = argparse.Namespace(
+            plan_hash=wrong["plan_hash"], checkpoint="RP-D3", pending_path=[], confirm="RECOVER",
+        )
+        with mock.patch.object(ralph, "init_files"), mock.patch.object(ralph, "load_state", return_value=wrong):
+            with self.assertRaisesRegex(RuntimeError, "exact current-step pending paths"):
+                ralph.cmd_recover_interrupted_run(bad)
+
+    def test_recovery_parser_requires_confirmation_and_exposes_pending_paths(self):
+        parser = ralph.build_parser()
+        args = parser.parse_args([
+            "recover-interrupted-run", "a" * 64, "--checkpoint", "RP-D3",
+            "--pending-path", "pending.py", "--confirm", "RECOVER",
+        ])
+        self.assertEqual(args.pending_path, ["pending.py"])
+        self.assertEqual(args.confirm, "RECOVER")

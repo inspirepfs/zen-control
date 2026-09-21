@@ -285,6 +285,8 @@ def default_state() -> dict:
         "usage_admission": None,
         "controller_runtime": None,
         "retirement_rollback_preview": None,
+        "proposal_previous_state_sha256": None,
+        "interrupted_run_recovery": None,
         "updated_at": utc_now(),
     }
 
@@ -5863,6 +5865,230 @@ def cmd_init(_: argparse.Namespace) -> int:
     return 0
 
 
+PROPOSAL_PREVIOUS_STATE_SCHEMA = "zen_ralph_proposal_previous_state_v1"
+_PROPOSAL_PREVIOUS_STATE_FIELDS = frozenset(
+    (set(default_state()) | {
+        "carry_forward_candidates", "codex_usage", "human_gate_resolutions", "last_efficiency",
+        "last_post_turn_verification", "plan_carry_forward_files", "retired_plans",
+        "retirement_record_id", "self_upgrade_recovery", "usage_pause",
+    }) - {"controller_runtime", "proposal_previous_state_sha256"}
+)
+
+
+def _proposal_previous_state_snapshot(state: dict) -> dict:
+    """Return a schema-bound whitelist of durable pre-proposal controller state."""
+    durable = {
+        key: _json_copy(state[key])
+        for key in sorted(_PROPOSAL_PREVIOUS_STATE_FIELDS)
+        if key in state and key != "proposal_previous_state"
+    }
+    return {"schema": PROPOSAL_PREVIOUS_STATE_SCHEMA, "state": durable}
+
+
+def _invalidate_terminal_artifacts_for_recovery(state: dict, reason: str) -> None:
+    """Recovery must never inherit commit readiness or a prior qualified delta."""
+    prior = state.get("final_qualification")
+    if isinstance(prior, dict):
+        state["final_qualification"] = {
+            "state": "STALE",
+            "invalidated_by": "recovery",
+            "reason": str(reason)[:1200],
+            "prior_delta_fingerprint": prior.get("delta_fingerprint"),
+            "invalidated_at": utc_now(),
+        }
+    else:
+        state["final_qualification"] = None
+    state["completion_changes"] = None
+    state["commit_sha"] = None
+    state["commit_message"] = None
+    state["commit_reconciled"] = False
+    state["commit_reconcile_note"] = None
+    state["commit_reconciled_at"] = None
+    state["push_upstream"] = None
+    state["push_reconciled"] = False
+    state["pushed_at"] = None
+
+
+INTERRUPTED_RUN_RECOVERY_SCHEMA = "zen_ralph_interrupted_run_recovery_v1"
+
+
+def _interrupted_run_recovery_record(state: dict, checkpoint_id: str, *, action: str, detail: str, verification: dict | None = None) -> dict:
+    record = {
+        "schema": INTERRUPTED_RUN_RECOVERY_SCHEMA,
+        "plan_hash": state.get("plan_hash"),
+        "checkpoint": checkpoint_id,
+        "step": int(state.get("current_step") or 0),
+        "loop": int(state.get("loop_count") or 0),
+        "action": action,
+        "detail": str(detail)[:2000],
+        "verification": _json_copy(verification) if isinstance(verification, dict) else None,
+        "recorded_at": utc_now(),
+    }
+    record["sha256"] = _evidence_digest(record)
+    return record
+
+
+def _declared_interrupted_pending_paths(state: dict, raw_paths: object) -> set[str]:
+    values = list(raw_paths) if isinstance(raw_paths, (list, tuple)) else []
+    normalized: list[str] = []
+    for value in values:
+        raw = str(value or "").strip()
+        path = _normalize_repo_path(raw)
+        if not raw or not path or path != raw:
+            raise RuntimeError(f"recover-interrupted-run has invalid pending path: {raw!r}")
+        if is_protected_path(path) or _is_runtime_authority_path(path):
+            raise RuntimeError(f"recover-interrupted-run refuses protected/runtime pending path: {path}")
+        normalized.append(path)
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError("recover-interrupted-run pending paths must be unique")
+    current_step = int(state.get("current_step") or 0)
+    expected = _pending_step_paths(state, current_step)
+    declared = set(normalized)
+    if declared != expected:
+        raise RuntimeError(
+            "recover-interrupted-run requires the exact current-step pending paths: "
+            f"declared={sorted(declared)} expected={sorted(expected)}"
+        )
+    return declared
+
+
+def _interrupted_run_recovery_evidence(state: dict, checkpoint_id: str, declared_pending: set[str]) -> dict:
+    runtime = controller_runtime_status(state)
+    if runtime.get("active"):
+        raise RuntimeError(
+            f"interrupted-run recovery refuses an active controller runtime pid {runtime.get('pid')}"
+        )
+    # An absent identity is the normal consequence of an externally killed
+    # controller. A present identity must still be controller-shaped; do not
+    # silently turn malformed runtime evidence into an absent runtime.
+    raw_runtime = state.get("controller_runtime")
+    if raw_runtime is not None:
+        if not isinstance(raw_runtime, dict):
+            raise RuntimeError("interrupted-run recovery refuses malformed controller runtime evidence")
+        try:
+            runtime_pid = int(raw_runtime.get("pid") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("interrupted-run recovery refuses malformed controller runtime evidence") from exc
+        if runtime_pid <= 0 or not str(raw_runtime.get("command") or "").strip():
+            raise RuntimeError("interrupted-run recovery refuses malformed controller runtime evidence")
+    expected = str(state.get("plan_hash") or "")
+    if not expected:
+        raise RuntimeError("interrupted-run recovery requires an active plan hash")
+    validate_complete_plan(state.get("plan"), expected)
+    checkpoint = verify_approval_execution_evidence(state)
+    if str(checkpoint.get("id") or "") != checkpoint_id:
+        raise RuntimeError("interrupted-run recovery checkpoint does not match approval evidence")
+    current_step = int(state.get("current_step") or 0)
+    steps = list(((state.get("plan") or {}).get("steps") or []))
+    if not (1 <= current_step <= len(steps)):
+        raise RuntimeError("interrupted-run recovery requires an unfinished approved step")
+    step = steps[current_step - 1]
+    sandbox = sandbox_for_approved_plan(state["plan"], expected)
+    verification = verify_post_turn_repository_state(state, step, sandbox, [])
+    current_delta = set(verification.get("new_project_delta") or [])
+    recorded = set(current_attributed_paths(state))
+    pending = set(declared_pending)
+    expected_delta = recorded | pending
+    if current_delta != expected_delta:
+        raise RuntimeError(
+            "interrupted run has unverified repository delta: "
+            f"unexpected={sorted(current_delta - expected_delta)} "
+            f"missing={sorted(expected_delta - current_delta)}"
+        )
+    return verification | {
+        "recorded_paths": sorted(recorded),
+        "pending_current_step_paths": sorted(pending),
+        "runtime": runtime,
+    }
+
+
+def cmd_recover_interrupted_run(args: argparse.Namespace) -> int:
+    """Normalize a dead RUNNING controller only when repository evidence is exact."""
+    init_files()
+    state = load_state()
+    expected = str(state.get("plan_hash") or "")
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    if not expected or not secrets.compare_digest(str(args.plan_hash or ""), expected):
+        raise RuntimeError("recover-interrupted-run hash does not match the active plan")
+    if not checkpoint_id or str(args.checkpoint or "") != checkpoint_id:
+        raise RuntimeError("recover-interrupted-run requires the exact active recovery checkpoint")
+    if str(getattr(args, "confirm", "") or "") != "RECOVER":
+        raise RuntimeError("recover-interrupted-run requires --confirm RECOVER")
+    declared_pending = _declared_interrupted_pending_paths(state, getattr(args, "pending_path", []))
+
+    prior = state.get("interrupted_run_recovery")
+    if state.get("status") == "APPROVED" and isinstance(prior, dict):
+        prior_payload = {key: value for key, value in prior.items() if key != "sha256"}
+        if (
+            prior.get("schema") == INTERRUPTED_RUN_RECOVERY_SCHEMA
+            and prior.get("action") == "RESUMED"
+            and prior.get("plan_hash") == expected
+            and prior.get("checkpoint") == checkpoint_id
+            and int(prior.get("loop") or -1) == int(state.get("loop_count") or 0)
+            and secrets.compare_digest(str(prior.get("sha256") or ""), _evidence_digest(prior_payload))
+        ):
+            print(
+                f"INTERRUPTED_RUN_ALREADY_RECOVERED plan={expected} checkpoint={checkpoint_id} "
+                f"step={state.get('current_step')} loop={state.get('loop_count')} status=APPROVED"
+            )
+            return 0
+
+    if state.get("status") == "APPROVED" and isinstance(prior, dict):
+        raise RuntimeError("recover-interrupted-run prior recovery record is stale or altered")
+
+    status = str(state.get("status") or "")
+    if status not in {"RUNNING", "BLOCKED_HUMAN"}:
+        raise RuntimeError(
+            f"recover-interrupted-run requires RUNNING or interruption-blocked state, found {status}"
+        )
+    if status == "BLOCKED_HUMAN":
+        reason = str(state.get("block_reason") or "")
+        if not (reason.startswith("controller interrupted:") or reason.startswith("controller runtime exception:")):
+            raise RuntimeError("recover-interrupted-run refuses an unrelated human block")
+
+    try:
+        verification = _interrupted_run_recovery_evidence(state, checkpoint_id, declared_pending)
+    except RuntimeError as exc:
+        detail = str(exc)
+        state["status"] = "BLOCKED_HUMAN"
+        state["block_reason"] = f"interrupted run recovery refused: {detail}"[:2000]
+        state["controller_runtime"] = None
+        state["interrupted_run_recovery"] = _interrupted_run_recovery_record(
+            state, checkpoint_id, action="REFUSED", detail=detail,
+        )
+        save_state(state)
+        live_write(state["block_reason"], "FAIL")
+        print(state["block_reason"])
+        return 2
+
+    _invalidate_terminal_artifacts_for_recovery(state, "interrupted controller run resumed")
+    state["status"] = "APPROVED"
+    state["block_reason"] = None
+    state["controller_runtime"] = None
+    state["interrupted_run_recovery"] = _interrupted_run_recovery_record(
+        state, checkpoint_id, action="RESUMED", detail="exact checkpoint-relative repository state verified",
+        verification=verification,
+    )
+    save_state(state)
+    plan_control_event(
+        state, "interrupted_run_recovery",
+        "dead controller runtime normalized after exact repository verification",
+        step=int(state.get("current_step") or 0), loop=int(state.get("loop_count") or 0),
+    )
+    append_journal(
+        int(state.get("loop_count") or 0), int(state.get("current_step") or 0),
+        "interrupted-run-recovery", "RECOVERED",
+        summary="Dead/interrupted controller runtime recovered without changing repository ownership or loop lineage.",
+        files=list(verification.get("new_project_delta") or []),
+        next_action="retry the same approved step",
+    )
+    print(
+        f"INTERRUPTED_RUN_RECOVERED plan={expected} checkpoint={checkpoint_id} "
+        f"step={state.get('current_step')} loop={state.get('loop_count')} status=APPROVED"
+    )
+    return 0
+
+
 def cmd_propose(args: argparse.Namespace) -> int:
     init_files()
     state = load_state()
@@ -5921,8 +6147,8 @@ def cmd_propose(args: argparse.Namespace) -> int:
         plan.get("_ralph_metrics") if isinstance(plan, dict) else {},
         plan_hash_value=digest, goal=goal, scope="planning", phase="replacement-proposal" if carry_forward else "proposal",
     )
-    previous_state = dict(state)
-    previous_state.pop("proposal_previous_state", None)
+    previous_state = _proposal_previous_state_snapshot(state)
+    previous_state_sha256 = _evidence_digest(previous_state)
     state.update({
         "status": "AWAITING_APPROVAL",
         "plan_hash": digest,
@@ -5934,6 +6160,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
         "last_result": None,
         "block_reason": None,
         "proposal_previous_state": previous_state,
+        "proposal_previous_state_sha256": previous_state_sha256,
         "retirement_record_id": retirement_record_id,
         "retirement_rollback_preview": None,
         "recovery_checkpoint": None,
@@ -6022,6 +6249,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     clear_self_hosting_context(state)
     state["step_results"] = []
     state.pop("proposal_previous_state", None)
+    state.pop("proposal_previous_state_sha256", None)
     save_state(state)
     plan_control_event(state, "plan_control_baseline", "plan control accounting baseline created", step=0)
     print(tui.box(
@@ -6051,8 +6279,28 @@ def cmd_reject(args: argparse.Namespace) -> int:
 
     current_usage = state.get("codex_usage")
     previous = state.get("proposal_previous_state")
-    if isinstance(previous, dict) and previous.get("status") in {"IDLE", "PLAN_COMPLETE", "PUSHED", "READ_ONLY_COMPLETE"}:
-        restored = dict(previous)
+    previous_sha256 = str(state.get("proposal_previous_state_sha256") or "")
+    previous_state = previous.get("state") if isinstance(previous, dict) else None
+    if (
+        isinstance(previous, dict)
+        and previous.get("schema") == PROPOSAL_PREVIOUS_STATE_SCHEMA
+        and isinstance(previous_state, dict)
+        and previous_state.get("status") in {"IDLE", "PLAN_COMPLETE", "PUSHED", "READ_ONLY_COMPLETE"}
+    ):
+        if not previous_sha256 or not secrets.compare_digest(previous_sha256, _evidence_digest(previous)):
+            raise RuntimeError("proposal previous-state snapshot is stale or altered")
+        if set(previous_state) - _PROPOSAL_PREVIOUS_STATE_FIELDS:
+            raise RuntimeError("proposal previous-state snapshot contains non-whitelisted fields")
+        if "controller_runtime" in previous_state or "proposal_previous_state" in previous_state:
+            raise RuntimeError("proposal previous-state snapshot contains transient controller state")
+        restored = default_state()
+        restored.update(_json_copy(previous_state))
+        restored["loop_count"] = max(
+            int(restored.get("loop_count") or 0), int(state.get("loop_count") or 0)
+        )
+        restored["controller_runtime"] = None
+        restored.pop("proposal_previous_state", None)
+        restored.pop("proposal_previous_state_sha256", None)
         if isinstance(current_usage, dict):
             restored["codex_usage"] = current_usage
         state = restored
@@ -7010,6 +7258,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     tui.configure(getattr(args, "color", "auto"))
     init_files()
     state = load_state()
+    # Durable admission is independent from process concurrency. Check it
+    # before policy persistence so a stranded RUNNING run cannot reach model
+    # admission without its explicit recovery command.
+    if state.get("status") == "RUNNING":
+        raise RuntimeError(
+            "run refuses durable RUNNING without explicit recovery; use recover-interrupted-run with the exact checkpoint"
+        )
+    runtime = controller_runtime_status(state)
+    registered_here = bool(getattr(args, "_controller_runtime_registered", False))
+    if runtime.get("active") and not (registered_here and int(runtime.get("pid") or 0) == os.getpid()):
+        raise RuntimeError(
+            f"run refuses live controller runtime ({runtime.get('command') or 'controller'} pid {runtime.get('pid')})"
+        )
     requested_mode = getattr(args, "efficiency_mode", None)
     if requested_mode is not None:
         policy = efficiency_policy.save_policy(ROOT, {"mode": _efficiency_mode(requested_mode)})
@@ -7017,8 +7278,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         policy = efficiency_policy.load_policy(ROOT)
     state["efficiency_mode"] = str(policy["mode"])
     save_state(state)
-    if state.get("status") not in {"APPROVED", "RUNNING", "PAUSED_USAGE_LIMIT"}:
-        raise RuntimeError(f"run requires APPROVED/RUNNING/PAUSED_USAGE_LIMIT status, found {state.get('status')}")
+    if state.get("status") not in {"APPROVED", "PAUSED_USAGE_LIMIT"}:
+        raise RuntimeError(f"run requires APPROVED/PAUSED_USAGE_LIMIT status, found {state.get('status')}")
     try:
         validate_complete_plan(state["plan"], state.get("plan_hash"))
         sandbox = sandbox_for_approved_plan(state["plan"], state.get("plan_hash"))
@@ -7497,6 +7758,7 @@ def cmd_recover_self_upgrade(args: argparse.Namespace) -> int:
         state["pending_step_delta_paths"] = {"step": current_step, "paths": pending, "updated_at": utc_now()}
     else:
         _clear_pending_step_paths(state)
+    _invalidate_terminal_artifacts_for_recovery(state, "controller self-upgrade attribution recovery")
     state["status"] = "APPROVED"
     state["block_reason"] = None
     state["self_upgrade_recovery"] = {
@@ -7611,6 +7873,7 @@ def cmd_recover_validation_block(args: argparse.Namespace) -> int:
             stats=stats, attribution=attribution,
         )
         state["current_step"] += 1
+        _invalidate_terminal_artifacts_for_recovery(state, "human-triggered validation recovery")
         state["status"] = "APPROVED"
         save_state(state)
         live_write(f"step={step['id']} recovered qualification PASS; advanced to step={state['current_step']}", "PASS")
@@ -7784,6 +8047,18 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_gate.add_argument("--gate", required=True, help="exact current human-gate ID, for example HG-0015-04")
     resolve_gate.add_argument("--reason", required=True, help="human evidence/action satisfying the approved gate")
     resolve_gate.set_defaults(func=cmd_resolve_gate)
+    interrupted_recover = sub.add_parser(
+        "recover-interrupted-run",
+        help="recover a dead/interrupted RUNNING controller after exact checkpoint-relative verification",
+    )
+    interrupted_recover.add_argument("plan_hash")
+    interrupted_recover.add_argument("--checkpoint", required=True, help="exact active approval recovery checkpoint")
+    interrupted_recover.add_argument(
+        "--pending-path", action="append", default=[], metavar="PATH",
+        help="declare each exact current-step pending path already recorded by the controller; repeat as needed",
+    )
+    interrupted_recover.add_argument("--confirm", required=True, choices=["RECOVER"], help="must be RECOVER")
+    interrupted_recover.set_defaults(func=cmd_recover_interrupted_run)
     self_upgrade_recover = sub.add_parser(
         "recover-self-upgrade",
         help="operator-confirmed repair for an active plan stranded by a controller attribution-schema self-upgrade",
@@ -7853,6 +8128,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _fail_closed_interrupted_run(args: argparse.Namespace, detail: str) -> None:
+    """Persist operator/process interruption as an explicit recoverable human block."""
+    if getattr(args, "command", None) != "run":
+        return
+    try:
+        state = load_state()
+    except Exception:
+        return
+    if state.get("status") != "RUNNING":
+        return
+    state["status"] = "BLOCKED_HUMAN"
+    state["block_reason"] = f"controller interrupted: {detail}"[:2000]
+    checkpoint_id = str(state.get("recovery_checkpoint") or "")
+    if checkpoint_id:
+        state["interrupted_run_recovery"] = _interrupted_run_recovery_record(
+            state, checkpoint_id, action="INTERRUPTED", detail=detail,
+        )
+    save_state(state)
+    try:
+        plan_control_event(
+            state, "controller_interrupted",
+            "run process interrupted; explicit recovery required before another run",
+            step=int(state.get("current_step") or 0),
+        )
+    except Exception:
+        pass
+
+
 def _fail_closed_unhandled_run_exception(args: argparse.Namespace, exc: Exception) -> None:
     """Never leave durable RUNNING state behind after the run process exits."""
     if getattr(args, "command", None) != "run":
@@ -7894,7 +8197,12 @@ def main() -> int:
         if runtime_tracked:
             _register_controller_runtime(command)
             runtime_registered = True
+            args._controller_runtime_registered = True
         return args.func(args)
+    except KeyboardInterrupt:
+        _fail_closed_interrupted_run(args, "operator keyboard interrupt")
+        print("RALPH-Lite: controller interrupted; explicit recover-interrupted-run is required", file=sys.stderr)
+        return 130
     except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
         _fail_closed_unhandled_run_exception(args, exc)
         print(f"RALPH-Lite: {exc}", file=sys.stderr)
