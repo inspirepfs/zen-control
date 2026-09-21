@@ -66,8 +66,8 @@ def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def policy_path(root: Path) -> Path:
-    return Path(root) / ".ralph" / FILENAME
+def policy_path(root: Path, runtime_directory: Path | None = None) -> Path:
+    return Path(runtime_directory) / FILENAME if runtime_directory is not None else Path(root) / ".ralph" / FILENAME
 
 
 def defaults() -> dict[str, Any]:
@@ -174,8 +174,8 @@ def normalize_policy(raw: dict[str, Any] | None) -> dict[str, Any]:
     return merged
 
 
-def load_policy(root: Path) -> dict[str, Any]:
-    path = policy_path(root)
+def load_policy(root: Path, *, runtime_directory: Path | None = None) -> dict[str, Any]:
+    path = policy_path(root, runtime_directory)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -190,10 +190,10 @@ def load_policy(root: Path) -> dict[str, Any]:
         raise RuntimeError(f"invalid {path}: {exc}") from exc
 
 
-def save_policy(root: Path, values: dict[str, Any], *, replace: bool = False) -> dict[str, Any]:
-    path = policy_path(root)
+def save_policy(root: Path, values: dict[str, Any], *, replace: bool = False, runtime_directory: Path | None = None) -> dict[str, Any]:
+    path = policy_path(root, runtime_directory)
     path.parent.mkdir(parents=True, exist_ok=True)
-    current = normalize_policy(None) if replace else load_policy(root)
+    current = normalize_policy(None) if replace else load_policy(root, runtime_directory=runtime_directory)
     candidate = defaults() if replace else dict(current)
     for key, value in dict(values or {}).items():
         if key in _EDITABLE:
@@ -207,11 +207,11 @@ def save_policy(root: Path, values: dict[str, Any], *, replace: bool = False) ->
     return policy
 
 
-def ensure_policy(root: Path) -> dict[str, Any]:
-    path = policy_path(root)
+def ensure_policy(root: Path, *, runtime_directory: Path | None = None) -> dict[str, Any]:
+    path = policy_path(root, runtime_directory)
     if path.exists():
-        return load_policy(root)
-    return save_policy(root, {}, replace=True)
+        return load_policy(root, runtime_directory=runtime_directory)
+    return save_policy(root, {}, replace=True, runtime_directory=runtime_directory)
 
 
 def limits(policy: dict[str, Any], mode: str | None = None) -> dict[str, int]:

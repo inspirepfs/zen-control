@@ -32,25 +32,27 @@ if str(_SCRIPT_DIR) not in sys.path:
 import ralph_tui as tui
 import ralph_efficiency as efficiency_policy
 import ralph_model as model_policy
-from ralph_profile import ZEN_PROFILE
+from ralph_profile import PROJECT_PROFILE
 
-ROOT = ZEN_PROFILE.repository_root(__file__)
-RALPH = ZEN_PROFILE.runtime_directory(ROOT)
-STATE = ZEN_PROFILE.artifact(ROOT, "state")
-PLAN = ZEN_PROFILE.artifact(ROOT, "plan")
-IDEAS = ZEN_PROFILE.artifact(ROOT, "ideas")
-JOURNAL = ZEN_PROFILE.artifact(ROOT, "journal")
-POLICY = ZEN_PROFILE.artifact(ROOT, "policy")
-LIVE = ZEN_PROFILE.artifact(ROOT, "live")
-CONTEXT = ZEN_PROFILE.artifact(ROOT, "context")
-EVENTS = ZEN_PROFILE.artifact(ROOT, "events")
-RECOVERY = ZEN_PROFILE.artifact(ROOT, "recovery")
-REPORTS = ZEN_PROFILE.artifact(ROOT, "reports")
-# Retirement manifests are controller artifacts but intentionally outside the
-# profile's mutable artifact map: records are append-only and self-validating.
-RETIREMENTS = RALPH / "retirements"
-USAGE_LEDGER = ZEN_PROFILE.artifact(ROOT, "usage_ledger")
-USAGE_STATS_RESET = ZEN_PROFILE.artifact(ROOT, "usage_stats_reset")
+ROOT = PROJECT_PROFILE.repository_root(__file__)
+
+
+def _project_policy_kwargs() -> dict[str, Path]:
+    return PROJECT_PROFILE.policy_storage_kwargs(ROOT)
+RALPH = PROJECT_PROFILE.runtime_directory(ROOT)
+STATE = PROJECT_PROFILE.artifact(ROOT, "state")
+PLAN = PROJECT_PROFILE.artifact(ROOT, "plan")
+IDEAS = PROJECT_PROFILE.artifact(ROOT, "ideas")
+JOURNAL = PROJECT_PROFILE.artifact(ROOT, "journal")
+POLICY = PROJECT_PROFILE.artifact(ROOT, "policy")
+LIVE = PROJECT_PROFILE.artifact(ROOT, "live")
+CONTEXT = PROJECT_PROFILE.artifact(ROOT, "context")
+EVENTS = PROJECT_PROFILE.artifact(ROOT, "events")
+RECOVERY = PROJECT_PROFILE.artifact(ROOT, "recovery")
+REPORTS = PROJECT_PROFILE.artifact(ROOT, "reports")
+RETIREMENTS = PROJECT_PROFILE.artifact(ROOT, "retirements")
+USAGE_LEDGER = PROJECT_PROFILE.artifact(ROOT, "usage_ledger")
+USAGE_STATS_RESET = PROJECT_PROFILE.artifact(ROOT, "usage_stats_reset")
 
 MAX_REPAIRS_PER_FAILURE = 3
 DEFAULT_MAX_LOOPS = 40
@@ -58,7 +60,7 @@ DEFAULT_MAX_LOOPS = 40
 # budgets therefore act as a safe post-loop circuit breaker: finish the current
 # qualified step, then pause before another model turn if efficiency regresses.
 # Backward-compatible constant aliases. Runtime decisions reload the live policy
-# from .ralph/efficiency-policy.json before each model turn / efficiency decision.
+# from the host policy storage before each model turn / efficiency decision.
 _DEFAULT_EFFICIENCY = efficiency_policy.DEFAULT_POLICY
 PROMPT_COMMAND_BUDGET = int(_DEFAULT_EFFICIENCY["normal_prompt_command_budget"])
 EFFICIENCY_MAX_COMMANDS = int(_DEFAULT_EFFICIENCY["normal_max_commands"])
@@ -79,12 +81,12 @@ PLAN_MIN_STEPS_DEFAULT = 5
 PLAN_MAX_STEPS_DEFAULT = 10
 PLAN_MAX_STEPS_LIMIT = 20
 _CODEX_PREFIX: list[str] | None = None
-EXCLUDED_DIRS = ZEN_PROFILE.excluded_dirs
-PROTECTED_PREFIXES = ZEN_PROFILE.protected_prefixes
-PROTECTED_EXACT = ZEN_PROFILE.protected_exact
-PROTECTED_DIR_PREFIXES = ZEN_PROFILE.protected_dir_prefixes
-PROTECTED_SUFFIXES = ZEN_PROFILE.protected_suffixes
-TOOLING_PATHS = ZEN_PROFILE.tooling_paths
+EXCLUDED_DIRS = PROJECT_PROFILE.excluded_dirs
+PROTECTED_PREFIXES = PROJECT_PROFILE.protected_prefixes
+PROTECTED_EXACT = PROJECT_PROFILE.protected_exact
+PROTECTED_DIR_PREFIXES = PROJECT_PROFILE.protected_dir_prefixes
+PROTECTED_SUFFIXES = PROJECT_PROFILE.protected_suffixes
+TOOLING_PATHS = PROJECT_PROFILE.tooling_paths
 REPOSITORY_AUTHORITY_FIELD = "repository_authority"
 REPOSITORY_AUTHORITIES = frozenset({"read-only", "write"})
 PLAN_SCHEMA = {
@@ -405,8 +407,10 @@ def _context_path(value: str) -> str | None:
             candidate = candidate.relative_to(ROOT)
     except ValueError:
         return None
-    rel = candidate.as_posix().lstrip("./")
-    if not rel or rel == ".ralph" or rel.startswith(".ralph/") or is_protected_path(rel):
+    rel = candidate.as_posix()
+    while rel.startswith("./"):
+        rel = rel[2:]
+    if not rel or PROJECT_PROFILE.is_runtime_path(rel) or is_protected_path(rel):
         return None
     return rel
 
@@ -694,7 +698,7 @@ def verify_approved_plan_artifact(state: dict) -> None:
         raise RuntimeError("approved plan artifact binding is missing")
     if artifact.get("schema") != "zen_ralph_approved_plan_artifact_v1":
         raise RuntimeError("approved plan artifact binding is invalid")
-    if artifact.get("path") != ".ralph/plan.md" or artifact.get("plan_hash") != state.get("plan_hash"):
+    if artifact.get("path") != PROJECT_PROFILE.artifact_relative_path("plan") or artifact.get("plan_hash") != state.get("plan_hash"):
         raise RuntimeError("approved plan artifact binding does not match the active plan")
     if not PLAN.is_file() or artifact.get("bytes") != PLAN.stat().st_size or artifact.get("sha256") != file_hash(PLAN):
         raise RuntimeError("approved plan file changed")
@@ -2132,7 +2136,7 @@ def bounded_diff(paths: Iterable[str], *, base_ref: str = "HEAD", max_chars: int
 
 def final_qualification_gates() -> list[tuple[str, list[str]]]:
     gates = list(qualification_gates())
-    gates.extend(ZEN_PROFILE.final_validator_gates(ROOT, sys.executable))
+    gates.extend(PROJECT_PROFILE.final_validator_gates(ROOT, sys.executable))
     gates.append(("diff-check", ["git", "diff", "--check"]))
     return gates
 
@@ -2414,7 +2418,7 @@ def build_completion_report(state: dict, final_gates: list[str]) -> dict:
 
 def _is_runtime_authority_path(path: str) -> bool:
     path = _normalize_repo_path(path)
-    return path == ".ralph" or path.startswith(".ralph/")
+    return PROJECT_PROFILE.is_runtime_path(path)
 
 
 def authorized_self_hosting_paths(state: dict) -> set[str]:
@@ -2522,7 +2526,7 @@ def _reconciled_provenance_guard(
             raise RuntimeError(f"UNRECORDED_ADOPTED_CARRY_FORWARD: {unrecorded}")
     elif adopted_paths:
         raise RuntimeError(f"CARRY_FORWARD_WITHOUT_RECONCILIATION: {sorted(adopted_paths)}")
-    current = {_normalize_repo_path(path) for path in git_changed_paths() if not path.startswith(".ralph/")}
+    current = {_normalize_repo_path(path) for path in git_changed_paths() if not PROJECT_PROFILE.is_runtime_path(path)}
     missing_new = sorted(new_paths - current)
     if require_new_plan_delta and missing_new:
         raise RuntimeError(f"MISSING_NEW_PLAN_DELTA: {missing_new}")
@@ -3193,8 +3197,8 @@ def finalization_review(state: dict) -> dict:
         planned = set()
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     baseline = set(checkpoint.get("baseline_dirty_paths") or []) if checkpoint else set()
-    current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
-    overlap = sorted((baseline & planned) - {path for path in planned if path.startswith(".ralph/")})
+    current = {path for path in git_changed_paths() if not PROJECT_PROFILE.is_runtime_path(path)}
+    overlap = sorted((baseline & planned) - {path for path in planned if PROJECT_PROFILE.is_runtime_path(path)})
     unexpected = sorted(current - baseline - planned)
     protected = sorted(path for path in planned if is_protected_path(path) or _is_runtime_authority_path(path))
     tooling = sorted(path for path in planned if is_tooling_path(path) and not _is_runtime_authority_path(path))
@@ -3273,8 +3277,8 @@ def _finalization_guard(state: dict) -> tuple[list[str], list[str]]:
             plan_files=len(planned),
         ))
         raise RuntimeError(f"plan changed files that were already dirty at approval; safe automated commit refused: {overlap}")
-    current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
-    baseline = {path for path in baseline if not path.startswith(".ralph/")}
+    current = {path for path in git_changed_paths() if not PROJECT_PROFILE.is_runtime_path(path)}
+    baseline = {path for path in baseline if not PROJECT_PROFILE.is_runtime_path(path)}
     unexpected = sorted(current - baseline - planned)
     if unexpected:
         raise RuntimeError(f"unexpected working-tree delta outside baseline/plan; automated commit refused: {unexpected}")
@@ -3325,7 +3329,7 @@ def _requalification_delta_guard(state: dict) -> tuple[list[str], list[str]]:
     overlap = sorted(baseline & planned)
     if overlap:
         raise RuntimeError(f"requalification refuses plan paths dirty at approval: {overlap}")
-    current = {path for path in git_changed_paths() if not path.startswith(".ralph/")}
+    current = {path for path in git_changed_paths() if not PROJECT_PROFILE.is_runtime_path(path)}
     unexpected = sorted(current - baseline - planned)
     if unexpected:
         raise RuntimeError(f"unexpected working-tree delta outside baseline/plan; requalification refused: {unexpected}")
@@ -3347,7 +3351,7 @@ def _default_commit_message(state: dict) -> str:
     goal = re.sub(r"[^A-Za-z0-9 ._/-]+", "", goal).strip()
     if len(goal) > 64:
         goal = goal[:61].rstrip() + "..."
-    return f"{ZEN_PROFILE.completion_commit_prefix} {goal[0].lower() + goal[1:] if goal else 'ralph plan completion'}"
+    return f"{PROJECT_PROFILE.completion_commit_prefix} {goal[0].lower() + goal[1:] if goal else 'ralph plan completion'}"
 
 
 def cmd_checkpoints(_: argparse.Namespace) -> int:
@@ -3779,7 +3783,7 @@ def init_files() -> None:
     REPORTS.mkdir(parents=True, exist_ok=True)
     EVENTS.touch(exist_ok=True)
     USAGE_LEDGER.touch(exist_ok=True)
-    efficiency_policy.ensure_policy(ROOT)
+    efficiency_policy.ensure_policy(ROOT, **_project_policy_kwargs())
     if not STATE.exists():
         save_state(default_state())
     if not PLAN.exists():
@@ -3793,7 +3797,7 @@ def init_files() -> None:
     if not CONTEXT.exists():
         save_context(default_context())
     if not POLICY.exists():
-        raise RuntimeError("missing tracked authority file .ralph/policy.md")
+        raise RuntimeError(f"missing tracked authority file {PROJECT_PROFILE.policy_reference()}")
     bootstrap_context_from_journal(load_state())
 
 
@@ -3982,7 +3986,7 @@ def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
 
 def authority_snapshot() -> dict[Path, bytes | None]:
     runtime_paths = {STATE, PLAN, IDEAS, JOURNAL, POLICY, CONTEXT}
-    registered = {ROOT / rel for rel in TOOLING_PATHS if not rel.startswith(".ralph/")}
+    registered = {ROOT / rel for rel in TOOLING_PATHS if not PROJECT_PROFILE.is_runtime_path(rel)}
     discovered: set[Path] = set()
     for path in ROOT.rglob("*"):
         if not path.is_file() or path.is_symlink():
@@ -4047,7 +4051,7 @@ def self_hosting_grant_allows(
     if operation_loop is None and gate_loop > state_loop:
         return False, "self-hosting grant gate is from a future controller loop"
     allowed = {_normalize_repo_path(str(path)) for path in grant.get("paths") or []}
-    runtime = [path for path in paths if path == ".ralph" or path.startswith(".ralph/")]
+    runtime = [path for path in paths if PROJECT_PROFILE.is_runtime_path(path)]
     if runtime:
         return False, f"RALPH runtime authority is never self-hosting writable: {runtime}"
     protected = [path for path in paths if is_protected_path(path)]
@@ -4385,7 +4389,7 @@ def run_codex(prompt: str, schema: dict, sandbox: str, *, context: str = "Codex"
 
 
 def qualification_gates() -> list[tuple[str, list[str]]]:
-    return ZEN_PROFILE.qualification_gates(ROOT, sys.executable)
+    return PROJECT_PROFILE.qualification_gates(ROOT, sys.executable)
 
 
 def run_gates() -> tuple[bool, list[str], str | None, str, dict[str, float]]:
@@ -4428,7 +4432,7 @@ def _efficiency_mode(value: str | None) -> str:
 
 def efficiency_findings(stats: dict | None, mode: str | None = None, policy: dict | None = None) -> list[str]:
     """Return live policy-level efficiency findings; OFF disables ordinary policy only."""
-    policy_source = efficiency_policy.load_policy(ROOT) if policy is None else policy
+    policy_source = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs()) if policy is None else policy
     policy = efficiency_policy.normalize_policy(policy_source)
     mode = _efficiency_mode(mode or str(policy.get("mode") or "NORMAL"))
     if mode == "OFF":
@@ -4454,7 +4458,7 @@ def efficiency_findings(stats: dict | None, mode: str | None = None, policy: dic
 
 def runaway_findings(stats: dict | None, policy: dict | None = None) -> list[str]:
     """Return emergency findings from live policy; these remain active in every mode."""
-    policy_source = efficiency_policy.load_policy(ROOT) if policy is None else policy
+    policy_source = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs()) if policy is None else policy
     policy = efficiency_policy.normalize_policy(policy_source)
     limits = efficiency_policy.runaway_limits(policy)
     stats = dict(stats or {})
@@ -4633,9 +4637,7 @@ def is_recoverable_validation_block(reason: str) -> bool:
     """Conservative migration check for pre-v0.1.6 validation-only blocks."""
     text = str(reason or "").lower()
     required = ("test", "validation", "command budget", "python")
-    return any(marker in text for marker in required) and not any(
-        marker in text for marker in ("policy violation", "secret", "credential", "routeros", "human decision")
-    )
+    return any(marker in text for marker in required) and not PROJECT_PROFILE.validation_block_is_nonrecoverable(text)
 
 
 def git_changed_paths() -> list[str]:
@@ -4728,7 +4730,7 @@ def validate_ready_to_commit_test_reconciliation(
     } | {
         str(item) for item in checkpoint.get("baseline_untracked_paths") or []
     }
-    current = {item for item in git_changed_paths() if not item.startswith(".ralph/")}
+    current = {item for item in git_changed_paths() if not PROJECT_PROFILE.is_runtime_path(item)}
     unexpected = current - baseline - planned
     if unexpected != {path}:
         return False, "test reconciliation requires the test path to be the sole unexpected delta"
@@ -4781,18 +4783,18 @@ def plan_prompt(goal: str, carry_forward: dict | None = None, *, min_steps: int 
             + json.dumps(carry_forward.get("historical_planning_context") or {}, sort_keys=True, ensure_ascii=False)
             + "\n"
         )
-    return f"""You are planning work for {ZEN_PROFILE.identity} under RALPH-Lite. Inspect the repository read-only.
+    return f"""You are planning work for {PROJECT_PROFILE.identity} under RALPH-Lite. Inspect the repository read-only.
 Goal: {goal}
 {carry_forward_text}
 Return between {min_steps} and {max_steps} ordered, concrete implementation steps. Keep steps small enough to implement and qualify independently.
 For each step choose test_change_policy: none, add-only, or modify. Prefer add-only; use modify only when modifying existing tests is genuinely required.
 Use targeted symbol/range reads instead of broad repository ingestion. Avoid reading docs, README, CHANGELOG, or Git history unless directly needed for the goal.
-Do not execute or edit anything. Respect .ralph/policy.md. Put discovered nice-to-have work into later plan steps only if it directly serves the goal; otherwise it belongs in the ideas bucket during execution.
+Do not execute or edit anything. Respect {PROJECT_PROFILE.policy_reference()}. Put discovered nice-to-have work into later plan steps only if it directly serves the goal; otherwise it belongs in the ideas bucket during execution.
 """
 
 
 def step_prompt(state: dict, step: dict, repair_fp: str | None, repair_no: int) -> str:
-    policy = efficiency_policy.load_policy(ROOT)
+    policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
     mode = _efficiency_mode(str(policy.get("mode") or "NORMAL"))
     command_budget = int(efficiency_policy.limits(policy, mode)["prompt_commands"])
     repair_text = ""
@@ -4803,7 +4805,7 @@ def step_prompt(state: dict, step: dict, repair_fp: str | None, repair_no: int) 
             + repair_failure_evidence(state, repair_fp)
         )
     prior = context_handoff(state)
-    return f"""Execute exactly ONE approved RALPH-Lite plan step in {ZEN_PROFILE.identity}.
+    return f"""Execute exactly ONE approved RALPH-Lite plan step in {PROJECT_PROFILE.identity}.
 Approved plan hash: {state['plan_hash']}
 Step {step['id']}: {step['title']}
 Objective: {step['objective']}
@@ -4829,7 +4831,7 @@ CONTEXT-EFFICIENCY RULES:
 - Stop discovery once there is enough evidence to implement safely.
 - Return context.relevant_files (max 8), context.accepted_findings (max 8), and context.files_inspected (max 16) for the next loop.
 
-Read .ralph/policy.md and obey it. Do not edit any file under .ralph. Do not interact with live RouterOS, secrets, credentials, or external production systems. Stay inside the repository. Do not disable, skip, delete, or weaken qualification to obtain a pass. Make only changes necessary for this step. You may run focused local tests while working, but the external controller will run authoritative gates afterwards.
+Read {PROJECT_PROFILE.policy_reference()} and obey it. Do not edit any file under {PROJECT_PROFILE.runtime_relative_path()}. {PROJECT_PROFILE.prompt_guardrails()} Stay inside the repository. Do not disable, skip, delete, or weaken qualification to obtain a pass. Make only changes necessary for this step. You may run focused local tests while working, but the external controller will run authoritative gates afterwards.
 If you discover useful out-of-scope work, return it in ideas and continue the approved step rather than implementing it.
 Use blocker_class="continuation", needs_human=false only for ordinary additional work inside the already-approved step when the current bounded turn is exhausted. Use blocker_class="human-decision" only when genuine human judgement is required and blocker_class="policy" only when safe completion would break policy. In those cases return needs_human=true with blockers. If the APPROVED acceptance explicitly says missing operator/runtime evidence must stop at BLOCKED_HUMAN, treat absent required evidence as blocker_class="human-decision", needs_human=true, and put the exact evidence/action in blockers; never classify that condition as validation-only or continuation. Otherwise use blocker_class="none" (or "validation-only" as described above).
 If safe completion requires breaking policy or human judgement, make no speculative workaround: return needs_human=true with blockers.
@@ -4864,13 +4866,13 @@ def configured_codex_effort() -> str | None:
 
 def selected_codex_model() -> str | None:
     """Return RALPH's project-local model override, otherwise the Codex default."""
-    selected = model_policy.load_policy(ROOT).get("model")
+    selected = model_policy.load_policy(ROOT, **_project_policy_kwargs()).get("model")
     return str(selected).strip() if selected else configured_codex_model()
 
 
 def selected_codex_effort() -> str | None:
     """Return RALPH's project-local effort override, otherwise the Codex default."""
-    selected = model_policy.load_policy(ROOT).get("reasoning_effort")
+    selected = model_policy.load_policy(ROOT, **_project_policy_kwargs()).get("reasoning_effort")
     return str(selected).strip().lower() if selected else configured_codex_effort()
 
 
@@ -5282,7 +5284,7 @@ def ensure_codex_usage_capacity(state: dict, *, wait: bool = True, poll_seconds:
     was_paused = state.get("status") == "PAUSED_USAGE_LIMIT"
     while True:
         try:
-            policy = efficiency_policy.load_policy(ROOT)
+            policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
             reserve_percent = float(policy["reserve_percent"])
             snapshot = query_codex_rate_limits()
             admitted = usage_admission_valid(state)
@@ -5686,7 +5688,7 @@ def live_usage_by_loop() -> dict[int, dict[str, int]]:
 
 
 def usage_report_data(state: dict, snapshot: dict | None = None) -> dict:
-    policy = efficiency_policy.load_policy(ROOT)
+    policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
     reserve_percent = float(policy["reserve_percent"])
     scoped = live_usage_scopes()
     turns = scoped["implementation"]
@@ -6092,7 +6094,7 @@ def cmd_recover_interrupted_run(args: argparse.Namespace) -> int:
 def cmd_propose(args: argparse.Namespace) -> int:
     init_files()
     state = load_state()
-    policy = efficiency_policy.load_policy(ROOT)
+    policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
     reserve_percent = float(policy["reserve_percent"])
     if state.get("status") not in {"IDLE", "PLAN_COMPLETE", "PUSHED", "READ_ONLY_COMPLETE"}:
         raise RuntimeError(f"cannot propose while status={state.get('status')}; finish or resolve the current plan first")
@@ -6693,7 +6695,7 @@ def cmd_authorize_self_hosting(args: argparse.Namespace) -> int:
     requested: list[str] = []
     for raw in list(args.path or []):
         path = _normalize_repo_path(str(raw or ""))
-        if not path or path == ".ralph" or path.startswith(".ralph/"):
+        if not path or PROJECT_PROFILE.is_runtime_path(path):
             raise RuntimeError(f"self-hosting grant cannot include RALPH runtime state: {path or raw}")
         if is_protected_path(path):
             raise RuntimeError(f"self-hosting grant cannot include protected path: {path}")
@@ -6891,7 +6893,7 @@ def _model_supported_efforts(catalog: dict, model_name: str | None) -> list[str]
 def cmd_model_policy(args: argparse.Namespace) -> int:
     operation = str(getattr(args, "model_action", "show") or "show")
     if operation == "show":
-        policy = model_policy.load_policy(ROOT)
+        policy = model_policy.load_policy(ROOT, **_project_policy_kwargs())
     elif operation == "set":
         requested = str(getattr(args, "model", "") or "").strip()
         if not requested:
@@ -6900,21 +6902,21 @@ def cmd_model_policy(args: argparse.Namespace) -> int:
         available = {str(item.get("id") or "") for item in catalog.get("models") or []}
         if requested not in available:
             raise RuntimeError(f"model {requested!r} is not in the current authenticated Codex model catalog")
-        current = model_policy.load_policy(ROOT)
+        current = model_policy.load_policy(ROOT, **_project_policy_kwargs())
         current_effort = str(current.get("reasoning_effort") or "").strip().lower() or None
         supported = _model_supported_efforts(catalog, requested)
         if current_effort and current_effort not in supported:
-            policy = model_policy.save_policy(ROOT, requested, reasoning_effort=None)
+            policy = model_policy.save_policy(ROOT, requested, reasoning_effort=None, **_project_policy_kwargs())
             live_write(
                 f"model policy updated revision={policy['revision']} model={requested}; "
                 f"effort override {current_effort} cleared because the model does not support it",
                 "MODEL",
             )
         else:
-            policy = model_policy.save_policy(ROOT, requested)
+            policy = model_policy.save_policy(ROOT, requested, **_project_policy_kwargs())
             live_write(f"model policy updated revision={policy['revision']} model={requested}", "MODEL")
     elif operation == "reset":
-        policy = model_policy.save_policy(ROOT, None)
+        policy = model_policy.save_policy(ROOT, None, **_project_policy_kwargs())
         live_write(f"model policy reset to Codex configured default revision={policy['revision']}", "MODEL")
     elif operation == "set-effort":
         requested_effort = str(getattr(args, "effort", "") or "").strip().lower()
@@ -6934,13 +6936,13 @@ def cmd_model_policy(args: argparse.Namespace) -> int:
                 f"effort {requested_effort!r} is not supported by model {effective_model!r}; "
                 f"supported={','.join(supported)}"
             )
-        policy = model_policy.save_policy(ROOT, reasoning_effort=requested_effort)
+        policy = model_policy.save_policy(ROOT, reasoning_effort=requested_effort, **_project_policy_kwargs())
         live_write(
             f"model effort policy updated revision={policy['revision']} effort={requested_effort}",
             "MODEL",
         )
     elif operation == "reset-effort":
-        policy = model_policy.save_policy(ROOT, reasoning_effort=None)
+        policy = model_policy.save_policy(ROOT, reasoning_effort=None, **_project_policy_kwargs())
         live_write(
             f"model effort policy reset to Codex configured default revision={policy['revision']}",
             "MODEL",
@@ -6990,7 +6992,7 @@ def cmd_usage_reset_stats(args: argparse.Namespace) -> int:
 def cmd_status(_: argparse.Namespace) -> int:
     init_files()
     state = load_state()
-    policy = efficiency_policy.load_policy(ROOT)
+    policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
     total = len((state.get("plan") or {}).get("steps") or [])
     efficiency = state.get("last_efficiency") if isinstance(state.get("last_efficiency"), dict) else {}
     usage = state.get("codex_usage") if isinstance(state.get("codex_usage"), dict) else {}
@@ -7041,18 +7043,18 @@ def cmd_efficiency_policy(args: argparse.Namespace) -> int:
     init_files()
     operation = str(getattr(args, "policy_action", "show") or "show")
     if operation == "show":
-        policy = efficiency_policy.load_policy(ROOT)
+        policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
     elif operation == "set":
         updates = _policy_arg_updates(args)
         if not updates:
             raise RuntimeError("efficiency-policy set requires at least one setting")
-        policy = efficiency_policy.save_policy(ROOT, updates)
+        policy = efficiency_policy.save_policy(ROOT, updates, **_project_policy_kwargs())
         live_write(f"efficiency policy updated revision={policy['revision']} mode={policy['mode']} reserve={float(policy['reserve_percent']):.1f}%", "EFFICIENCY")
     elif operation == "reset":
-        policy = efficiency_policy.save_policy(ROOT, {}, replace=True)
+        policy = efficiency_policy.save_policy(ROOT, {}, replace=True, **_project_policy_kwargs())
         live_write(f"efficiency policy restored to defaults revision={policy['revision']}", "EFFICIENCY")
     elif operation == "reset-mode":
-        policy = efficiency_policy.save_policy(ROOT, {"mode": "NORMAL"})
+        policy = efficiency_policy.save_policy(ROOT, {"mode": "NORMAL"}, **_project_policy_kwargs())
         live_write(f"efficiency mode reset to NORMAL revision={policy['revision']}", "EFFICIENCY")
     else:
         raise RuntimeError(f"unsupported efficiency-policy action {operation}")
@@ -7273,9 +7275,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     requested_mode = getattr(args, "efficiency_mode", None)
     if requested_mode is not None:
-        policy = efficiency_policy.save_policy(ROOT, {"mode": _efficiency_mode(requested_mode)})
+        policy = efficiency_policy.save_policy(ROOT, {"mode": _efficiency_mode(requested_mode)}, **_project_policy_kwargs())
     else:
-        policy = efficiency_policy.load_policy(ROOT)
+        policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
     state["efficiency_mode"] = str(policy["mode"])
     save_state(state)
     if state.get("status") not in {"APPROVED", "PAUSED_USAGE_LIMIT"}:
@@ -7300,7 +7302,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise RuntimeError("replacement dirty-path inventory requires explicit dispositions before execution")
     loops_this_run = 0
     while state["current_step"] <= len(state["plan"]["steps"]):
-        policy = efficiency_policy.load_policy(ROOT)
+        policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
         if state.get("efficiency_mode") != policy["mode"]:
             state["efficiency_mode"] = str(policy["mode"])
             save_state(state)
@@ -7402,8 +7404,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
                 candidate_paths = sorted(
                     path for path in changed_authority
-                    if path != ".ralph"
-                    and not path.startswith(".ralph/")
+                    if not PROJECT_PROFILE.is_runtime_path(path)
                     and not is_protected_path(path)
                     and is_tooling_path(path)
                 )
@@ -7559,7 +7560,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         passed, gates, fp, gate_output, gate_durations = run_gates()
         stats = loop_stats(loop_started, result, gate_durations=gate_durations, repair=repair_no)
         if passed:
-            policy = efficiency_policy.load_policy(ROOT)
+            policy = efficiency_policy.load_policy(ROOT, **_project_policy_kwargs())
             mode = _efficiency_mode(str(policy.get("mode") or "NORMAL"))
             state["efficiency_mode"] = mode
             runaway = runaway_findings(stats, policy=policy)

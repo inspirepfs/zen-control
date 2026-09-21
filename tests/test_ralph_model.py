@@ -68,6 +68,16 @@ class ModelPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single model identifier"):
             model.normalize_policy({"model": "x" * 161})
 
+    def test_policy_location_accepts_host_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_directory = root / ".controller-state"
+            selected = model.save_policy(root, "gpt-portable", runtime_directory=runtime_directory)
+            self.assertEqual("gpt-portable", selected["model"])
+            self.assertTrue((root / ".controller-state" / model.FILENAME).is_file())
+            self.assertFalse((root / ".ralph" / model.FILENAME).exists())
+            self.assertEqual("gpt-portable", model.load_policy(root, runtime_directory=runtime_directory)["model"])
+
 
 if __name__ == "__main__":
     unittest.main()

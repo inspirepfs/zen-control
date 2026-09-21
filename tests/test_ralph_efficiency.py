@@ -138,6 +138,16 @@ class EfficiencyPolicyTests(unittest.TestCase):
             self.assertEqual(policy["strict_max_commands"], 4)
             self.assertEqual(policy["relaxed_max_commands"], 18)
 
+    def test_policy_location_accepts_host_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_directory = root / ".controller-state"
+            updated = eff.save_policy(root, {"mode": "RELAXED"}, runtime_directory=runtime_directory)
+            self.assertEqual("RELAXED", updated["mode"])
+            self.assertTrue((root / ".controller-state" / eff.FILENAME).is_file())
+            self.assertFalse((root / ".ralph" / eff.FILENAME).exists())
+            self.assertEqual("RELAXED", eff.load_policy(root, runtime_directory=runtime_directory)["mode"])
+
 
 if __name__ == "__main__":
     unittest.main()

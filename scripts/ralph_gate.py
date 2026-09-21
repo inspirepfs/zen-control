@@ -22,17 +22,17 @@ from typing import Any
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
-from ralph_profile import ZEN_PROFILE
+from ralph_profile import PROJECT_PROFILE
 
 VERSION = "0.2.1"
 SCHEMA = "ralph_human_gate_v1"
 MAX_TEXT = 480
 
-ROOT = ZEN_PROFILE.repository_root(__file__)
-RALPH_DIR = ZEN_PROFILE.runtime_directory(ROOT)
-STATE = ZEN_PROFILE.artifact(ROOT, "state")
-JOURNAL = ZEN_PROFILE.artifact(ROOT, "journal")
-LIVE = ZEN_PROFILE.artifact(ROOT, "live")
+ROOT = PROJECT_PROFILE.repository_root(__file__)
+RALPH_DIR = PROJECT_PROFILE.runtime_directory(ROOT)
+STATE = PROJECT_PROFILE.artifact(ROOT, "state")
+JOURNAL = PROJECT_PROFILE.artifact(ROOT, "journal")
+LIVE = PROJECT_PROFILE.artifact(ROOT, "live")
 
 ANSI = {
     "reset": "\033[0m",
@@ -131,15 +131,7 @@ def _gate_class(reason: str, step_title: str = "") -> str:
     title_text = step_title.lower()
     if "policy violation" in reason_text or "protected path" in reason_text or "controller/tooling authority" in reason_text:
         return "policy_review"
-    rules = (
-        ("validation_evidence", ("performance", "sample", "acceptance evidence", "snapshot", "validation")),
-        ("runtime_evidence", ("incident", "runtime", "diagnostic", "worker", "active durable")),
-        ("credentials_or_access", ("credential", "login", "permission", "access token", "authentication")),
-        ("security_approval", ("security approval", "security sign-off", "authority approval")),
-        ("production_action", ("routeros", "production", "live write", "live action")),
-        ("scope_conflict", ("scope conflict", "overlap", "claimed work", "out of scope")),
-        ("external_dependency", ("external dependency", "third-party", "upstream", "service unavailable")),
-    )
+    rules = PROJECT_PROFILE.gate_rules()
     for name, needles in rules:
         if any(needle in reason_text for needle in needles):
             return name
@@ -155,11 +147,11 @@ def _guidance(gate_class: str, reason: str) -> dict[str, list[str]]:
     # controller state and renders the read-only review surface.
     lower = reason.lower()
     if gate_class == "policy_review":
-        return ZEN_PROFILE.guidance(ZEN_PROFILE.policy_review_guidance)
-    if gate_class == "runtime_evidence" and "incident" in lower:
-        return ZEN_PROFILE.guidance(ZEN_PROFILE.incident_gate_guidance)
-    if gate_class == "validation_evidence" and "performance" in lower:
-        return ZEN_PROFILE.guidance(ZEN_PROFILE.performance_gate_guidance)
+        return PROJECT_PROFILE.guidance(PROJECT_PROFILE.policy_review_guidance)
+    if gate_class == "runtime_evidence" and PROJECT_PROFILE.incident_reason_keyword.lower() in lower:
+        return PROJECT_PROFILE.guidance(PROJECT_PROFILE.incident_gate_guidance)
+    if gate_class == "validation_evidence" and PROJECT_PROFILE.performance_reason_keyword.lower() in lower:
+        return PROJECT_PROFILE.guidance(PROJECT_PROFILE.performance_gate_guidance)
     return {
         "actions": [
             "Review the blocker summary and the approved step acceptance criteria.",
@@ -195,11 +187,8 @@ def _accepted_findings(state: dict[str, Any]) -> list[str]:
 
 
 def _display_summary(gate_class: str, reason: str) -> str:
-    if gate_class == "runtime_evidence" and "incident" in reason.lower():
-        return (
-            "Incident Monitor state is runtime-owned. No verified source/configuration defect "
-            "was found; operator action/evidence is required before this approved step can advance."
-        )
+    if gate_class == "runtime_evidence" and PROJECT_PROFILE.incident_reason_keyword.lower() in reason.lower():
+        return PROJECT_PROFILE.incident_runtime_summary
     return _text(reason)
 
 
@@ -227,7 +216,7 @@ def _checkpoint(state: dict[str, Any]) -> dict[str, Any]:
     checkpoint_id = str(state.get("recovery_checkpoint") or "")
     if not checkpoint_id:
         return {}
-    path = RALPH_DIR / "recovery" / checkpoint_id / "manifest.json"
+    path = PROJECT_PROFILE.recovery_manifest(ROOT, checkpoint_id)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -275,7 +264,7 @@ def build_gate(state: dict[str, Any]) -> dict[str, Any]:
         "test_change_policy": str(item.get("test_change_policy") or ""),
         "paths": [{"path": path, "origin": _path_origin(state, path)} for path in policy_paths],
     } if gate_class == "policy_review" else {}
-    controller_command = ZEN_PROFILE.controller_display_command(ROOT)
+    controller_command = PROJECT_PROFILE.controller_display_command(ROOT)
     return {
         "schema": SCHEMA,
         "version": VERSION,
@@ -325,9 +314,9 @@ def build_gate(state: dict[str, Any]) -> dict[str, Any]:
             if plan_hash else f"{controller_command} resume <plan-hash> --reason \"<reason>\""
         ),
         "sources": {
-            "state": ZEN_PROFILE.relative_path(ROOT, STATE),
-            "journal": ZEN_PROFILE.relative_path(ROOT, JOURNAL),
-            "live": ZEN_PROFILE.relative_path(ROOT, LIVE),
+            "state": PROJECT_PROFILE.relative_path(ROOT, STATE),
+            "journal": PROJECT_PROFILE.relative_path(ROOT, JOURNAL),
+            "live": PROJECT_PROFILE.relative_path(ROOT, LIVE),
         },
     }
 
@@ -346,7 +335,7 @@ def _rule(title: str) -> list[str]:
 
 
 def _command_lines(gate: dict[str, Any]) -> list[str]:
-    controller_command = ZEN_PROFILE.controller_display_command(ROOT)
+    controller_command = PROJECT_PROFILE.controller_display_command(ROOT)
     commands: list[str] = []
     if gate.get("class") == "policy_review" and gate.get("steer"):
         commands.extend([gate["steer"], gate["resume"]])

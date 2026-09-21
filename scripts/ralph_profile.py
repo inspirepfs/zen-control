@@ -1,18 +1,25 @@
-"""ZEN Control's internal RALPH-Lite project contract.
+"""Host-project profile contract for embedded RALPH-Lite.
 
-This module deliberately contains project choices only.  Controller lifecycle,
-approval, repair, resource, and state-machine behavior remains in the RALPH
-controller modules.
+The controller owns lifecycle, approval, recovery, qualification orchestration,
+and evidence semantics.  A project profile supplies repository layout, durable
+runtime locations, host validation commands, protection/tooling policy, and
+host-specific prompt/gate wording.
+
+``ZEN_PROFILE`` is the compatibility-preserving adapter for the current ZEN
+Control embedding.  Controller modules consume the neutral ``PROJECT_PROFILE``
+name so physical extraction can replace the adapter without editing core
+lifecycle logic.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 @dataclass(frozen=True)
-class ZenProjectProfile:
-    """Stable, internal defaults for the ZEN Control RALPH installation."""
+class ProjectProfile:
+    """Host-supplied project contract consumed by the embedded controller."""
 
     identity: str = "ZEN Control"
     completion_commit_prefix: str = "chore(zen):"
@@ -26,6 +33,7 @@ class ZenProjectProfile:
         ("journal", "journal.md"), ("policy", "policy.md"), ("live", "live.log"),
         ("context", "context.json"), ("events", "events.jsonl"),
         ("recovery", "recovery"), ("reports", "reports"),
+        ("retirements", "retirements"),
         ("usage_ledger", "usage-ledger.jsonl"), ("usage_stats_reset", "usage-stats-reset.json"),
         ("web_job", "web-job.json"), ("web_log", "web-run.log"),
     )
@@ -40,9 +48,11 @@ class ZenProjectProfile:
     tooling_paths: frozenset[str] = frozenset({
         ".gitignore", ".ralph/policy.md", "scripts/ralph.py", "scripts/ralph_efficiency.py",
         "scripts/ralph_model.py", "scripts/ralph_gate.py", "scripts/ralph_tui.py",
-        "scripts/ralph_web.py", "tests/test_ralph_lite.py", "tests/test_ralph_efficiency.py",
-        "tests/test_ralph_model.py", "tests/test_ralph_gate.py", "tests/test_ralph_lifecycle.py",
-        "tests/test_ralph_retry_hardening.py", "tests/test_ralph_web.py", "tests/test_ralph_self_hosting.py",
+        "scripts/ralph_web.py", "scripts/ralph_profile.py", "tests/test_ralph_lite.py",
+        "tests/test_ralph_efficiency.py", "tests/test_ralph_model.py", "tests/test_ralph_gate.py",
+        "tests/test_ralph_lifecycle.py", "tests/test_ralph_retry_hardening.py",
+        "tests/test_ralph_web.py", "tests/test_ralph_self_hosting.py",
+        "tests/test_ralph_profile_boundary.py", "tests/test_ralph_web_gate_profile_boundary.py",
         "docs/RALPH-LITE.md",
     })
     optional_final_validators: tuple[tuple[str, str], ...] = (
@@ -50,6 +60,24 @@ class ZenProjectProfile:
         ("supply-chain", "scripts/supply_chain_validate.py"),
         ("public-audit", "scripts/public_release_audit.py"),
     )
+    execution_prompt_guardrails: tuple[str, ...] = (
+        "Do not interact with live RouterOS, secrets, credentials, or external production systems.",
+    )
+    nonrecoverable_validation_markers: tuple[str, ...] = (
+        "policy violation", "secret", "credential", "routeros", "human decision",
+    )
+    production_action_keywords: tuple[str, ...] = (
+        "routeros", "production", "live write", "live action",
+    )
+    incident_reason_keyword: str = "incident"
+    performance_reason_keyword: str = "performance"
+    incident_runtime_summary: str = (
+        "Incident Monitor state is runtime-owned. No verified source/configuration defect "
+        "was found; operator action/evidence is required before this approved step can advance."
+    )
+    web_login_subtitle: str = "Private home-lab operator console"
+    web_title: str = "RALPH-Lite"
+    web_console_subtitle: str = "Operator console · CLI/TUI remains authoritative"
     policy_review_guidance: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("actions", (
             "Compare the requested path/action with the approved step and its test-change policy.",
@@ -105,8 +133,51 @@ class ZenProjectProfile:
     def runtime_directory(self, root: Path) -> Path:
         return root / self.runtime_dir_name
 
+    def runtime_relative_path(self, relative: str | Path | None = None) -> str:
+        base = Path(self.runtime_dir_name).as_posix().strip("/")
+        if not relative:
+            return base
+        suffix = Path(relative).as_posix().lstrip("/")
+        return f"{base}/{suffix}" if suffix else base
+
+    def is_runtime_path(self, path: str | Path) -> bool:
+        value = Path(str(path)).as_posix()
+        while value.startswith("./"):
+            value = value[2:]
+        base = self.runtime_relative_path()
+        return value == base or value.startswith(base + "/")
+
     def artifact(self, root: Path, name: str) -> Path:
         return self.runtime_directory(root) / dict(self.artifacts)[name]
+
+    def artifact_relative_path(self, name: str) -> str:
+        return self.runtime_relative_path(dict(self.artifacts)[name])
+
+    def runtime_config_path(self, root: Path, filename: str) -> Path:
+        return self.runtime_directory(root) / filename
+
+    def policy_storage_directory(self, root: Path) -> Path:
+        """Return the host-owned directory for live policy documents."""
+        return self.runtime_directory(root)
+
+    def policy_storage_kwargs(self, root: Path) -> dict[str, Path]:
+        """Return helper arguments while preserving the ZEN helper call shape.
+
+        The original ZEN helpers infer their ``.ralph`` location from ``root``.
+        Alternate hosts must pass their runtime directory explicitly; keeping
+        that distinction here prevents controller and Web code from owning a
+        runtime-path decision.
+        """
+        runtime_directory = self.policy_storage_directory(root)
+        if self.runtime_dir_name == ".ralph" and runtime_directory == self.runtime_directory(root):
+            return {}
+        return {"runtime_directory": runtime_directory}
+
+    def recovery_manifest(self, root: Path, checkpoint_id: str) -> Path:
+        return self.artifact(root, "recovery") / checkpoint_id / "manifest.json"
+
+    def policy_reference(self) -> str:
+        return self.artifact_relative_path("policy")
 
     def controller_cli(self, root: Path) -> Path:
         return root / self.controller_cli_relative_path
@@ -150,9 +221,30 @@ class ZenProjectProfile:
             if (root / relative_path).exists()
         ]
 
+    def prompt_guardrails(self) -> str:
+        return " ".join(item.strip() for item in self.execution_prompt_guardrails if item.strip())
+
+    def validation_block_is_nonrecoverable(self, text: str) -> bool:
+        lower = str(text or "").lower()
+        return any(marker.lower() in lower for marker in self.nonrecoverable_validation_markers)
+
+    def gate_rules(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return (
+            ("validation_evidence", ("performance", "sample", "acceptance evidence", "snapshot", "validation")),
+            ("runtime_evidence", ("incident", "runtime", "diagnostic", "worker", "active durable")),
+            ("credentials_or_access", ("credential", "login", "permission", "access token", "authentication")),
+            ("security_approval", ("security approval", "security sign-off", "authority approval")),
+            ("production_action", tuple(self.production_action_keywords)),
+            ("scope_conflict", ("scope conflict", "overlap", "claimed work", "out of scope")),
+            ("external_dependency", ("external dependency", "third-party", "upstream", "service unavailable")),
+        )
+
     @staticmethod
     def guidance(values: tuple[tuple[str, tuple[str, ...]], ...]) -> dict[str, list[str]]:
         return {key: list(items) for key, items in values}
 
 
-ZEN_PROFILE = ZenProjectProfile()
+# Current host adapter.  Persisted filenames/schemas remain unchanged; D4 only
+# makes the boundary executable and testable, it does not migrate runtime data.
+ZEN_PROFILE = ProjectProfile()
+PROJECT_PROFILE = ZEN_PROFILE

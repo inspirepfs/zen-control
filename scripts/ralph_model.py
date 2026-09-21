@@ -23,8 +23,8 @@ def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def policy_path(root: Path) -> Path:
-    return Path(root) / ".ralph" / FILENAME
+def policy_path(root: Path, runtime_directory: Path | None = None) -> Path:
+    return Path(runtime_directory) / FILENAME if runtime_directory is not None else Path(root) / ".ralph" / FILENAME
 
 
 def _normalise_effort(value: Any) -> str | None:
@@ -61,8 +61,8 @@ def normalize_policy(raw: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def load_policy(root: Path) -> dict[str, Any]:
-    path = policy_path(root)
+def load_policy(root: Path, *, runtime_directory: Path | None = None) -> dict[str, Any]:
+    path = policy_path(root, runtime_directory)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -82,15 +82,16 @@ def save_policy(
     model: str | None | object = _UNSET,
     *,
     reasoning_effort: str | None | object = _UNSET,
+    runtime_directory: Path | None = None,
 ) -> dict[str, Any]:
     """Atomically update one or both project-local Codex selections.
 
     Unspecified fields are preserved. Passing None explicitly clears that
     override and returns control to the user's Codex configuration.
     """
-    path = policy_path(root)
+    path = policy_path(root, runtime_directory)
     path.parent.mkdir(parents=True, exist_ok=True)
-    current = load_policy(root)
+    current = load_policy(root, runtime_directory=runtime_directory)
     next_model = current.get("model") if model is _UNSET else model
     next_effort = current.get("reasoning_effort") if reasoning_effort is _UNSET else reasoning_effort
     candidate = normalize_policy({

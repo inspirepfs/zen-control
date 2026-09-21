@@ -19,7 +19,7 @@ from scripts import ralph, ralph_profile
 class ProfileBoundaryTests(unittest.TestCase):
     def test_profile_controls_project_metadata_validation_and_discovery(self):
         profile = replace(
-            ralph_profile.ZEN_PROFILE,
+            ralph_profile.PROJECT_PROFILE,
             identity="Boundary Host",
             completion_commit_prefix="chore(boundary):",
             source_roots=("host_source",),
@@ -37,7 +37,7 @@ class ProfileBoundaryTests(unittest.TestCase):
             self.assertEqual(["python3", "-m", "unittest", "discover", "-s", "host_tests", "-v"], gates[1][1])
             self.assertEqual([("host-validator", ["python3", "scripts/ux_validate.py"])], profile.final_validator_gates(root, "python3"))
 
-        with mock.patch.object(ralph, "ZEN_PROFILE", profile):
+        with mock.patch.object(ralph, "PROJECT_PROFILE", profile):
             self.assertIn("Boundary Host", ralph.plan_prompt("test"))
             self.assertIn("Boundary Host", ralph.step_prompt(ralph.default_state(), {"id": 1, "title": "test", "objective": "test", "acceptance": [], "test_change_policy": "none"}, None, 0))
             self.assertEqual("chore(boundary): boundary work", ralph._default_commit_message({"plan": {"goal": "Boundary work"}}))
@@ -46,6 +46,40 @@ class ProfileBoundaryTests(unittest.TestCase):
                 profile.final_validator_gates(ralph.ROOT, ralph.sys.executable),
                 ralph.final_qualification_gates()[-2:-1],
             )
+
+    def test_profile_owns_runtime_boundary_and_host_prompt_guardrails(self):
+        profile = replace(
+            ralph_profile.PROJECT_PROFILE,
+            identity="Portable Host",
+            runtime_dir_name=".controller-state",
+            execution_prompt_guardrails=("Do not access Portable Host production.",),
+            nonrecoverable_validation_markers=("portable-policy",),
+        )
+        state = {"plan_hash": "a" * 64, "human_steering": []}
+        step = {"id": 1, "title": "Boundary", "objective": "Prove boundary", "acceptance": ["done"], "test_change_policy": "none"}
+        policy = ralph.efficiency_policy.normalize_policy({"normal_prompt_command_budget": 3})
+        with (
+            mock.patch.object(ralph, "PROJECT_PROFILE", profile),
+            mock.patch.object(ralph.efficiency_policy, "load_policy", return_value=policy) as load_policy,
+            mock.patch.object(ralph, "context_handoff", return_value={}),
+        ):
+            self.assertTrue(ralph._is_runtime_authority_path(".controller-state/state.json"))
+            self.assertFalse(ralph._is_runtime_authority_path(".ralph/state.json"))
+            self.assertIsNone(ralph._context_path(".controller-state/context.json"))
+            prompt = ralph.step_prompt(state, step, None, 0)
+            self.assertEqual(profile.policy_storage_directory(ralph.ROOT), load_policy.call_args.kwargs["runtime_directory"])
+            self.assertIn(".controller-state/policy.md", prompt)
+            self.assertIn("Do not edit any file under .controller-state", prompt)
+            self.assertIn("Do not access Portable Host production.", prompt)
+            self.assertNotIn("RouterOS", prompt)
+            self.assertTrue(ralph.is_recoverable_validation_block("python test failed"))
+            self.assertFalse(ralph.is_recoverable_validation_block("python test failed portable-policy"))
+
+    def test_controller_source_has_no_zen_host_literals_outside_compatibility_schemas(self):
+        source = Path(ralph.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("ZEN Control", source)
+        self.assertNotIn("RouterOS", source)
+        self.assertNotIn('startswith(".ralph/")', source)
 
     def test_controller_has_no_zen_application_module_dependency(self):
         tree = ast.parse(Path(ralph.__file__).read_text(encoding="utf-8"))
