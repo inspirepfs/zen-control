@@ -174,7 +174,7 @@ services:
 
 
   telemetry-db:
-    image: postgres:17-bookworm
+    image: postgres:18-bookworm
     container_name: mikrotik-telemetry-db
     restart: unless-stopped
     environment:
