@@ -48,6 +48,15 @@ class ReplacementInventoryTests(unittest.TestCase):
         self.assertEqual(items["snapshot-only.py"]["classification"], "SNAPSHOT_ONLY_EXTERNAL_RECONCILIATION")
         self.assertEqual(items["snapshot-only.py"]["disposition"], "REJECTED_EXTERNAL_RECONCILIATION_REQUIRED")
 
+    def test_excludes_controller_runtime_paths_from_replacement_inventory(self):
+        (self.root / "app.py").write_text("retained\n", encoding="utf-8")
+        runtime = self.root / ".ralph" / "state.json"
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        runtime.write_text('{"status":"APPROVED"}\n', encoding="utf-8")
+        items = {item["path"]: item for item in ralph.replacement_dirty_inventory(self.manifest("app.py"))}
+        self.assertIn("app.py", items)
+        self.assertNotIn(".ralph/state.json", items)
+
     def test_fails_closed_for_changed_forged_and_protected_evidence(self):
         (self.root / "app.py").write_text("retained\n", encoding="utf-8")
         manifest = self.manifest("app.py")

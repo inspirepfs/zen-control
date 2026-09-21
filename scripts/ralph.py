@@ -284,6 +284,7 @@ def default_state() -> dict:
         "efficiency_recommendation": None,
         "usage_admission": None,
         "controller_runtime": None,
+        "retirement_rollback_preview": None,
         "updated_at": utc_now(),
     }
 
@@ -1706,13 +1707,28 @@ def _current_carry_forward_step(state: dict, step_no: int) -> dict:
     return _carry_forward_step(state, step_no)
 
 
-def _validate_carry_forward_action_scope(state: dict, path: str, step_no: int) -> dict:
+def _validate_carry_forward_action_scope(
+    state: dict, path: str, step_no: int, source: dict, *, grants_plan_authority: bool,
+) -> dict:
+    """Bind one reconciliation action to the live step without broadening authority.
+
+    Leaving or rejecting retained content is a non-absorption disposition and
+    therefore does not require test-mutation or self-hosting authority. Adoption
+    does grant plan context, so the originating retirement baseline determines
+    whether ``add-only`` is sufficient or ``modify`` is required.
+    """
     step = _current_carry_forward_step(state, step_no)
+    if not grants_plan_authority:
+        return step
     if path == "tests" or path.startswith("tests/"):
         policy = str(step.get("test_change_policy") or "none")
-        # Carried-forward tests are retained evidence, not a modification of an
-        # existing test.  The active step must nevertheless explicitly permit
-        # test content, including the add-only policy.
+        baseline = str(source.get("baseline") or "")
+        if policy == "none":
+            raise RuntimeError(f"carry-forward reconciliation violates test policy none: {path}")
+        if policy == "add-only" and baseline != "absent":
+            raise RuntimeError(
+                f"carry-forward reconciliation add-only cannot adopt pre-existing test content: {path}"
+            )
         if policy not in {"add-only", "modify"}:
             raise RuntimeError(f"carry-forward reconciliation violates test policy {policy}: {path}")
     if is_tooling_path(path):
@@ -1786,13 +1802,14 @@ def reconciliation_snapshot(state: dict) -> dict:
             continue
         _retirement_path(path)
         record = candidate.get("adoption") if disposition == _CARRY_FORWARD_ADOPTED else candidate.get("reconciliation")
-        if disposition in {_CARRY_FORWARD_ADOPTED, _CARRY_FORWARD_OUTSIDE}:
+        operator_final = disposition in {_CARRY_FORWARD_ADOPTED, _CARRY_FORWARD_OUTSIDE} or (
+            disposition == _CARRY_FORWARD_REJECTED and candidate.get("eligible") is True
+        )
+        if operator_final:
             if not isinstance(source, dict) or not isinstance(record, dict):
                 raise RuntimeError("replacement reconciliation state lacks manifest-bound action evidence")
-            # Diagnose an action against the live approved policy before its
-            # integrity check.  A persisted action can never preserve policy
-            # authority after the plan context changes; the hash check below
-            # still rejects any corresponding record mutation.
+            # Diagnose an action against the immutable approved policy before its
+            # integrity check. Persisted action data cannot create new authority.
             step_no = int(record.get("claiming_step") or 0)
             step = _carry_forward_step(state, step_no)
             if record.get("test_change_policy") != step.get("test_change_policy"):
@@ -1807,13 +1824,20 @@ def reconciliation_snapshot(state: dict) -> dict:
                     or record.get("retirement_evidence") != source.get("evidence")):
                 raise RuntimeError("replacement reconciliation action is not bound to current immutable provenance")
             authority = record.get("self_hosting_authority")
-            if authority is not None and (not isinstance(authority, dict) or authority.get("plan_hash") != state.get("plan_hash")):
-                raise RuntimeError("replacement reconciliation action authority evidence is stale")
-            item.update({"claiming_step": step_no, "evidence_status": "manifest-bound-unchanged",
+            if disposition == _CARRY_FORWARD_ADOPTED and is_tooling_path(path):
+                if not isinstance(authority, dict):
+                    raise RuntimeError("replacement reconciliation tooling adoption lacks self-hosting evidence")
+                allowed, reason = self_hosting_grant_allows(
+                    {**state, "self_hosting_grant": authority}, step_no, [path]
+                )
+                if not allowed:
+                    raise RuntimeError(f"replacement reconciliation action authority evidence is stale: {reason}")
+            elif authority is not None:
+                raise RuntimeError("replacement reconciliation non-adoption action contains inapplicable authority evidence")
+            item.update({"claiming_step": step_no,
+                         "evidence_status": "manifest-bound-rejected" if disposition == _CARRY_FORWARD_REJECTED else "manifest-bound-unchanged",
                          "qualification_impact": "REQUIRES_REQUALIFICATION", "action_hash": provided_hash,
                          "authority_evidence": authority})
-        elif disposition == _CARRY_FORWARD_REJECTED and source is not None and record is not None:
-            item["evidence_status"] = "manifest-bound-rejected"
         snapshot.append(item)
     return {"replacement": True, "retirement_record_id": record_id,
             "retirement_manifest_sha256": retirement_record_digest(state, record_id),
@@ -1840,7 +1864,8 @@ def _carry_forward_action(state: dict, candidate: dict, source: dict, *, disposi
         "inherited_fingerprint": source["evidence"]["fingerprint"],
         "source_kind": source["current"],
         "test_change_policy": step.get("test_change_policy"),
-        "self_hosting_authority": state.get("self_hosting_grant") if is_tooling_path(candidate["path"]) else None,
+        "self_hosting_authority": state.get("self_hosting_grant")
+        if disposition == _CARRY_FORWARD_ADOPTED and is_tooling_path(candidate["path"]) else None,
         "reason": reason,
         "recorded_at": utc_now(),
     }
@@ -1856,7 +1881,9 @@ def _validate_carry_forward_adoption(state: dict, path: str, step_no: int) -> tu
         raise RuntimeError("carry-forward candidate is duplicate or already absorbed by the plan")
     if is_protected_path(path) or _is_runtime_authority_path(path):
         raise RuntimeError("carry-forward adoption refuses protected or runtime paths")
-    _validate_carry_forward_action_scope(state, path, step_no)
+    _validate_carry_forward_action_scope(
+        state, path, step_no, source, grants_plan_authority=True,
+    )
     return candidate, source
 
 
@@ -1910,7 +1937,9 @@ def _cmd_dispose_carry_forward(args: argparse.Namespace, disposition: str, actio
     reason = " ".join(str(args.reason or "").split())
     if not reason:
         raise RuntimeError(f"{action} requires a non-empty --reason")
-    step = _validate_carry_forward_action_scope(state, path, step_no)
+    step = _validate_carry_forward_action_scope(
+        state, path, step_no, source, grants_plan_authority=False,
+    )
     basis = "outside-plan-boundary" if disposition == _CARRY_FORWARD_OUTSIDE else "external-reconciliation-required"
     record = _carry_forward_action(state, candidate, source, disposition=disposition, step=step, ownership_basis=basis, reason=reason[:1200])
     candidate.update({"disposition": disposition, "owned": False, "reason": reason[:1200], "disposed_at": record["recorded_at"], "reconciliation": record})
@@ -2686,8 +2715,10 @@ def replacement_dirty_inventory(manifest: dict) -> list[dict]:
 
     Retirement evidence can prove that a path is retained, but the repository
     snapshot is only audit context: it never grants replacement-plan ownership.
-    Protected and malformed paths deliberately receive status-only evidence so
-    the controller does not read their content while still making them visible.
+    Protected and malformed project paths deliberately receive status-only
+    evidence so the controller does not read their content while still making
+    them visible. Controller runtime paths are excluded entirely because their
+    expected lifecycle mutations are not project dirty-tree reconciliation.
     """
     dirty, untracked = _status_sets()
     manifest_paths = manifest.get("paths") if isinstance(manifest.get("paths"), list) else []
@@ -2718,8 +2749,9 @@ def replacement_dirty_inventory(manifest: dict) -> list[dict]:
                                      "disposition": _CARRY_FORWARD_REJECTED, "evidence_error": "protected path content not read"})
             continue
         if _is_runtime_authority_path(path):
-            inventory.append(base | {"classification": "RUNTIME_AUTHORITY_NON_ADOPTABLE", "eligible": False,
-                                     "disposition": _CARRY_FORWARD_REJECTED, "evidence_error": "runtime authority path"})
+            # Controller runtime files are deliberately outside project dirty-tree
+            # reconciliation. They mutate as the controller records checkpoints,
+            # events and state, and can never be adopted into a replacement plan.
             continue
         sources = by_path.get(path, [])
         if len(sources) > 1:
@@ -2768,7 +2800,7 @@ def replacement_inventory_binding(candidate: dict) -> dict:
     """Return the immutable evidence portion of one replacement candidate."""
     if not isinstance(candidate, dict):
         return {"invalid_candidate": True}
-    mutable = {"disposition", "owned", "reason", "disposed_at", "adoption"}
+    mutable = {"disposition", "owned", "reason", "disposed_at", "adoption", "reconciliation"}
     return {key: value for key, value in candidate.items() if key not in mutable}
 
 
@@ -5903,6 +5935,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
         "block_reason": None,
         "proposal_previous_state": previous_state,
         "retirement_record_id": retirement_record_id,
+        "retirement_rollback_preview": None,
         "recovery_checkpoint": None,
         "approved_plan_artifact": None,
         "approval_repository_evidence": None,
@@ -5983,6 +6016,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     state["plan_owned_files"] = []
     state["plan_carry_forward_files"] = []
     state["carry_forward_candidates"] = candidates
+    state["retirement_rollback_preview"] = None
     state["human_steering"] = []
     state["steering_allowed_new_tests"] = []
     clear_self_hosting_context(state)
@@ -6062,6 +6096,58 @@ def cmd_reject_carry_forward(args: argparse.Namespace) -> int:
 
 
 
+RETIREMENT_ROLLBACK_PREVIEW_SCHEMA = "zen_ralph_retirement_rollback_preview_v1"
+
+
+def retirement_rollback_preview(
+    state: dict, checkpoint: dict, records: list[dict], *, reason: str, status: str,
+    step: int, loop_count: int, recovery_ref: str, recovery_oid: str,
+) -> dict:
+    """Create the immutable operator-review contract for one exact rollback."""
+    paths = []
+    for record in records:
+        attribution = record.get("attribution") if isinstance(record.get("attribution"), dict) else {}
+        paths.append({
+            "path": record["path"],
+            "baseline": record["baseline"],
+            "before": _json_copy(record["before"]),
+            "operation_record_sha256": attribution.get("record_sha256"),
+        })
+    payload = {
+        "schema": RETIREMENT_ROLLBACK_PREVIEW_SCHEMA,
+        "plan_hash": state.get("plan_hash"),
+        "checkpoint": checkpoint.get("id"),
+        "checkpoint_manifest_sha256": _checkpoint_identity(str(checkpoint.get("id") or ""), checkpoint)["manifest_sha256"],
+        "recovery_ref": recovery_ref,
+        "recovery_oid": recovery_oid,
+        "reason": reason[:1200],
+        "status_before": status,
+        "step": int(step),
+        "loop_count": int(loop_count),
+        "paths": paths,
+        # Keep the action projection in the signed preview as well as in the
+        # per-path baseline evidence.  This makes the operator-facing restore
+        # and delete sets explicit, ordered, and impossible to substitute at
+        # execution without changing the reviewed digest.
+        "restore_paths": [record["path"] for record in records if record["baseline"] == "tracked"],
+        "delete_paths": [record["path"] for record in records if record["baseline"] == "absent"],
+    }
+    payload["sha256"] = _evidence_digest(payload)
+    return payload
+
+
+def _require_matching_retirement_rollback_preview(state: dict, current: dict, supplied_sha: str) -> None:
+    stored = state.get("retirement_rollback_preview")
+    if not isinstance(stored, dict):
+        raise RuntimeError("retire-plan rollback requires a previously reviewed rollback preview")
+    expected = str(stored.get("sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", supplied_sha or "") or not secrets.compare_digest(supplied_sha, expected):
+        raise RuntimeError("retire-plan rollback preview SHA does not match the reviewed preview")
+    canonical = {key: value for key, value in stored.items() if key != "created_at"}
+    if canonical != current:
+        raise RuntimeError("retire-plan rollback evidence changed after preview; generate and review a new preview")
+
+
 def cmd_retire_plan(args: argparse.Namespace) -> int:
     """Retire an active plan by an explicit, auditable disposition."""
     init_files()
@@ -6090,17 +6176,16 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
     if not reason:
         raise RuntimeError("retire-plan requires a non-empty reason")
 
-    # Parser-driven invocations always carry explicit disposition flags.  Keep
-    # the pre-existing in-process controller API usable for its legacy callers;
-    # it maps only a flag-less invocation to the non-destructive disposition.
-    legacy_invocation = not hasattr(args, "rollback") and not hasattr(args, "carry_forward")
     rollback = bool(getattr(args, "rollback", False))
-    carry_forward = bool(getattr(args, "carry_forward", False)) or legacy_invocation
+    carry_forward = bool(getattr(args, "carry_forward", False))
     if rollback == carry_forward:
         raise RuntimeError("retire-plan requires exactly one of --rollback or --carry-forward")
-    if legacy_invocation and not state.get("recovery_checkpoint"):
-        state["recovery_checkpoint"] = create_recovery_checkpoint(state)["id"]
-        save_state(state)
+    # Retirement is a lifecycle transition of the exact immutable approved plan,
+    # not a mechanism for accepting a substituted in-memory plan object.  Bind to
+    # the already-approved plan hash without reinterpreting historical schema.
+    live_plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    if plan_hash(live_plan) != expected:
+        raise RuntimeError("retire-plan approved plan is stale or altered")
     checkpoint = load_recovery_checkpoint(state.get("recovery_checkpoint"))
     if not checkpoint or checkpoint.get("id") != state.get("recovery_checkpoint"):
         raise RuntimeError("retire-plan requires the active recovery checkpoint")
@@ -6130,17 +6215,31 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
     restore_paths = [item["path"] for item in records if item["baseline"] == "tracked"]
     delete_paths = [item["path"] for item in records if item["baseline"] == "absent"]
     if rollback:
+        preview = retirement_rollback_preview(
+            state, checkpoint, records, reason=reason, status=status, step=old_step,
+            loop_count=old_loops, recovery_ref=recovery_ref, recovery_oid=recovery_oid,
+        )
         print("ROLLBACK PREVIEW")
         print(f"Recovery checkpoint: {checkpoint['id']} ({recovery_ref})")
         print("Restore paths: " + (", ".join(restore_paths) if restore_paths else "(none)"))
         print("Delete paths: " + (", ".join(delete_paths) if delete_paths else "(none)"))
+        print(f"Preview SHA-256: {preview['sha256']}")
         if str(getattr(args, "confirm", "") or "") != "ROLLBACK":
-            print("No files changed. Re-run with --confirm ROLLBACK to execute this exact rollback.")
+            state["retirement_rollback_preview"] = {**preview, "created_at": utc_now()}
+            save_state(state)
+            print(
+                "No files changed. Review the paths above, then re-run with "
+                f"--preview-sha {preview['sha256']} --confirm ROLLBACK to execute this exact rollback."
+            )
             return 0
+        supplied_preview_sha = str(getattr(args, "preview_sha", "") or "").strip()
+        _require_matching_retirement_rollback_preview(state, preview, supplied_preview_sha)
+        # Revalidate each path immediately before its mutation. The reviewed
+        # preview is already hash-bound to every attribution record and current
+        # fingerprint, so a changed path cannot be silently substituted.
         for record in records:
             if not retirement_fingerprint_matches(record["before"]):
                 raise RuntimeError(f"retire-plan rollback path changed after preview evidence: {record['path']}")
-        for record in records:
             record["after"] = _restore_attributed_retirement_path(recovery_ref, record)
             record["restoration"] = {
                 "disposition": "restored",
@@ -6181,6 +6280,7 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
         disposition,
     )
 
+    state["retirement_rollback_preview"] = None
     state.update({
         "status": "IDLE",
         "plan_hash": None,
@@ -6189,7 +6289,7 @@ def cmd_retire_plan(args: argparse.Namespace) -> int:
         "failure_attempts": {},
         "active_failure": None,
         "last_failure": None,
-        "last_result": "RETIRED" if legacy_invocation else disposition,
+        "last_result": disposition,
         "block_reason": None,
     })
     clear_self_hosting_context(state)
@@ -7565,7 +7665,8 @@ def build_parser() -> argparse.ArgumentParser:
     disposition = retire.add_mutually_exclusive_group(required=True)
     disposition.add_argument("--rollback", action="store_true")
     disposition.add_argument("--carry-forward", action="store_true")
-    retire.add_argument("--confirm", default=None, help="must be ROLLBACK to execute a rollback")
+    retire.add_argument("--preview-sha", default=None, help="exact SHA-256 emitted by the reviewed rollback preview")
+    retire.add_argument("--confirm", default=None, help="must be ROLLBACK to execute a reviewed rollback")
     retire.add_argument(
         "--reconcile-restored",
         action="store_true",

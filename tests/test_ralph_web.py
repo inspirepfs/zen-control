@@ -433,8 +433,11 @@ class ActionAuthorityTests(unittest.TestCase):
         state = self.base_state("BLOCKED_HUMAN")
         with self.assertRaisesRegex(web.WebConsoleError, "confirm=ROLLBACK"):
             web.command_for_action({"action": "retire", "mode": "rollback", "confirm": "RETIRE", "reason": "obsolete"}, state)
-        rollback = web.command_for_action({"action": "retire", "mode": "rollback", "confirm": "ROLLBACK", "reason": "obsolete"}, state)
-        self.assertEqual(rollback.argv, ["retire-plan", "b" * 64, "--reason", "obsolete", "--rollback", "--confirm", "ROLLBACK"])
+        with self.assertRaisesRegex(web.WebConsoleError, "rollback preview SHA"):
+            web.command_for_action({"action": "retire", "mode": "rollback", "confirm": "ROLLBACK", "reason": "obsolete"}, state)
+        state["retirement_rollback_preview"] = {"plan_hash": "b" * 64, "sha256": "c" * 64, "checkpoint": "RP-test", "reason": "obsolete"}
+        rollback = web.command_for_action({"action": "retire", "mode": "rollback", "confirm": "ROLLBACK", "preview_sha": "c" * 64, "reason": "obsolete"}, state)
+        self.assertEqual(rollback.argv, ["retire-plan", "b" * 64, "--reason", "obsolete", "--rollback", "--preview-sha", "c" * 64, "--confirm", "ROLLBACK"])
         carry = web.command_for_action({"action": "retire", "mode": "carry-forward", "confirm": "CARRY_FORWARD", "reason": "obsolete"}, state)
         self.assertEqual(carry.argv, ["retire-plan", "b" * 64, "--reason", "obsolete", "--carry-forward"])
         with self.assertRaisesRegex(web.WebConsoleError, "mode must"):

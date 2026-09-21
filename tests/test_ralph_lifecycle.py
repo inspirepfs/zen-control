@@ -1559,6 +1559,20 @@ class RetirePlanTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "hash does not match"):
                 ralph.cmd_retire_plan(type("Args", (), {"plan_hash": "wrong", "reason": "obsolete"})())
 
+    def test_retire_plan_rejects_substituted_approved_plan(self):
+        with RepoHarness(self):
+            state = self.blocked_state()
+            checkpoint = ralph.create_recovery_checkpoint(state)
+            state["recovery_checkpoint"] = checkpoint["id"]
+            state["plan"]["goal"] = "substituted after approval"
+            ralph.save_state(state)
+            args = type("Args", (), {
+                "plan_hash": state["plan_hash"], "reason": "obsolete",
+                "rollback": False, "carry_forward": True, "confirm": None,
+            })()
+            with self.assertRaisesRegex(RuntimeError, "approved plan is stale or altered"):
+                ralph.cmd_retire_plan(args)
+
     def test_retire_plan_rejects_empty_reason(self):
         with RepoHarness(self):
             state = self.blocked_state()
@@ -1577,14 +1591,19 @@ class RetirePlanTests(unittest.TestCase):
     def test_retire_plan_returns_controller_to_idle_without_codex(self):
         with RepoHarness(self):
             state = self.blocked_state()
-            ralph.save_state(state)
             ralph.PLAN.write_text(ralph.render_plan(state["plan"]), encoding="utf-8")
-            rc = ralph.cmd_retire_plan(type("Args", (), {"plan_hash": state["plan_hash"], "reason": "superseded by real operation"})())
+            checkpoint = ralph.create_recovery_checkpoint(state)
+            state["recovery_checkpoint"] = checkpoint["id"]
+            ralph.save_state(state)
+            rc = ralph.cmd_retire_plan(type("Args", (), {
+                "plan_hash": state["plan_hash"], "reason": "superseded by real operation",
+                "rollback": False, "carry_forward": True, "confirm": None,
+            })())
             self.assertEqual(rc, 0)
             retired = ralph.load_state()
             self.assertEqual(retired["status"], "IDLE")
             self.assertEqual(retired["loop_count"], 9)
-            self.assertEqual(retired["last_result"], "RETIRED")
+            self.assertEqual(retired["last_result"], "RETIRED_WITH_CARRY_FORWARD")
             self.assertEqual(retired["retired_plans"][-1]["plan_hash"], state["plan_hash"])
 
     def _rollback_state(self, repo) -> tuple[dict, dict]:
@@ -1622,16 +1641,28 @@ class RetirePlanTests(unittest.TestCase):
         return state, checkpoint
 
     @staticmethod
-    def _rollback_args(plan_hash: str):
+    def _rollback_args(plan_hash: str, *, confirm: str | None = "ROLLBACK", preview_sha: str | None = None, reason: str = "obsolete"):
         return type("Args", (), {
-            "plan_hash": plan_hash, "reason": "obsolete", "rollback": True,
-            "carry_forward": False, "confirm": "ROLLBACK", "reconcile_restored": False,
+            "plan_hash": plan_hash, "reason": reason, "rollback": True,
+            "carry_forward": False, "confirm": confirm, "preview_sha": preview_sha,
+            "reconcile_restored": False,
         })()
+
+    def _reviewed_rollback_args(self, state: dict, *, reason: str = "obsolete"):
+        self.assertEqual(0, ralph.cmd_retire_plan(self._rollback_args(
+            state["plan_hash"], confirm=None, reason=reason,
+        )))
+        preview = ralph.load_state().get("retirement_rollback_preview")
+        self.assertIsInstance(preview, dict)
+        self.assertRegex(str(preview.get("sha256") or ""), r"^[0-9a-f]{64}$")
+        return self._rollback_args(
+            state["plan_hash"], confirm="ROLLBACK", preview_sha=preview["sha256"], reason=reason,
+        )
 
     def test_rollback_restores_attributed_tracked_edits_deletions_and_creations(self):
         with RepoHarness(self) as repo:
             state, checkpoint = self._rollback_state(repo)
-            self.assertEqual(0, ralph.cmd_retire_plan(self._rollback_args(state["plan_hash"])))
+            self.assertEqual(0, ralph.cmd_retire_plan(self._reviewed_rollback_args(state)))
             self.assertEqual("value = 1\n", (repo.root / "app.py").read_text(encoding="utf-8"))
             self.assertEqual("delete_me = True\n", (repo.root / "deleted.py").read_text(encoding="utf-8"))
             self.assertFalse((repo.root / "created.py").exists())
@@ -1643,6 +1674,27 @@ class RetirePlanTests(unittest.TestCase):
             self.assertEqual(checkpoint["id"], manifest["checkpoint"])
             self.assertEqual({"app.py", "created.py", "deleted.py"}, {item["path"] for item in manifest["paths"]})
             self.assertTrue(all(item["before"] and item["after"] for item in manifest["paths"]))
+
+    def test_rollback_requires_exact_reviewed_preview_and_refuses_changed_contract(self):
+        with RepoHarness(self) as repo:
+            state, _checkpoint = self._rollback_state(repo)
+            with self.assertRaisesRegex(RuntimeError, "previously reviewed rollback preview"):
+                ralph.cmd_retire_plan(self._rollback_args(state["plan_hash"], preview_sha="0" * 64))
+
+            reviewed = self._reviewed_rollback_args(state, reason="obsolete")
+            with self.assertRaisesRegex(RuntimeError, "preview SHA does not match"):
+                ralph.cmd_retire_plan(self._rollback_args(
+                    state["plan_hash"], preview_sha="f" * 64, reason="obsolete",
+                ))
+            with self.assertRaisesRegex(RuntimeError, "evidence changed after preview"):
+                ralph.cmd_retire_plan(self._rollback_args(
+                    state["plan_hash"], preview_sha=reviewed.preview_sha, reason="different reason",
+                ))
+
+            preview = ralph.load_state()["retirement_rollback_preview"]
+            self.assertEqual(state["plan_hash"], preview["plan_hash"])
+            self.assertEqual(["app.py", "deleted.py"], preview["restore_paths"])
+            self.assertEqual(["created.py"], preview["delete_paths"])
 
     def test_rollback_refuses_stale_altered_duplicate_and_unattributed_evidence(self):
         cases = ("stale", "altered", "duplicate", "unattributed")
@@ -1681,6 +1733,57 @@ class RetirePlanTests(unittest.TestCase):
                 ralph.save_state(state)
                 with self.assertRaisesRegex(RuntimeError, expected):
                     ralph.cmd_retire_plan(self._rollback_args(state["plan_hash"]))
+
+    def test_carry_forward_scope_distinguishes_test_policies_and_nonabsorption_authority(self):
+        state = ralph.default_state()
+        plan = valid_plan()
+        state.update({
+            "status": "APPROVED",
+            "plan_hash": ralph.plan_hash(plan),
+            "plan": plan,
+            "current_step": 1,
+        })
+        step = state["plan"]["steps"][0]
+        tracked = {"baseline": "tracked"}
+        absent = {"baseline": "absent"}
+
+        step["test_change_policy"] = "none"
+        with self.assertRaisesRegex(RuntimeError, "violates test policy none"):
+            ralph._validate_carry_forward_action_scope(
+                state, "tests/existing_test.py", 1, tracked, grants_plan_authority=True,
+            )
+        self.assertIs(
+            step,
+            ralph._validate_carry_forward_action_scope(
+                state, "tests/existing_test.py", 1, tracked, grants_plan_authority=False,
+            ),
+        )
+
+        step["test_change_policy"] = "add-only"
+        with self.assertRaisesRegex(RuntimeError, "add-only cannot adopt pre-existing test content"):
+            ralph._validate_carry_forward_action_scope(
+                state, "tests/existing_test.py", 1, tracked, grants_plan_authority=True,
+            )
+        self.assertIs(
+            step,
+            ralph._validate_carry_forward_action_scope(
+                state, "tests/new_test.py", 1, absent, grants_plan_authority=True,
+            ),
+        )
+
+        step["test_change_policy"] = "modify"
+        self.assertIs(
+            step,
+            ralph._validate_carry_forward_action_scope(
+                state, "tests/existing_test.py", 1, tracked, grants_plan_authority=True,
+            ),
+        )
+        self.assertIs(
+            step,
+            ralph._validate_carry_forward_action_scope(
+                state, "scripts/ralph_shadow.py", 1, tracked, grants_plan_authority=False,
+            ),
+        )
 
     def test_carry_forward_v4_manifest_preserves_inventory_without_rollback_authority(self):
         with RepoHarness(self):
