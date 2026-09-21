@@ -279,6 +279,7 @@ def default_state() -> dict:
         "efficiency_mode": "NORMAL",
         "efficiency_recommendation": None,
         "usage_admission": None,
+        "controller_runtime": None,
         "updated_at": utc_now(),
     }
 
@@ -295,6 +296,62 @@ def save_state(state: dict) -> None:
     tmp = STATE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, STATE)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def controller_runtime_status(state: dict) -> dict:
+    """Return controller-owned runtime identity independent of CLI/Web origin."""
+    raw = state.get("controller_runtime") if isinstance(state.get("controller_runtime"), dict) else {}
+    try:
+        pid = int(raw.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    active = _pid_alive(pid)
+    return {
+        "active": active,
+        "stale": bool(pid and not active),
+        "pid": pid or None,
+        "command": str(raw.get("command") or "") or None,
+        "started_at": raw.get("started_at"),
+        "plan_hash": raw.get("plan_hash"),
+    }
+
+
+def _register_controller_runtime(command: str) -> None:
+    state = load_state()
+    existing = controller_runtime_status(state)
+    if existing.get("active") and int(existing.get("pid") or 0) != os.getpid():
+        raise RuntimeError(
+            f"controller runtime already active ({existing.get('command') or 'controller'} pid {existing.get('pid')})"
+        )
+    state["controller_runtime"] = {
+        "pid": os.getpid(),
+        "command": str(command),
+        "started_at": utc_now(),
+        "plan_hash": state.get("plan_hash"),
+    }
+    save_state(state)
+
+
+def _clear_controller_runtime(command: str) -> None:
+    state = load_state()
+    runtime = state.get("controller_runtime") if isinstance(state.get("controller_runtime"), dict) else {}
+    try:
+        runtime_pid = int(runtime.get("pid") or 0)
+    except (TypeError, ValueError):
+        runtime_pid = 0
+    if runtime_pid == os.getpid() and str(runtime.get("command") or "") == str(command):
+        state["controller_runtime"] = None
+        save_state(state)
 
 
 def default_context() -> dict:
@@ -2018,10 +2075,20 @@ def final_qualification_gates() -> list[tuple[str, list[str]]]:
     return gates
 
 
+def _final_qualification_delta_guard(state: dict) -> None:
+    """Bind final gates to the approved plan's repository authority."""
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    authority = str(plan.get(REPOSITORY_AUTHORITY_FIELD) or "")
+    if authority == "read-only":
+        verified_read_only_completion(state, "final qualification")
+        return
+    _requalification_delta_guard(state)
+
+
 def run_final_qualification(requalification_state: dict | None = None) -> tuple[bool, list[str], dict[str, float], str]:
-    """Run final gates, guarding the recorded delta when requalifying."""
+    """Run final gates with an authority-specific delta guard on both sides."""
     if requalification_state is not None:
-        _requalification_delta_guard(requalification_state)
+        _final_qualification_delta_guard(requalification_state)
     results: list[str] = []
     durations: dict[str, float] = {}
     output = ""
@@ -2038,7 +2105,7 @@ def run_final_qualification(requalification_state: dict | None = None) -> tuple[
             output = proc.stdout[-12000:]
             return False, results, durations, output
     if requalification_state is not None:
-        _requalification_delta_guard(requalification_state)
+        _final_qualification_delta_guard(requalification_state)
     return True, results, durations, output
 
 
@@ -6499,7 +6566,9 @@ def cmd_status(_: argparse.Namespace) -> int:
     remaining = min((float(w.get("remaining_percent", 100.0)) for w in windows), default=None)
     quota = f"{guard}:{remaining:.1f}%min" if remaining is not None else guard
     gate = gate_id_for_state(state) if state.get("status") == "BLOCKED_HUMAN" else "-"
-    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} gate={gate} block={state.get('block_reason') or '-'} efficiency={efficiency.get('status') or '-'} mode={policy['mode']} reserve={float(policy['reserve_percent']):.1f}% quota={quota}")
+    runtime = controller_runtime_status(state)
+    runtime_text = f"{runtime.get('command') or 'controller'}:{runtime.get('pid')}" if runtime.get("active") else ("stale" if runtime.get("stale") else "-")
+    print(f"status={state.get('status')} plan={state.get('plan_hash') or '-'} step={state.get('current_step')}/{total or '-'} loops={state.get('loop_count')} gate={gate} block={state.get('block_reason') or '-'} runtime={runtime_text} efficiency={efficiency.get('status') or '-'} mode={policy['mode']} reserve={float(policy['reserve_percent']):.1f}% quota={quota}")
     return 0
 
 
@@ -7623,12 +7692,21 @@ def main() -> int:
         raise SystemExit("--usage-refresh-seconds must be >= 15")
     if getattr(args, "session_hours", 12.0) <= 0:
         raise SystemExit("--session-hours must be > 0")
+    command = str(getattr(args, "command", "") or "")
+    runtime_tracked = command in {"propose", "run", "requalify"}
+    runtime_registered = False
     try:
+        if runtime_tracked:
+            _register_controller_runtime(command)
+            runtime_registered = True
         return args.func(args)
     except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
         _fail_closed_unhandled_run_exception(args, exc)
         print(f"RALPH-Lite: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if runtime_registered:
+            _clear_controller_runtime(command)
 
 
 if __name__ == "__main__":

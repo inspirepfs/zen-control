@@ -22,6 +22,7 @@ class WebPlanBoundsTests(unittest.TestCase):
                 "goal": "Implement bounded proposal sizing in the operator interface",
                 "min_steps": 2,
                 "max_steps": 7,
+                "repository_authority": "write",
             },
             state,
         )
@@ -31,6 +32,8 @@ class WebPlanBoundsTests(unittest.TestCase):
                 "propose",
                 "--goal",
                 "Implement bounded proposal sizing in the operator interface",
+                "--repository-authority",
+                "write",
                 "--min-steps",
                 "2",
                 "--max-steps",
@@ -45,6 +48,7 @@ class WebPlanBoundsTests(unittest.TestCase):
             "goal": "Implement bounded proposal sizing in the operator interface",
             "min_steps": 8,
             "max_steps": 3,
+            "repository_authority": "write",
         }
         with self.assertRaisesRegex(web.WebConsoleError, "greater than or equal"):
             web.command_for_action(payload, state)
@@ -67,6 +71,7 @@ class WebPlanBoundsTests(unittest.TestCase):
                 "goal": "Repair only the replacement lifecycle defect",
                 "min_steps": 1,
                 "max_steps": 5,
+                "repository_authority": "write",
             },
             state,
         )
@@ -76,6 +81,8 @@ class WebPlanBoundsTests(unittest.TestCase):
                 "propose",
                 "--from-retirement",
                 "RT-current",
+                "--repository-authority",
+                "write",
                 "--min-steps",
                 "1",
                 "--max-steps",

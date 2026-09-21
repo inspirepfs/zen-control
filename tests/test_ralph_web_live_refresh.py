@@ -26,8 +26,10 @@ class LiveRefreshContractTests(unittest.TestCase):
         source = controls.group(1)
 
         self.assertIn('id="goalInput"', source)
+        self.assertIn("READ_ONLY_COMPLETE", source)
+        self.assertIn("operation=rt.active", source)
         self.assertIn('id="steerInput"', source)
-        self.assertIn("const identity=JSON.stringify([st,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);", source)
+        self.assertIn("const identity=JSON.stringify([st,operation,st==='BLOCKED_HUMAN'?String(g?.id||''):'',JSON.stringify(g?.self_hosting_candidate?.paths||[])]);", source)
         self.assertIn("if(identity===renderedControlsIdentity)return;", source)
         self.assertLess(
             source.index("if(identity===renderedControlsIdentity)return;"),
@@ -70,11 +72,25 @@ class LiveRefreshContractTests(unittest.TestCase):
     def test_operator_actions_publish_transient_state_before_waiting_for_controller(self):
         self.assertIn("function actionState(action)", self.page)
         self.assertIn("showActionState(action);const j=await post(p)", self.page)
-        self.assertIn("localActionState||c.status", self.page)
+        self.assertIn("renderText('status',c.status)", self.page)
+        self.assertNotIn("renderText('status',localActionState", self.page)
         self.assertIn("QUALIFYING", self.page)
         self.assertIn("REVIEWING", self.page)
         self.assertIn("COMMITTING", self.page)
         self.assertIn("PUSHING", self.page)
+
+    def test_durable_status_and_web_activity_are_separate(self):
+        self.assertIn("renderText('status',c.status)", self.page)
+        self.assertIn("web_activity", self.page)
+        self.assertIn("Web activity is transient; durable controller status remains", self.page)
+        self.assertIn("controller_output", self.page)
+        self.assertIn("localActionState=actionState(action)", self.page)
+        self.assertNotIn("renderText('status',localActionState", self.page)
+
+    def test_proposals_send_explicit_repository_authority(self):
+        self.assertIn('id="proposalAuthority"', self.page)
+        self.assertIn("repository_authority", self.page)
+        self.assertIn("READ_ONLY_COMPLETE", self.page)
 
     def test_usage_layout_is_compact_and_plan_details_expand_in_place(self):
         self.assertIn("usage-grid{display:grid;grid-template-columns:repeat(6", self.page)

@@ -684,6 +684,67 @@ class SelfUpgradeRecoveryTests(unittest.TestCase):
             self.assertIn("controller runtime exception: boom", blocked["block_reason"])
 
 
+class ControllerRuntimeIdentityTests(unittest.TestCase):
+    def test_runtime_identity_is_published_during_main_and_cleared_on_return(self):
+        with RepoHarness(self):
+            ralph.save_state(ralph.default_state())
+            observed = {}
+
+            def command(_args):
+                observed.update(ralph.controller_runtime_status(ralph.load_state()))
+                return 0
+
+            args = argparse.Namespace(
+                command="run", func=command, color="auto", usage_refresh_seconds=30, session_hours=12.0,
+            )
+            parser = mock.Mock()
+            parser.parse_args.return_value = args
+            with mock.patch.object(ralph, "build_parser", return_value=parser):
+                self.assertEqual(0, ralph.main())
+
+            self.assertTrue(observed["active"])
+            self.assertEqual("run", observed["command"])
+            self.assertEqual(__import__("os").getpid(), observed["pid"])
+            self.assertIsNone(ralph.load_state().get("controller_runtime"))
+
+    def test_runtime_identity_is_cleared_when_controller_command_fails_closed(self):
+        with RepoHarness(self):
+            ralph.save_state(ralph.default_state())
+
+            def command(_args):
+                self.assertTrue(ralph.controller_runtime_status(ralph.load_state())["active"])
+                raise RuntimeError("boom")
+
+            args = argparse.Namespace(
+                command="run", func=command, color="auto", usage_refresh_seconds=30, session_hours=12.0,
+            )
+            parser = mock.Mock()
+            parser.parse_args.return_value = args
+            with mock.patch.object(ralph, "build_parser", return_value=parser):
+                self.assertEqual(2, ralph.main())
+            self.assertIsNone(ralph.load_state().get("controller_runtime"))
+
+    def test_stale_runtime_record_is_not_reported_active(self):
+        state = ralph.default_state()
+        state["controller_runtime"] = {"pid": 99999999, "command": "run"}
+        with mock.patch.object(ralph, "_pid_alive", return_value=False):
+            runtime = ralph.controller_runtime_status(state)
+        self.assertFalse(runtime["active"])
+        self.assertTrue(runtime["stale"])
+
+    def test_register_runtime_refuses_parallel_live_controller(self):
+        with RepoHarness(self):
+            state = ralph.default_state()
+            state["controller_runtime"] = {
+                "pid": 424242, "command": "run",
+                "started_at": "2026-09-20T21:00:00+00:00", "plan_hash": None,
+            }
+            ralph.save_state(state)
+            with mock.patch.object(ralph, "_pid_alive", return_value=True):
+                with self.assertRaisesRegex(RuntimeError, "controller runtime already active"):
+                    ralph._register_controller_runtime("run")
+
+
 class SteerTests(unittest.TestCase):
     def blocked_state(self, repo, *, policy="add-only"):
         plan = valid_plan()
@@ -890,9 +951,8 @@ class FinalizationTests(unittest.TestCase):
             ]
             ralph.save_state(state)
             with (
-                mock.patch.object(ralph, "run_final_qualification", return_value=(
-                    True, ["unit-tests=PASS"], {}, "",
-                )),
+                mock.patch.object(ralph, "final_qualification_gates", return_value=[("unit-tests", ["true"])]),
+                mock.patch.object(ralph, "run_process", return_value=subprocess.CompletedProcess(["true"], 0, "")),
                 mock.patch.object(ralph, "query_codex_rate_limits", return_value={}),
             ):
                 self.assertEqual(ralph.finalize_completed_plan(state), 0)
@@ -913,6 +973,16 @@ class FinalizationTests(unittest.TestCase):
             self.assertNotIn("Suggested commit", text)
             self.assertNotIn("finalize ", text)
 
+    def test_read_only_attribution_projection_blocks_final_qualification_before_gates(self):
+        with RepoHarness(self):
+            state, _checkpoint = native_approved_state(repository_authority="read-only")
+            state["plan_changed_files"] = ["app.py"]
+            ralph.save_state(state)
+            with mock.patch.object(ralph, "run_process") as run_process:
+                with self.assertRaisesRegex(RuntimeError, "stale read-only ownership projections"):
+                    ralph.run_final_qualification(state)
+            run_process.assert_not_called()
+
     def test_read_only_checkpoint_delta_blocks_before_commit_capable_state(self):
         with RepoHarness(self) as repo:
             state, _checkpoint = native_approved_state(repository_authority="read-only")
@@ -920,12 +990,12 @@ class FinalizationTests(unittest.TestCase):
             state["current_step"] = 6
             ralph.save_state(state)
             with (
-                mock.patch.object(ralph, "run_final_qualification", return_value=(
-                    True, ["unit-tests=PASS"], {}, "",
-                )),
+                mock.patch.object(ralph, "final_qualification_gates", return_value=[("unit-tests", ["true"])]),
+                mock.patch.object(ralph, "run_process") as run_process,
                 mock.patch.object(ralph, "query_codex_rate_limits", return_value={}),
             ):
                 self.assertEqual(ralph.finalize_completed_plan(state), 2)
+            run_process.assert_not_called()
 
             blocked = ralph.load_state()
             self.assertEqual("BLOCKED_HUMAN", blocked["status"])

@@ -200,7 +200,7 @@ class SnapshotTests(unittest.TestCase):
                     self.assertNotIn("self_hosting_candidate", gate)
                     self.assertNotIn("authority_block", gate)
 
-    def test_snapshot_reports_active_web_operation_without_mutating_durable_state(self):
+    def test_snapshot_keeps_durable_controller_status_separate_from_web_operation(self):
         with WebHarness() as h:
             h.state(status="READY_TO_COMMIT")
             web.WEB_JOB.write_text(json.dumps({
@@ -208,9 +208,28 @@ class SnapshotTests(unittest.TestCase):
                 "activity": "COMMITTING", "argv": ["finalize", "abc", "--commit"],
             }), encoding="utf-8")
             snap = web.snapshot()
-            self.assertEqual(snap["controller"]["status"], "COMMITTING")
+            self.assertEqual(snap["controller"]["status"], "READY_TO_COMMIT")
             self.assertEqual(snap["controller"]["durable_status"], "READY_TO_COMMIT")
             self.assertEqual(snap["job"]["activity"], "COMMITTING")
+            self.assertEqual(snap["web_activity"], "COMMITTING")
+
+    def test_snapshot_exposes_active_cli_controller_runtime(self):
+        with WebHarness() as h:
+            h.state(
+                status="RUNNING",
+                controller_runtime={
+                    "pid": __import__("os").getpid(), "command": "run",
+                    "started_at": "2026-09-20T21:00:00+00:00", "plan_hash": "a" * 64,
+                },
+            )
+            web.LIVE.write_text("controller-live\n", encoding="utf-8")
+            web.WEB_LOG.write_text("stale-web-output\n", encoding="utf-8")
+            snap = web.snapshot()
+            self.assertTrue(snap["runtime"]["active"])
+            self.assertEqual("run", snap["runtime"]["command"])
+            self.assertEqual(__import__("os").getpid(), snap["runtime"]["pid"])
+            self.assertEqual(snap["controller_output_source"], "controller-live")
+            self.assertEqual(snap["live_log"], ["controller-live"])
 
     def test_snapshot_exposes_controller_reconciliation_without_web_reclassification(self):
         with WebHarness() as h:
@@ -333,7 +352,7 @@ class ActionAuthorityTests(unittest.TestCase):
 
     def test_actions_expose_immediate_operational_state(self):
         cases = [
-            ({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "IDLE"}, "PLANNING"),
+            ({"action": "propose", "goal": "A sufficiently bounded engineering goal", "repository_authority": "read-only"}, {"status": "IDLE"}, "PLANNING"),
             ({"action": "run"}, self.base_state("APPROVED"), "RUNNING"),
             ({"action": "requalify"}, self.base_state("READY_TO_COMMIT"), "QUALIFYING"),
             ({"action": "finalize_review"}, self.base_state("READY_TO_COMMIT"), "REVIEWING"),
@@ -344,13 +363,29 @@ class ActionAuthorityTests(unittest.TestCase):
             with self.subTest(action=payload["action"]):
                 self.assertEqual(web.command_for_action(payload, state).activity, activity)
 
-    def test_propose_requires_idle_like_state_and_goal(self):
-        req = web.command_for_action({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "IDLE"})
+    def test_propose_requires_idle_like_state_goal_and_explicit_repository_authority(self):
+        payload = {
+            "action": "propose", "goal": "A sufficiently bounded engineering goal",
+            "repository_authority": "read-only",
+        }
+        req = web.command_for_action(payload, {"status": "IDLE"})
         self.assertTrue(req.background)
+        self.assertEqual(req.argv[:5], [
+            "propose", "--goal", "A sufficiently bounded engineering goal",
+            "--repository-authority", "read-only",
+        ])
+        write_req = web.command_for_action({**payload, "repository_authority": "write"}, {"status": "PUSHED"})
+        self.assertIn("write", write_req.argv)
+        read_only_terminal = web.command_for_action(payload, {"status": "READ_ONLY_COMPLETE"})
+        self.assertTrue(read_only_terminal.background)
+        with self.assertRaisesRegex(web.WebConsoleError, "repository_authority"):
+            web.command_for_action({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "IDLE"})
+        with self.assertRaisesRegex(web.WebConsoleError, "repository_authority"):
+            web.command_for_action({**payload, "repository_authority": "forged"}, {"status": "IDLE"})
         with self.assertRaises(web.WebConsoleError):
-            web.command_for_action({"action": "propose", "goal": "short"}, {"status": "IDLE"})
+            web.command_for_action({**payload, "goal": "short"}, {"status": "IDLE"})
         with self.assertRaises(web.WebConsoleError):
-            web.command_for_action({"action": "propose", "goal": "A sufficiently bounded engineering goal"}, {"status": "RUNNING"})
+            web.command_for_action(payload, {"status": "RUNNING"})
 
     def test_requalify_action_is_ready_to_commit_only_and_background(self):
         req = web.command_for_action({"action": "requalify"}, self.base_state("READY_TO_COMMIT"))
@@ -370,6 +405,24 @@ class ActionAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(web.WebConsoleError, "retire mode"):
             web.command_for_action({"action": "retire", "reason": "obsolete"}, self.base_state("BLOCKED_HUMAN"))
 
+    def test_read_only_complete_admits_proposals_but_refuses_write_terminal_actions(self):
+        state = self.base_state("READ_ONLY_COMPLETE")
+        proposal = web.command_for_action({
+            "action": "propose", "goal": "A sufficiently bounded engineering goal",
+            "repository_authority": "read-only",
+        }, state)
+        self.assertEqual(proposal.argv[-2:], ["--repository-authority", "read-only"])
+        for payload, expected in (
+            ({"action": "finalize_review"}, "READY_TO_COMMIT"),
+            ({"action": "finalize_commit", "confirm": "COMMIT"}, "READY_TO_COMMIT"),
+            ({"action": "finalize_push", "confirm": "PUSH"}, "COMMITTED"),
+            ({"action": "requalify"}, "READY_TO_COMMIT"),
+            ({"action": "reconcile_ready_test", "confirm": "ADOPT", "reason": "late test"}, "READY_TO_COMMIT"),
+        ):
+            with self.subTest(action=payload["action"]):
+                with self.assertRaisesRegex(web.WebConsoleError, expected):
+                    web.command_for_action(payload, state)
+
     def reconciliation_state(self):
         return {
             "status": "APPROVED", "plan_hash": "b" * 64, "retirement_record_id": "RT-1",
@@ -387,12 +440,20 @@ class ActionAuthorityTests(unittest.TestCase):
         with self.assertRaisesRegex(web.WebConsoleError, "mode must"):
             web.command_for_action({"action": "retire", "mode": "forged", "confirm": "CARRY_FORWARD", "reason": "obsolete"}, state)
 
-    def test_replacement_proposal_only_forwards_latest_controller_retirement(self):
+    def test_replacement_proposal_only_forwards_latest_controller_retirement_and_authority(self):
         state = {"status": "IDLE", "retired_plans": [{"record_id": "RT-new", "disposition": "RETIRED_WITH_CARRY_FORWARD", "manifest_sha256": "a" * 64}]}
-        request = web.command_for_action({"action": "propose_replacement", "retirement_record_id": "RT-new"}, state)
-        self.assertEqual(request.argv, ["propose", "--from-retirement", "RT-new"])
+        request = web.command_for_action({
+            "action": "propose_replacement", "retirement_record_id": "RT-new",
+            "repository_authority": "write",
+        }, state)
+        self.assertEqual(request.argv, ["propose", "--from-retirement", "RT-new", "--repository-authority", "write"])
+        with self.assertRaisesRegex(web.WebConsoleError, "repository_authority"):
+            web.command_for_action({"action": "propose_replacement", "retirement_record_id": "RT-new"}, state)
         with self.assertRaisesRegex(web.WebConsoleError, "exactly match"):
-            web.command_for_action({"action": "propose_replacement", "retirement_record_id": "RT-forged"}, state)
+            web.command_for_action({
+                "action": "propose_replacement", "retirement_record_id": "RT-forged",
+                "repository_authority": "write",
+            }, state)
 
     def test_reconciliation_actions_require_current_controller_candidate_and_confirmation(self):
         state = self.reconciliation_state()
@@ -803,6 +864,30 @@ class HttpSurfaceTests(unittest.TestCase):
 
 
 class BackgroundJobTests(unittest.TestCase):
+    def test_cli_controller_runtime_refuses_conflicting_web_action(self):
+        with WebHarness() as h:
+            h.state(controller_runtime={
+                "pid": __import__("os").getpid(), "command": "run",
+                "started_at": "2026-09-20T21:00:00+00:00", "plan_hash": "a" * 64,
+            })
+            with self.assertRaisesRegex(web.WebConsoleError, "controller runtime already active"):
+                web.run_command(web.CommandRequest(["run"], background=True))
+
+    def test_cli_controller_runtime_allows_explicit_parallel_policy_control(self):
+        with WebHarness() as h:
+            h.state(controller_runtime={
+                "pid": __import__("os").getpid(), "command": "run",
+                "started_at": "2026-09-20T21:00:00+00:00", "plan_hash": "a" * 64,
+            })
+            request = web.CommandRequest(
+                ["efficiency-policy", "set", "--mode", "relaxed"],
+                activity="EFFICIENCY_UPDATE", allow_while_active=True, track_job=False,
+            )
+            completed = mock.Mock(returncode=0, stdout="ok", stderr="")
+            with mock.patch.object(web.subprocess, "run", return_value=completed):
+                result = web.run_command(request)
+            self.assertTrue(result["ok"])
+
     def test_second_background_job_is_refused(self):
         with WebHarness() as h:
             h.state()
