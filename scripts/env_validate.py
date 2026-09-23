@@ -44,7 +44,6 @@ SECRET_VARS = {
 # application defaults. They are deliberately not part of the host .env contract.
 INTERNAL_ENV_VARS = {
     "ADMIN_PASSWORD_HASH",
-    "RALPH_WEB_PASSWORD",
     "CLASSIFIER_STATUS_FILE",
     "CLASSIFIER_STATUS_SECONDS",
     "DNS_POLL_SECONDS",
